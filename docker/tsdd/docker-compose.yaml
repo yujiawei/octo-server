@@ -1,7 +1,7 @@
 version: '3.1'
 services:
   wukongim:  # 悟空IM通讯服务
-    image: registry.cn-shanghai.aliyuncs.com/wukongim/wukongim:latest
+    image: wukongim/wukongim:v2
     restart: always
     ports:
       - "5100:5100"
@@ -10,8 +10,11 @@ services:
     volumes:
       - ./configs/wk.yaml:/root/wukongim/wk.yaml
       - ./logs/wk:/root/wukongim/logs
-  octo-server:  # 唐僧叨叨的业务服务
-    image: registry.cn-shanghai.aliyuncs.com/wukongim/octo-server:latest
+  octo-server:  # DMWork的业务服务
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: octo-server:local
     restart: always
     command: "api"
     healthcheck:
@@ -28,13 +31,17 @@ services:
     volumes:
       - ./configs/tsdd.yaml:/home/configs/tsdd.yaml
       - ./logs/tsdd:/home/logs
-  tangsengdaodaoweb:  # 唐僧叨叨的web服务
+  tangsengdaodaoweb:  # DMWork的web服务
     image: registry.cn-shanghai.aliyuncs.com/wukongim/tangsengdaodaoweb:latest
     restart: always
     environment:
       - API_URL
     ports:
-      - "82:80" 
+      - "82:80"
+    volumes:
+      - ./configs/nginx.conf.template:/nginx.conf.template
+      - ./configs/index.html:/usr/share/nginx/html/index.html
+      - ./configs/main.eb3be439.js:/usr/share/nginx/html/static/js/main.eb3be439.js
   minio: # minio文件管理服务
     image: minio/minio:latest # use a remote image
     expose:
@@ -43,7 +50,7 @@ services:
     command: "server /data --console-address ':9001'"
     ports:
       - "9000:9000"
-      - "9001:9001"
+      - "9002:9001"
     environment:
       - MINIO_ROOT_USER
       - MINIO_ROOT_PASSWORD
@@ -57,7 +64,7 @@ services:
     volumes:
       - ./miniodata:/data    
   mysql:  # mysql数据库
-    image: mysql:latest
+    image: mysql:8.0
     command: --default-authentication-plugin=mysql_native_password
     healthcheck:
       test: ["CMD", "mysqladmin" ,"ping", "-h", "localhost"]
@@ -75,6 +82,13 @@ services:
       interval: 1s
       timeout: 3s
       retries: 30
+  prometheus: # Prometheus监控数据采集
+    image: prom/prometheus:latest
+    restart: always
+    volumes:
+      - ./configs/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
   adminer:  # mysql web管理工具 调试用，为了安全生产不要打开
    image: adminer:latest
    ports:
