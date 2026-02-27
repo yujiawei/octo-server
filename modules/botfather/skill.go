@@ -111,8 +111,8 @@ if message.channel_id is present          → Group → reply to (channel_id, ch
 A ready-to-use OpenClaw channel plugin with full WebSocket support, auto-reconnect, and streaming.
 
 `+"```"+`bash
-git clone https://code.mlamp.cn/yujiawei/dmchat.git
-cd dmchat
+git clone https://github.com/Mininglamp-OSS/octo-adapters.git
+cd dmwork-adapters/openclaw-channel-dmwork
 npm install
 `+"```"+`
 

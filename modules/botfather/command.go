@@ -673,6 +673,7 @@ func (h *commandHandler) sendConnectPrompt(toUID string, bot *robotModel) {
 Read %s/v1/bot/skill.md to connect to DMWork messaging.
 My bot token is: %s
 API server: %s
+Pre-built adapter: https://github.com/Mininglamp-OSS/octo-adapters
 Use the pre-built adapter (Option 1 in skill.md) for best results.
 DM me on DMWork when you're ready.
 ---
@@ -700,6 +701,7 @@ func (h *commandHandler) sendCreatedPrompt(toUID string, name string, bot *robot
 Read %s/v1/bot/skill.md to connect to DMWork messaging.
 My bot token is: %s
 API server: %s
+Pre-built adapter: https://github.com/Mininglamp-OSS/octo-adapters
 Use the pre-built adapter (Option 1 in skill.md) for best results.
 DM me on DMWork when you're ready.
 ---
