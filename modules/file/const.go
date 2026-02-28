@@ -1,6 +1,10 @@
 package file
 
-import "strings"
+import (
+	"path/filepath"
+	"strings"
+	"unicode/utf8"
+)
 
 // Type 文件类型
 type Type string
@@ -35,7 +39,7 @@ const MaxFileSize int64 = 100 * 1024 * 1024
 var allowedExtensions = map[string]bool{
 	// 图片
 	".jpg": true, ".jpeg": true, ".png": true, ".gif": true,
-	".bmp": true, ".webp": true, ".svg": true, ".ico": true,
+	".bmp": true, ".webp": true, ".ico": true,
 	// 文档
 	".pdf": true, ".doc": true, ".docx": true, ".xls": true,
 	".xlsx": true, ".ppt": true, ".pptx": true, ".txt": true,
@@ -61,6 +65,8 @@ var blockedExtensions = map[string]bool{
 	".pif": true, ".vbs": true, ".vbe": true, ".js": true,
 	".jse": true, ".wsf": true, ".wsh": true, ".ps1": true,
 	".sys": true, ".cpl": true, ".inf": true, ".reg": true,
+	".php": true, ".jsp": true, ".asp": true, ".aspx": true,
+	".cgi": true, ".py": true, ".rb": true, ".pl": true,
 }
 
 // IsAllowedExtension 检查文件扩展名是否允许上传
@@ -75,4 +81,44 @@ func IsAllowedExtension(ext string) bool {
 // IsBlockedExtension 检查文件扩展名是否被禁止
 func IsBlockedExtension(ext string) bool {
 	return blockedExtensions[strings.ToLower(ext)]
+}
+
+// sanitizeFilename 清洗文件名，去除路径分隔符、CRLF、控制字符等危险字符
+func sanitizeFilename(name string) string {
+	// 去除路径前缀，只保留文件名部分
+	name = filepath.Base(name)
+	// 替换 Windows 路径分隔符残留
+	name = strings.ReplaceAll(name, "\\", "_")
+
+	// 过滤危险字符：CRLF、控制字符、双引号
+	var b strings.Builder
+	for _, r := range name {
+		if r == '\r' || r == '\n' || r == '"' || r == '\x00' {
+			b.WriteRune('_')
+		} else if r < 0x20 { // 其他控制字符
+			b.WriteRune('_')
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	name = b.String()
+
+	// 限制长度为 255 字符（按 UTF-8 字符数）
+	if utf8.RuneCountInString(name) > 255 {
+		runes := []rune(name)
+		ext := filepath.Ext(name)
+		extRunes := []rune(ext)
+		// 保留扩展名，截断文件名主体
+		if len(extRunes) < 255 {
+			name = string(runes[:255-len(extRunes)]) + ext
+		} else {
+			name = string(runes[:255])
+		}
+	}
+
+	if name == "" || name == "." {
+		name = "file"
+	}
+
+	return name
 }

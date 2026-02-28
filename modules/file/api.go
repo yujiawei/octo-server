@@ -8,6 +8,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -129,6 +130,10 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 		c.ResponseError(err)
 		return
 	}
+
+	// 限制请求体大小，防止大文件 DoS
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, MaxFileSize+1024*1024)
+
 	file, fileHeader, err := c.Request.FormFile("file")
 	if err != nil {
 		f.Error("读取文件失败！", zap.Error(err))
@@ -145,19 +150,22 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 	}
 
 	// 文件扩展名检查
-	fileName := fileHeader.Filename
+	fileName := sanitizeFilename(fileHeader.Filename)
 	ext := strings.ToLower(filepath.Ext(fileName))
-	if ext != "" {
-		if IsBlockedExtension(ext) {
-			f.Warn("上传了禁止的文件类型", zap.String("filename", fileName), zap.String("ext", ext))
-			c.ResponseError(fmt.Errorf("禁止上传%s类型的文件", ext))
-			return
-		}
-		if !IsAllowedExtension(ext) {
-			f.Warn("上传了不支持的文件类型", zap.String("filename", fileName), zap.String("ext", ext))
-			c.ResponseError(fmt.Errorf("不支持上传%s类型的文件", ext))
-			return
-		}
+	if ext == "" {
+		f.Warn("上传的文件没有扩展名", zap.String("filename", fileName))
+		c.ResponseError(errors.New("文件必须包含扩展名"))
+		return
+	}
+	if IsBlockedExtension(ext) {
+		f.Warn("上传了禁止的文件类型", zap.String("filename", fileName), zap.String("ext", ext))
+		c.ResponseError(fmt.Errorf("禁止上传%s类型的文件", ext))
+		return
+	}
+	if !IsAllowedExtension(ext) {
+		f.Warn("上传了不支持的文件类型", zap.String("filename", fileName), zap.String("ext", ext))
+		c.ResponseError(fmt.Errorf("不支持上传%s类型的文件", ext))
+		return
 	}
 
 	path := uploadPath
@@ -218,20 +226,28 @@ func (f *File) getFile(c *wkhttp.Context) {
 			filename = paths[len(paths)-1]
 		}
 	}
+	// 清洗文件名，防止 CRLF 注入和路径穿越
+	filename = sanitizeFilename(filename)
 
-	// 设置 Content-Type
+	// 设置 Content-Type，未知扩展名默认为 application/octet-stream
 	ext := strings.ToLower(filepath.Ext(filename))
 	contentType := mime.TypeByExtension(ext)
-	if contentType != "" {
-		c.Header("Content-Type", contentType)
+	if contentType == "" {
+		contentType = "application/octet-stream"
 	}
+	c.Header("Content-Type", contentType)
 
-	// 设置 Content-Disposition（inline 预览，带文件名用于下载）
+	// 对未知扩展名强制 attachment（防止浏览器解析恶意内容）
 	disposition := c.Query("disposition")
+	if mime.TypeByExtension(ext) == "" {
+		disposition = "attachment"
+	}
+	// 构造安全的 Content-Disposition，使用 RFC 5987 编码处理非 ASCII 文件名
+	escapedFilename := url.PathEscape(filename)
 	if disposition == "attachment" {
-		c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
+		c.Header("Content-Disposition", fmt.Sprintf("attachment; filename*=UTF-8''%s", escapedFilename))
 	} else {
-		c.Header("Content-Disposition", fmt.Sprintf("inline; filename=\"%s\"", filename))
+		c.Header("Content-Disposition", fmt.Sprintf("inline; filename*=UTF-8''%s", escapedFilename))
 	}
 
 	downloadURL, err := f.service.DownloadURL(ph, filename)
