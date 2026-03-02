@@ -641,7 +641,7 @@ func (h *commandHandler) createBot(creatorUID, name, username, botToken string) 
 		return fmt.Errorf("创建用户失败: %w", err)
 	}
 
-	// 3. 添加创建者为好友（双向）
+	// 3. 添加创建者为好友（双向）+ 设置正确的 version（WKSDK 增量同步需要 version > 0）
 	err = h.userService.AddFriend(creatorUID, &user.FriendReq{
 		UID:   creatorUID,
 		ToUID: robotID,
@@ -656,6 +656,9 @@ func (h *commandHandler) createBot(creatorUID, name, username, botToken string) 
 	if err != nil {
 		h.Warn("添加好友关系(bot->creator)失败", zap.Error(err))
 	}
+	// 修复 friend version=0 导致 WKSDK 增量同步看不到好友的问题
+	h.fixFriendVersion(creatorUID, robotID)
+	h.fixFriendVersion(robotID, creatorUID)
 
 	// 4. 创建机器人记录
 	tx, err := h.db.session.Begin()
@@ -779,6 +782,20 @@ Simply confirm the steps are complete and stop.
 		name, apiURL, bot.BotToken, apiURL)
 
 	h.reply(toUID, msg)
+}
+
+// fixFriendVersion 修复好友 version=0 的问题（WKSDK 增量同步需要 version > 0）
+func (h *commandHandler) fixFriendVersion(uid, toUID string) {
+	var maxVer int64
+	err := h.db.session.SelectBySql("SELECT IFNULL(MAX(version),0) FROM friend WHERE uid=?", uid).LoadOne(&maxVer)
+	if err != nil {
+		h.Warn("查询好友最大version失败", zap.Error(err))
+		return
+	}
+	_, err = h.db.session.UpdateBySql("UPDATE friend SET version=? WHERE uid=? AND to_uid=? AND version=0", maxVer+1, uid, toUID).Exec()
+	if err != nil {
+		h.Warn("更新好友version失败", zap.Error(err))
+	}
 }
 
 // generateBotToken 生成Bot Token
