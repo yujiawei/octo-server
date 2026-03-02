@@ -737,8 +737,8 @@ Install adapter: openclaw plugins install openclaw-channel-dmwork
 Configure in ~/.openclaw/openclaw.json:
 {"channels":{"dmwork":{"botToken":"YOUR_TOKEN","apiUrl":"API_SERVER"}}}
 Replace YOUR_TOKEN and API_SERVER with the values above.
-Then restart: openclaw gateway restart
-DM me on DMWork when you're ready.
+IMPORTANT: Do NOT run "openclaw gateway restart" — the gateway auto-detects config changes and reloads after this conversation ends.
+Simply confirm the steps are complete and stop.
 ---
 
 💡 支持 OpenClaw、Claude Code、及任何能读取 URL 的 AI Agent
@@ -769,8 +769,8 @@ Install adapter: openclaw plugins install openclaw-channel-dmwork
 Configure in ~/.openclaw/openclaw.json:
 {"channels":{"dmwork":{"botToken":"YOUR_TOKEN","apiUrl":"API_SERVER"}}}
 Replace YOUR_TOKEN and API_SERVER with the values above.
-Then restart: openclaw gateway restart
-DM me on DMWork when you're ready.
+IMPORTANT: Do NOT run "openclaw gateway restart" — the gateway auto-detects config changes and reloads after this conversation ends.
+Simply confirm the steps are complete and stop.
 ---
 
 💡 支持 OpenClaw、Claude Code、及任何能读取 URL 的 AI Agent
