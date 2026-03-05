@@ -2,6 +2,8 @@ package message
 
 import (
 	"errors"
+	"os"
+	"runtime/debug"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -673,7 +675,7 @@ func (co *Conversation) insertDeviceOffsets(deviceOffsetModels []*deviceOffsetMo
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	for _, deviceOffsetM := range deviceOffsetModels {
@@ -699,7 +701,7 @@ func (co *Conversation) insertUserLastOffsets(userLastOffsetModels []*userLastOf
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	for _, userLastOffsetM := range userLastOffsetModels {

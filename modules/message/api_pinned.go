@@ -2,6 +2,8 @@ package message
 
 import (
 	"encoding/json"
+	"os"
+	"runtime/debug"
 	"fmt"
 	"strconv"
 	"time"
@@ -134,7 +136,7 @@ func (m *Message) pinnedMessage(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	isPinned := 0
@@ -346,7 +348,7 @@ func (m *Message) clearPinnedMessage(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	for _, msg := range updateModel {

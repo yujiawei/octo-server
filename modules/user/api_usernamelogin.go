@@ -2,6 +2,8 @@ package user
 
 import (
 	"context"
+	"os"
+	"runtime/debug"
 	"encoding/hex"
 	"fmt"
 	"strconv"
@@ -147,7 +149,7 @@ func (u *User) registerWithUsername(username string, name string, password strin
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	publicIP := util.GetClientPublicIP(c.Request)

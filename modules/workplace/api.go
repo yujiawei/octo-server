@@ -2,6 +2,9 @@ package workplace
 
 import (
 	"errors"
+	"fmt"
+	"os"
+	"runtime/debug"
 
 	"github.com/Mininglamp-OSS/octo-server/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/common"
@@ -210,7 +213,7 @@ func (w *Workplace) reorderApp(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 

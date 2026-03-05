@@ -2,6 +2,8 @@ package group
 
 import (
 	"errors"
+	"os"
+	"runtime/debug"
 	"fmt"
 	"strings"
 
@@ -99,7 +101,7 @@ func (g *Group) handleRegisterUserEvent(data []byte, commit config.EventCommit) 
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
 			commit(err.(error))
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	if groupModel == nil {
@@ -213,7 +215,7 @@ func (g *Group) handleOrgOrDeptCreateEvent(data []byte, commit config.EventCommi
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
 			commit(err.(error))
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	if groupModel == nil {
@@ -399,7 +401,7 @@ func (g *Group) handleOrgOrDeptEmployeeUpdate(data []byte, commit config.EventCo
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
 			commit(err.(error))
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 
@@ -678,7 +680,7 @@ func (g *Group) handleOrgEmployeeExit(data []byte, commit config.EventCommit) {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
 			commit(err.(error))
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	for _, groupNo := range realGroups {

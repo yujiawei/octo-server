@@ -2,6 +2,8 @@ package group
 
 import (
 	"bytes"
+	"os"
+	"runtime/debug"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -254,7 +256,7 @@ func (m *Manager) leftbangroup(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	groupMap := make(map[string]string)
@@ -347,7 +349,7 @@ func (m *Manager) forbidden(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 

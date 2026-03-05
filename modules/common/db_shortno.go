@@ -2,6 +2,9 @@ package common
 
 import (
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"fmt"
+	"os"
+	"runtime/debug"
 	dbs "github.com/Mininglamp-OSS/octo-lib/pkg/db"
 	"github.com/gocraft/dbr/v2"
 )
@@ -29,7 +32,7 @@ func (s *shortnoDB) inserts(shortnos []string) error {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	for _, st := range shortnos {

@@ -2,6 +2,8 @@ package group
 
 import (
 	"errors"
+	"os"
+	"runtime/debug"
 	"fmt"
 
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
@@ -92,7 +94,7 @@ func (g *groupUpdateContext) commmitGroupUpdateEvent(key, value string) error {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	groupNo := g.groupModel.GroupNo

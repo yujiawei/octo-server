@@ -2,6 +2,9 @@ package workplace
 
 import (
 	"errors"
+	"fmt"
+	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 
@@ -79,7 +82,7 @@ func (m *manager) reorderBanner(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	var tempSortNum = len(req.BannerNos)
@@ -322,7 +325,7 @@ func (m *manager) addCategoryApp(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	var tempSortNum = len(saveIds) + maxNum
@@ -382,7 +385,7 @@ func (m *manager) reorderCategoryApp(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	var tempSortNum = len(req.AppIds)
@@ -675,7 +678,7 @@ func (m *manager) deleteApp(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	err = m.db.deleteAppTx(appId, tx)
@@ -739,7 +742,7 @@ func (m *manager) reorderCategory(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	var tempSortNum = len(req.CategoryNos)

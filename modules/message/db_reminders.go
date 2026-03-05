@@ -2,6 +2,8 @@ package message
 
 import (
 	"errors"
+	"os"
+	"runtime/debug"
 	"fmt"
 	"sort"
 
@@ -32,7 +34,7 @@ func (r *remindersDB) inserts(models []*remindersModel) error {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	for _, m := range models {

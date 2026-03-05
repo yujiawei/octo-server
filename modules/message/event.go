@@ -2,6 +2,8 @@ package message
 
 import (
 	"encoding/json"
+	"os"
+	"runtime/debug"
 	"errors"
 	"fmt"
 	"time"
@@ -109,7 +111,7 @@ func (m *Message) handleReadedMessageCount() {
 		if err := recover(); err != nil {
 			m.mutex.Unlock()
 			tx.RollbackUnlessCommitted()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	type sendCMDVO struct {
@@ -411,7 +413,7 @@ func (m *Message) updateMembersChannelOffset(groupNO string, members []*config.U
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 

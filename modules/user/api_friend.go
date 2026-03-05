@@ -2,6 +2,8 @@ package user
 
 import (
 	"fmt"
+	"os"
+	"runtime/debug"
 	"net/http"
 	"strconv"
 	"strings"
@@ -179,7 +181,7 @@ func (f *Friend) delete(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	version := f.ctx.GenSeq(common.FriendSeqKey)
@@ -394,7 +396,7 @@ func (f *Friend) friendApply(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	isAddCount := false
@@ -576,7 +578,7 @@ func (f *Friend) friendSure(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	version := f.ctx.GenSeq(common.FriendSeqKey)

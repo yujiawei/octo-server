@@ -2,6 +2,8 @@ package user
 
 import (
 	"fmt"
+	"os"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -455,7 +457,7 @@ func (m *Manager) addUser(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	userModel := &Model{}
@@ -1028,7 +1030,7 @@ func (m *Manager) addSystemFriend(uid string) error {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	if !isFriend {

@@ -2,6 +2,8 @@ package user
 
 import (
 	"context"
+	"os"
+	"runtime/debug"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -120,7 +122,7 @@ func (u *User) githubOAuth(c *wkhttp.Context) {
 		defer func() {
 			if err := recover(); err != nil {
 				tx.Rollback()
-				panic(err)
+				fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 			}
 		}()
 

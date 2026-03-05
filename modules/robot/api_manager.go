@@ -2,6 +2,8 @@ package robot
 
 import (
 	"crypto/rand"
+	"os"
+	"runtime/debug"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -112,7 +114,7 @@ func (m *Manager) delete(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	err = m.db.deleteMenuWithID(robot_id, id, tx)

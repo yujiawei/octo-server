@@ -2,6 +2,8 @@ package message
 
 import (
 	"encoding/json"
+	"os"
+	"runtime/debug"
 	"errors"
 	"fmt"
 	"net/http"
@@ -36,7 +38,7 @@ func (m *Message) reminderDone(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	err = m.remindersDB.insertDonesTx(ids, loginUID, tx)

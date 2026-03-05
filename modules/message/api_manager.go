@@ -2,6 +2,8 @@ package message
 
 import (
 	"fmt"
+	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -154,7 +156,7 @@ func (m *Manager) delete(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	msgIds := make([]string, 0)

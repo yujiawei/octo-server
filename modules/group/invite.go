@@ -2,6 +2,8 @@ package group
 
 import (
 	"errors"
+	"os"
+	"runtime/debug"
 	"fmt"
 	"net/http"
 	"time"
@@ -56,7 +58,7 @@ func (g *Group) groupMemberInviteAdd(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	eventID, err := g.ctx.EventBegin(&wkevent.Data{
@@ -249,7 +251,7 @@ func (g *Group) groupMemberInviteSure(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	err = g.db.UpdateInviteStatusTx(allower, InviteStatusOK, inviteNo, tx)

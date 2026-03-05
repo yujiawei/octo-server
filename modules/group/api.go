@@ -2,6 +2,7 @@ package group
 
 import (
 	"os"
+	"runtime/debug"
 	"errors"
 	"fmt"
 	"io"
@@ -152,7 +153,7 @@ func (g *Group) disband(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	group.Status = GroupStatusDisband
@@ -604,7 +605,7 @@ func (g *Group) groupCreate(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 
@@ -817,7 +818,7 @@ func (g *Group) groupUpdate(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	err = g.db.UpdateTx(group, tx)
@@ -1209,7 +1210,7 @@ func (g *Group) addMembers(members []string, groupNo string, operator, operatorN
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	commitCallback, err := g.addMembersTx(members, groupNo, operator, operatorName, tx)
@@ -1485,7 +1486,7 @@ func (g *Group) groupForbidden(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 
@@ -1707,7 +1708,7 @@ func (g *Group) groupScanJoin(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	eventID, err := g.ctx.EventBegin(&wkevent.Data{
@@ -1887,7 +1888,7 @@ func (g *Group) transferGrouper(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	eventID, err := g.ctx.EventBegin(&wkevent.Data{
@@ -2160,7 +2161,7 @@ func (g *Group) memberRemove(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 
@@ -2444,7 +2445,7 @@ func (g *Group) groupExit(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	eventID, err := g.ctx.EventBegin(&wkevent.Data{

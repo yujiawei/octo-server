@@ -2,6 +2,9 @@ package user
 
 import (
 	"net/http"
+	"fmt"
+	"os"
+	"runtime/debug"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
@@ -180,7 +183,7 @@ func (u *User) onlineStatusCheck() {
 		defer func() {
 			if err := recover(); err != nil {
 				tx.RollbackUnlessCommitted()
-				panic(err)
+				fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 			}
 		}()
 		for _, onlineStatusResp := range makeOfflines {

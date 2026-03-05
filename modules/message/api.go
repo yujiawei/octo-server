@@ -2,6 +2,8 @@ package message
 
 import (
 	"encoding/base64"
+	"os"
+	"runtime/debug"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -286,7 +288,7 @@ func (m *Message) messageEdit(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	fakeChannelID := req.ChannelID
@@ -410,7 +412,7 @@ func (m *Message) messageReaded(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 
@@ -1145,7 +1147,7 @@ func (m *Message) delete(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	for _, req := range reqs {
@@ -1271,7 +1273,7 @@ func (m *Message) offset(c *wkhttp.Context) {
 		defer func() {
 			if err := recover(); err != nil {
 				tx.RollbackUnlessCommitted()
-				panic(err)
+				fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 			}
 		}()
 		err = m.remindersDB.insertDonesTx(reminderIds, loginUID, tx)
@@ -1397,7 +1399,7 @@ func (m *Message) cancelMentionReminderIfNeed(message *messageModel) {
 					defer func() {
 						if err := recover(); err != nil {
 							tx.RollbackUnlessCommitted()
-							panic(err)
+							fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 						}
 					}()
 					for _, uid := range uids {
@@ -1504,7 +1506,7 @@ func (m *Message) revoke(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	messageIDStr := strconv.FormatInt(message.MessageID, 10)

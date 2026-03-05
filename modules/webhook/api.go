@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"bytes"
+	"runtime/debug"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -217,7 +218,7 @@ func (w *Webhook) handleMessageNotify(messages []MsgResp) ([]string, error) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	for _, message := range messages {

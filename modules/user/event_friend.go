@@ -2,6 +2,8 @@ package user
 
 import (
 	"fmt"
+	"os"
+	"runtime/debug"
 
 	"github.com/Mininglamp-OSS/octo-server/modules/source"
 	"github.com/Mininglamp-OSS/octo-lib/common"
@@ -144,7 +146,7 @@ func (f *Friend) handleUserRegister(data []byte, commit config.EventCommit) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	version := f.ctx.GenSeq(common.FriendSeqKey)

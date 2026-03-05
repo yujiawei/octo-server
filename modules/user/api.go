@@ -2,6 +2,7 @@ package user
 
 import (
 	"context"
+	"runtime/debug"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -611,7 +612,7 @@ func (u *User) userUpdateWithField(c *wkhttp.Context) {
 			defer func() {
 				if err := recover(); err != nil {
 					tx.Rollback()
-					panic(err)
+					fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 				}
 			}()
 			err = u.db.UpdateUsersWithField(key, fmt.Sprintf("%s", value), loginUID)
@@ -1769,7 +1770,7 @@ func (u *User) addBlacklist(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	err = u.db.AddOrRemoveBlacklistTx(loginUID, uid, 1, version, tx)
@@ -1841,7 +1842,7 @@ func (u *User) removeBlacklist(c *wkhttp.Context) {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	err = u.db.AddOrRemoveBlacklistTx(loginUID, uid, 0, version, tx)
@@ -2396,7 +2397,7 @@ func (u *User) addSystemFriend(uid string) error {
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	if !isFriend {
@@ -2560,7 +2561,7 @@ func (u *User) createUser(registerSpanCtx context.Context, createUser *createUse
 	defer func() {
 		if err := recover(); err != nil {
 			tx.Rollback()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	publicIP := util.GetClientPublicIP(c.Request)

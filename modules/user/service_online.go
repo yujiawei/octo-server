@@ -2,6 +2,9 @@ package user
 
 import (
 	"time"
+	"fmt"
+	"os"
+	"runtime/debug"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
@@ -46,7 +49,7 @@ func (o *OnlineService) listenOnlineStatus(onlineStatusList []config.OnlineStatu
 	defer func() {
 		if err := recover(); err != nil {
 			tx.RollbackUnlessCommitted()
-			panic(err)
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 

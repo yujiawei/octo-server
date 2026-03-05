@@ -2,6 +2,8 @@ package robot
 
 import (
 	"errors"
+	"os"
+	"runtime/debug"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -598,7 +600,7 @@ func (rb *Robot) insertSystemRobot() {
 		defer func() {
 			if err := recover(); err != nil {
 				tx.Rollback()
-				panic(err)
+				fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 			}
 		}()
 		err = rb.db.insertTx(&robot{

@@ -2,6 +2,8 @@ package botfather
 
 import (
 	"encoding/json"
+	"os"
+	"runtime/debug"
 	"errors"
 	"fmt"
 	"net/http"
@@ -170,7 +172,7 @@ func (bf *BotFather) initBotFatherUser() {
 		defer func() {
 			if err := recover(); err != nil {
 				tx.Rollback()
-				panic(err)
+				fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
 			}
 		}()
 
