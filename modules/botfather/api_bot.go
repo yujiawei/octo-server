@@ -74,9 +74,9 @@ func (bf *BotFather) syncMessages(c *wkhttp.Context) {
 
 // getGroups 获取机器人所在的群组列表
 func (bf *BotFather) getGroups(c *wkhttp.Context) {
-	botUID := c.GetString("bot_uid")
-	if botUID == "" {
-		c.ResponseError(errors.New("bot_uid not found"))
+	robotID := getRobotIDFromContext(c)
+	if robotID == "" {
+		c.ResponseError(errors.New("robot_id not found"))
 		return
 	}
 
@@ -88,7 +88,7 @@ func (bf *BotFather) getGroups(c *wkhttp.Context) {
 	var groups []GroupInfo
 	_, err := bf.ctx.DB().SelectBySql(
 		"SELECT gm.group_no, g.name FROM group_member gm INNER JOIN `group` g ON gm.group_no = g.group_no WHERE gm.uid = ? AND gm.is_deleted = 0",
-		botUID,
+		robotID,
 	).Load(&groups)
 	if err != nil {
 		bf.Error("查询机器人群组失败", zap.Error(err))
