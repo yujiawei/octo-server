@@ -115,7 +115,7 @@ var names = []string{"独角王", "老鼋", "灵感大王", "如意真仙", "蝎
 
 // GetRandomName 获取随机的名字
 func GetRandomName() string {
-	return names[rand.Intn(len(names)-1)]
+	return names[rand.Intn(len(names))]
 }
 
 func FormatSecondToDisplayTime(second int64) string {
