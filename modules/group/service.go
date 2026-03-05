@@ -94,7 +94,7 @@ func (s *Service) GetManagersWithGroupNos(groupNos []string) ([]*MemberResp, err
 	if err != nil {
 		return nil, err
 	}
-	list := make([]*MemberResp, 0)
+	list := make([]*MemberResp, 0, len(models))
 	if len(models) > 0 {
 		for _, model := range models {
 			list = append(list, &MemberResp{

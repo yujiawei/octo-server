@@ -2843,8 +2843,7 @@ func (g *Group) CheckForbiddenLoop() {
 				g.Warn("更新禁言成员新消息错误", zap.Error(err))
 				continue
 			}
-			uids := make([]string, 0)
-			uids = append(uids, model.UID)
+			uids := []string{model.UID}
 			if model.Status != int(common.GroupMemberStatusBlacklist) {
 				err = g.setGroupBlacklist(model.GroupNo, uids, false)
 				if err != nil {

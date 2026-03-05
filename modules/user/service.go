@@ -113,7 +113,7 @@ func (s *Service) GetAllUsers() ([]*Resp, error) {
 		s.Error("查询所有用户错误", zap.Error(err))
 		return nil, err
 	}
-	list := make([]*Resp, 0)
+	list := make([]*Resp, 0, len(models))
 	for _, user := range models {
 		list = append(list, &Resp{
 			UID:   user.UID,
