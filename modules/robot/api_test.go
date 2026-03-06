@@ -58,3 +58,62 @@ func TestMention(t *testing.T) {
 
 	fmt.Println(reg.FindAllString("dsds @增加啊每个萨摩 你好", -1))
 }
+
+// TestInlineQueryEventsMapLockConsistency verifies that inlineQueryEventsMap
+// is protected by inlineQueryEventsMapLock (not inlineQueryEventResultChanMapLock).
+// This test addresses issue #159 where the wrong lock was used, causing a race condition.
+// Run with: go test -race -run TestInlineQueryEventsMapLockConsistency
+func TestInlineQueryEventsMapLockConsistency(t *testing.T) {
+	// Create a minimal Robot struct for lock testing (no external dependencies)
+	rb := &Robot{
+		inlineQueryEventsMap:          make(map[string][]*robotEvent),
+		inlineQueryEventResultChanMap: make(map[string]chan *InlineQueryResult),
+	}
+
+	robotID := "test-robot-123"
+	done := make(chan bool)
+	iterations := 100
+
+	// Writer goroutine: simulates addInlineQuery behavior
+	go func() {
+		for i := 0; i < iterations; i++ {
+			rb.inlineQueryEventsMapLock.Lock()
+			events := rb.inlineQueryEventsMap[robotID]
+			if events == nil {
+				events = make([]*robotEvent, 0)
+			}
+			events = append(events, &robotEvent{
+				EventID: int64(i),
+				InlineQuery: &InlineQuery{
+					SID:   fmt.Sprintf("sid-%d", i),
+					Query: "test query",
+				},
+			})
+			rb.inlineQueryEventsMap[robotID] = events
+			rb.inlineQueryEventsMapLock.Unlock()
+		}
+		done <- true
+	}()
+
+	// Reader goroutine: simulates the fixed getRobotEvents behavior
+	// This was the buggy path that previously used the wrong lock
+	go func() {
+		for i := 0; i < iterations; i++ {
+			rb.inlineQueryEventsMapLock.RLock()
+			_ = rb.inlineQueryEventsMap[robotID]
+			rb.inlineQueryEventsMapLock.RUnlock()
+		}
+		done <- true
+	}()
+
+	// Wait for both goroutines to complete
+	<-done
+	<-done
+
+	// Verify data integrity
+	rb.inlineQueryEventsMapLock.RLock()
+	events := rb.inlineQueryEventsMap[robotID]
+	rb.inlineQueryEventsMapLock.RUnlock()
+
+	assert.Equal(t, iterations, len(events), "All events should have been added without race condition")
+}

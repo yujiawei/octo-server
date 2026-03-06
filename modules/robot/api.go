@@ -483,9 +483,9 @@ func (rb *Robot) getEventsResult(robotID string, eventID int64, limit int64) ([]
 	if err != nil {
 		return nil, err
 	}
-	rb.inlineQueryEventResultChanMapLock.RLock()
+	rb.inlineQueryEventsMapLock.RLock()
 	robotEvents := rb.inlineQueryEventsMap[robotID]
-	rb.inlineQueryEventResultChanMapLock.RUnlock()
+	rb.inlineQueryEventsMapLock.RUnlock()
 	newRobotEvents := make([]*robotEvent, 0, len(robotEvents)+int(limit))
 
 	results := make([]*robotEventResp, 0, len(robotEvents)+int(limit))
