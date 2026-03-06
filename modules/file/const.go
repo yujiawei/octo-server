@@ -44,6 +44,7 @@ var allowedExtensions = map[string]bool{
 	".pdf": true, ".doc": true, ".docx": true, ".xls": true,
 	".xlsx": true, ".ppt": true, ".pptx": true, ".txt": true,
 	".csv": true, ".rtf": true, ".odt": true, ".ods": true,
+	".md": true, ".html": true, ".htm": true,
 	// 音频
 	".mp3": true, ".wav": true, ".aac": true, ".flac": true,
 	".ogg": true, ".wma": true, ".m4a": true, ".amr": true,

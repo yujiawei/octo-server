@@ -32,6 +32,9 @@ func TestIsAllowedExtension(t *testing.T) {
 		{"pptx allowed", ".pptx", true},
 		{"txt allowed", ".txt", true},
 		{"csv allowed", ".csv", true},
+		{"md allowed", ".md", true},
+		{"html allowed", ".html", true},
+		{"htm allowed", ".htm", true},
 
 		// 音频格式
 		{"mp3 allowed", ".mp3", true},
@@ -311,7 +314,7 @@ func TestIsAllowedExtension_AllEntries(t *testing.T) {
 	allAllowed := []string{
 		".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".ico",
 		".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-		".txt", ".csv", ".rtf", ".odt", ".ods",
+		".txt", ".csv", ".rtf", ".odt", ".ods", ".md", ".html", ".htm",
 		".mp3", ".wav", ".aac", ".flac", ".ogg", ".wma", ".m4a", ".amr",
 		".mp4", ".avi", ".mov", ".wmv", ".flv", ".mkv", ".webm", ".m4v",
 		".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz",
