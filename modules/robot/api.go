@@ -337,7 +337,10 @@ func (rb *Robot) answerInlineQuery(c *wkhttp.Context) {
 	resultChan := rb.inlineQueryEventResultChanMap[result.InlineQuerySID]
 	rb.inlineQueryEventResultChanMapLock.Unlock()
 	if resultChan != nil {
-		resultChan <- result
+		select {
+		case resultChan <- result:
+		default:
+		}
 	}
 	c.ResponseOK()
 }
@@ -400,7 +403,6 @@ func (rb *Robot) inlineQuery(c *wkhttp.Context) {
 	}
 
 	rb.inlineQueryEventResultChanMapLock.Lock()
-	close(resultChan)
 	delete(rb.inlineQueryEventResultChanMap, sid)
 	rb.inlineQueryEventResultChanMapLock.Unlock()
 
