@@ -840,9 +840,22 @@ Install adapter: openclaw plugins install openclaw-channel-dmwork
 
 IMPORTANT - Check existing config first:
 1. Read ~/.openclaw/openclaw.json
-2. If channels.dmwork already exists with another bot, you must use dmScope to isolate sessions — see skill.md multi-agent guide
-3. If channels.dmwork does not exist, add it with botToken and apiUrl
-4. Do NOT run "openclaw gateway restart" — the gateway auto-detects config changes
+2. If channels.dmwork already exists with a botToken or accounts:
+   - Use multi-account structure, do NOT overwrite existing tokens
+   - Add your bot as a new account under channels.dmwork.accounts
+3. If channels.dmwork does not exist:
+   - Create it with single account structure
+
+Single bot config:
+{"channels":{"dmwork":{"botToken":"YOUR_TOKEN","apiUrl":"API_SERVER"}}}
+
+Multi-bot config (when other bots already exist):
+{"channels":{"dmwork":{"apiUrl":"API_SERVER","accounts":{"existing-bot":{"botToken":"KEEP_EXISTING","apiUrl":"API_SERVER"},"YOUR_BOT_ID":{"botToken":"YOUR_TOKEN","apiUrl":"API_SERVER"}}}}}
+
+Also add bindings for each bot:
+{"agentId":"YOUR_AGENT_ID","match":{"channel":"dmwork","accountId":"YOUR_BOT_ID"}}
+
+Do NOT run "openclaw gateway restart" — the gateway auto-detects config changes.
 Simply confirm the steps are complete and stop.
 ---
 
