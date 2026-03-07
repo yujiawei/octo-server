@@ -100,7 +100,8 @@ func (sc *ServiceCOS) DownloadURL(ph string, filename string) (string, error) {
 	}
 
 	vals := url.Values{}
-	vals.Set("response-content-disposition", fmt.Sprintf("inline; filename=\"%s\"", filename))
+	encodedFilename := "UTF-8''" + url.QueryEscape(filename)
+	vals.Set("response-content-disposition", fmt.Sprintf("attachment; filename*=%s", encodedFilename))
 	result, _ := url.JoinPath(downloadBase, ph)
 	return fmt.Sprintf("%s?%s", result, vals.Encode()), nil
 }
