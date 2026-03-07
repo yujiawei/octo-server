@@ -96,6 +96,7 @@ func (co *Conversation) Route(r *wkhttp.WKHttp) {
 		conversation.POST("/sync", co.syncUserConversation)
 		conversation.POST("/syncack", co.syncUserConversationAck)
 		conversation.POST("/extra/sync", co.conversationExtraSync) // 同步最近会话扩展
+		conversation.PUT("/clearUnread", co.clearConversationUnread) // 清除未读（正确拼写路径）
 	}
 	conversations := r.Group("/v1/conversations", co.ctx.AuthMiddleware(r))
 	{
