@@ -302,6 +302,7 @@ func (s *Space) listMembers(c *wkhttp.Context) {
 			UID:       m.UID,
 			Name:      m.Name,
 			Role:      m.Role,
+			Robot:     m.Robot,
 			CreatedAt: m.CreatedAt.String(),
 		})
 	}

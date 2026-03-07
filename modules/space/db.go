@@ -127,9 +127,11 @@ func (d *DB) queryMemberIncludeRemoved(spaceId string, uid string) (*MemberModel
 func (d *DB) queryMembers(spaceId string, page uint64, limit uint64) ([]*MemberDetailModel, error) {
 	var models []*MemberDetailModel
 	_, err := d.session.SelectBySql(`
-		SELECT sm.*, IFNULL(u.name,'') as name
+		SELECT sm.*, IFNULL(u.name,'') as name,
+			CASE WHEN r.robot_id IS NOT NULL AND r.status=1 THEN 1 ELSE 0 END as robot
 		FROM space_member sm
 		LEFT JOIN user u ON u.uid=sm.uid
+		LEFT JOIN robot r ON r.robot_id=sm.uid
 		WHERE sm.space_id=? AND sm.status=1
 		ORDER BY sm.role DESC, sm.created_at ASC
 		LIMIT ? OFFSET ?

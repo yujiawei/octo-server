@@ -87,6 +87,7 @@ type memberResp struct {
 	UID       string `json:"uid"`
 	Name      string `json:"name"`
 	Role      int    `json:"role"`
+	Robot     int    `json:"robot"`
 	CreatedAt string `json:"created_at"`
 }
 
@@ -103,7 +104,8 @@ type inviteResp struct {
 // MemberDetailModel 带用户名的成员详情
 type MemberDetailModel struct {
 	MemberModel
-	Name string // 用户名称
+	Name  string // 用户名称
+	Robot int    // 是否机器人 1=是 0=否
 }
 
 // SpaceDetailModel 带成员数和角色的空间详情
