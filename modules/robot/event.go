@@ -178,19 +178,32 @@ func (rb *Robot) messagesListen(messages []*config.MessageResp) {
 					if entities != nil {
 						var offset int64
 						var length int64
+						var offsetOK, lengthOK bool
 						for _, entitiesObj := range entities {
 							entitiesMap, ok := entitiesObj.(map[string]interface{})
 							if !ok {
 								continue
 							}
 							if entitiesMap["type"] == "bot_command" {
-								offset, _ = entitiesMap["offset"].(json.Number).Int64()
-								length, _ = entitiesMap["length"].(json.Number).Int64()
+								// Safely extract offset
+								if offsetVal, ok := entitiesMap["offset"].(json.Number); ok {
+									offset, _ = offsetVal.Int64()
+									offsetOK = true
+								}
+								// Safely extract length
+								if lengthVal, ok := entitiesMap["length"].(json.Number); ok {
+									length, _ = lengthVal.Int64()
+									lengthOK = true
+								}
 								break
 							}
 						}
-						contentRuns := []rune(content)
-						key = string(contentRuns[offset:length])
+						contentRunes := []rune(content)
+						contentLen := int64(len(contentRunes))
+						// Validate bounds before slicing - require both offset and length to be valid
+						if offsetOK && lengthOK && offset >= 0 && length > 0 && offset < contentLen && offset+length <= contentLen {
+							key = string(contentRunes[offset : offset+length])
+						}
 					}
 
 					channelID := message.ChannelID
