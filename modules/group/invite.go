@@ -301,6 +301,11 @@ func (g *Group) groupMemberInviteSure(c *wkhttp.Context) {
 
 // groupMemberInviteDetail 获取群成员邀请详情
 func (g *Group) groupMemberInviteDetail(c *wkhttp.Context) {
+	loginUID := c.GetLoginUID()
+	if loginUID == "" {
+		c.ResponseError(errors.New("请先登录！"))
+		return
+	}
 	inviteNo := c.Param("invite_no")
 	inviteDetilModel, err := g.db.QueryInviteDetail(inviteNo)
 	if err != nil {
@@ -318,6 +323,32 @@ func (g *Group) groupMemberInviteDetail(c *wkhttp.Context) {
 		c.ResponseError(errors.New("获取邀请项失败！"))
 		return
 	}
+
+	// 验证请求者是否有权查看该邀请（邀请者或被邀请者）
+	isAuthorized := inviteDetilModel.Inviter == loginUID
+	if !isAuthorized {
+		for _, item := range inviteItems {
+			if item.UID == loginUID {
+				isAuthorized = true
+				break
+			}
+		}
+	}
+	if !isAuthorized {
+		// 检查是否为群管理员或群主
+		isManager, err := g.db.QueryIsGroupManagerOrCreator(inviteDetilModel.GroupNo, loginUID)
+		if err != nil {
+			g.Error("查询管理员信息失败！", zap.Error(err))
+			c.ResponseError(errors.New("查询管理员信息失败！"))
+			return
+		}
+		isAuthorized = isManager
+	}
+	if !isAuthorized {
+		c.ResponseError(errors.New("您没有权限查看该邀请信息！"))
+		return
+	}
+
 	var uids = make([]string, 0, len(inviteItems))
 	for _, item := range inviteItems {
 		uids = append(uids, item.UID)

@@ -107,9 +107,10 @@ func (g *Group) Route(r *wkhttp.WKHttp) {
 	openGroup := r.Group("/v1/group")
 	{
 
-		openGroup.GET("invites/:invite_no", g.groupMemberInviteDetail) // 获取邀请详情
-		openGroup.POST("invite/sure", g.groupMemberInviteSure)         // 确认邀请
+		openGroup.POST("invite/sure", g.groupMemberInviteSure) // 确认邀请
 	}
+	// 邀请详情需要认证
+	group.GET("/invites/:invite_no", g.groupMemberInviteDetail) // 获取邀请详情
 	go g.CheckForbiddenLoop()
 }
 
