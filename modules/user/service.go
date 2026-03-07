@@ -463,15 +463,17 @@ func (s *Service) AddUser(user *AddUserReq) error {
 		shortNo = util.Ten2Hex(time.Now().UnixNano())
 	}
 	userM := &Model{
-		Name:     user.Name,
-		UID:      uid,
-		Zone:     user.Zone,
-		Phone:    user.Phone,
-		Username: username,
-		Email:    user.Email,
-		ShortNo:  shortNo,
-		Status:   1,
-		Robot:    user.Robot,
+		Name:      user.Name,
+		UID:       uid,
+		Zone:      user.Zone,
+		Phone:     user.Phone,
+		Username:  username,
+		Email:     user.Email,
+		ShortNo:   shortNo,
+		Vercode:   fmt.Sprintf("%s@%d", util.GenerUUID(), common.User),
+		QRVercode: fmt.Sprintf("%s@%d", util.GenerUUID(), common.QRCode),
+		Status:    1,
+		Robot:     user.Robot,
 	}
 	if user.Password != "" {
 		hashedPwd, hashErr := HashPassword(user.Password)
