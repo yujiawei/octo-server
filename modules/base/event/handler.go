@@ -2,6 +2,7 @@ package event
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -13,9 +14,14 @@ import (
 // Handler 事件处理者
 type Handler func(model *Model)
 
-var handlerMap = map[string]Handler{}
+var (
+	handlerMap   = map[string]Handler{}
+	handlerMapMu sync.RWMutex
+)
 
 func (e *Event) registerHandlers() {
+	handlerMapMu.Lock()
+	defer handlerMapMu.Unlock()
 	handlerMap = map[string]Handler{
 		GroupCreate:                  e.handleGroupCreateEvent,             // 群创建
 		GroupUnableAddDestroyAccount: e.handleGroupUnableAddDestroyAccount, // 无法添加注销账号到群聊
@@ -31,7 +37,9 @@ func (e *Event) registerHandlers() {
 }
 
 func (e *Event) handleEvent(model *Model) {
+	handlerMapMu.RLock()
 	handler := handlerMap[model.Event]
+	handlerMapMu.RUnlock()
 	if handler == nil {
 		listeners := e.ctx.GetEventListeners(model.Event)
 		if listeners == nil {
