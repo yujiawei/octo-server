@@ -102,8 +102,13 @@ func (cn *Common) Route(r *wkhttp.WKHttp) {
 		cn.Error("初始化应用配置返回空结果")
 		panic(errors.New("初始化应用配置返回空结果"))
 	}
-	// 设置系统私钥
-	cn.ctx.GetConfig().AppRSAPrivateKey = appConfigM.RSAPrivateKey
+	// 设置系统私钥（支持加密存储，向后兼容明文）
+	privateKey, err := decryptKey(appConfigM.RSAPrivateKey)
+	if err != nil {
+		cn.Error("解密RSA私钥失败", zap.Error(err))
+		panic(err)
+	}
+	cn.ctx.GetConfig().AppRSAPrivateKey = privateKey
 	cn.ctx.GetConfig().AppRSAPubKey = appConfigM.RSAPublicKey
 }
 
@@ -317,8 +322,14 @@ func (cn *Common) insertAppConfigIfNeed() (*appConfigModel, error) {
 		return nil, err
 	}
 
+	// Encrypt private key if master key is configured
+	encPrivateKey, err := encryptKey(privateKeyBuff.String())
+	if err != nil {
+		return nil, fmt.Errorf("encrypt private key: %w", err)
+	}
+
 	appConfigM = &appConfigModel{
-		RSAPrivateKey: privateKeyBuff.String(),
+		RSAPrivateKey: encPrivateKey,
 		RSAPublicKey:  publicKeyBuff.String(),
 		Version:       1,
 		SuperToken:    util.GenerUUID(),
