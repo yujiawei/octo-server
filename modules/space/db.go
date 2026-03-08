@@ -314,3 +314,12 @@ func GetSpaceMemberUIDs(ctx *config.Context, spaceID string) ([]string, error) {
 	`, spaceID).Load(&uids)
 	return uids, err
 }
+
+// insertMemberIgnore 插入成员（忽略重复）
+func (d *DB) insertMemberIgnore(m *MemberModel) error {
+	_, err := d.session.InsertBySql(
+		"INSERT IGNORE INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, ?, ?, NOW(), NOW())",
+		m.SpaceId, m.UID, m.Role, m.Status,
+	).Exec()
+	return err
+}

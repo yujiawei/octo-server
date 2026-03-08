@@ -145,6 +145,14 @@ func (s *Space) createSpace(c *wkhttp.Context) {
 	}
 	c.Response(resp)
 
+	// BotFather 自动加入新 Space
+	_ = s.db.insertMemberIgnore(&MemberModel{
+		SpaceId: spaceId,
+		UID:     "botfather",
+		Role:    0,
+		Status:  1,
+	})
+
 	// 刷新 ParseChannelID 缓存
 	go s.loadKnownSpaceIDs()
 }
