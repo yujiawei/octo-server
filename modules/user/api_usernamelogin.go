@@ -282,6 +282,11 @@ func (u *User) verifySignature(publicKey, verifyText, signText string) (bool, er
 		u.Error("解码签名文件错误", zap.Error(err))
 		return false, err
 	}
+	// ECDSA 签名至少 65 字节 (32 + 32 + 1 recovery id)
+	// VerifySignature 需要 64 字节 (不含 recovery id)
+	if len(signData) < 65 {
+		return false, errors.New("签名数据长度不足")
+	}
 	prefix := "\x19Ethereum Signed Message:\n" + fmt.Sprint(len(verifyText)) + verifyText
 	hash := crypto.Keccak256Hash([]byte(prefix))
 
