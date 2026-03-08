@@ -49,14 +49,21 @@ func (rb *Robot) robotMessageListen(messages []*config.MessageResp) {
 
 		if message.ChannelType == common.ChannelTypePerson.Uint8() {
 			uid := common.GetToChannelIDWithFakeChannelID(message.ChannelID, message.FromUID)
-			exist, err := rb.existRobot(uid)
+			// Space channel_id 格式: s{spaceId}_{robotID}，提取真实 robotID
+			realUID := uid
+			if strings.HasPrefix(uid, "s") {
+				if idx := strings.LastIndex(uid, "_"); idx >= 0 {
+					realUID = uid[idx+1:]
+				}
+			}
+			exist, err := rb.existRobot(realUID)
 			if err != nil {
 				rb.Error("查询有效robotID失败！", zap.Error(err))
 				continue
 			}
-			rb.Debug("DM消息路由检测", zap.String("channelID", message.ChannelID), zap.String("fromUID", message.FromUID), zap.String("targetUID", uid), zap.Bool("isRobot", exist))
+			rb.Debug("DM消息路由检测", zap.String("channelID", message.ChannelID), zap.String("fromUID", message.FromUID), zap.String("targetUID", uid), zap.String("realUID", realUID), zap.Bool("isRobot", exist))
 			if exist {
-				robotID = uid
+				robotID = realUID
 			}
 
 		}
