@@ -58,8 +58,6 @@ func (s *service) GetAppConfig() (*AppConfigResp, error) {
 	return &AppConfigResp{
 		RSAPublicKey:                   appConfigM.RSAPublicKey,
 		Version:                        appConfigM.Version,
-		SuperToken:                     appConfigM.SuperToken,
-		SuperTokenOn:                   appConfigM.SuperTokenOn,
 		WelcomeMessage:                 appConfigM.WelcomeMessage,
 		NewUserJoinSystemGroup:         appConfigM.NewUserJoinSystemGroup,
 		SearchByPhone:                  appConfigM.SearchByPhone,
@@ -125,11 +123,10 @@ func generateNums(length int, count int) []string {
 
 }
 
+// AppConfigResp returns safe configuration info, excluding sensitive fields such as SuperToken.
 type AppConfigResp struct {
 	RSAPublicKey                   string
 	Version                        int
-	SuperToken                     string
-	SuperTokenOn                   int
 	WelcomeMessage                 string // 登录欢迎语
 	NewUserJoinSystemGroup         int    // 新用户是否加入系统群聊
 	SearchByPhone                  int    // 是否可通过手机号搜索
