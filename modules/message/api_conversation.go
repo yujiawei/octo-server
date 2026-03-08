@@ -585,7 +585,8 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	if hasSpaceFilter {
 		filtered := make([]*SyncUserConversationResp, 0, len(syncUserConversationResps))
 		for _, conv := range syncUserConversationResps {
-			if conv.SpaceID == filterSpaceID {
+			// 匹配 Space 或旧会话（无 Space 前缀的裸 UID，视为属于当前 Space）
+			if conv.SpaceID == filterSpaceID || conv.SpaceID == "" {
 				filtered = append(filtered, conv)
 			}
 		}
