@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/smtp"
+	"strings"
 	"strconv"
 	"time"
 
@@ -101,6 +102,18 @@ func (s *EmailService) sendEmail(to, subject, body string) error {
 	}
 
 	auth := smtp.PlainAuth("", from, pwd, host)
+
+	// Sanitize header fields to prevent CRLF injection.
+	// An attacker could inject "Bcc: hacker@evil.com" via \r\n in to/subject.
+	sanitize := func(s string) string {
+		s = strings.ReplaceAll(s, "\r", "")
+		s = strings.ReplaceAll(s, "\n", "")
+		return s
+	}
+	to = sanitize(to)
+	subject = sanitize(subject)
+	from = sanitize(from)
+
 	msg := "From: " + from + "\r\n" +
 		"To: " + to + "\r\n" +
 		"Subject: " + subject + "\r\n" +
