@@ -104,6 +104,9 @@ func extractRealUID(uid string) string {
 func (h *commandHandler) handleCommand(fromUID string, cmd string) {
 	// 规范化命令（只取第一个词）
 	parts := strings.Fields(cmd)
+	if len(parts) == 0 {
+		return
+	}
 	command := strings.ToLower(parts[0])
 
 	switch command {
