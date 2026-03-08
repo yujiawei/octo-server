@@ -125,7 +125,7 @@ func (m *Message) Route(r *wkhttp.WKHttp) {
 	{
 		reaction.POST("/sync", m.syncReaction)
 	}
-	msg := r.Group("/v1/message")
+	msg := r.Group("/v1/message", m.ctx.AuthMiddleware(r))
 	{
 		msg.POST("/send", m.sendMsg) // 代发消息
 	}
