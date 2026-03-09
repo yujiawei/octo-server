@@ -1093,7 +1093,7 @@ func (rb *Robot) myBots(c *wkhttp.Context) {
 	args := []interface{}{loginUID}
 
 	if spaceID != "" {
-		query += ` AND f.to_uid IN (SELECT member_uid FROM space_members WHERE space_id = ?)`
+		query += ` AND f.to_uid IN (SELECT uid FROM space_member WHERE space_id = ?)`
 		args = append(args, spaceID)
 	}
 
