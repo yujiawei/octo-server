@@ -176,8 +176,9 @@ func (rb *Robot) messagesListen(messages []*config.MessageResp) {
 			continue
 		}
 		if contentMap != nil && contentMap["robot_id"] != nil {
-			robotID := contentMap["robot_id"]
-			if robotID != nil {
+			robotIDRaw := contentMap["robot_id"]
+			robotID, ok := robotIDRaw.(string)
+			if ok && robotID != "" {
 				if robotID == config.New().Account.SystemUID {
 					content, _ := contentMap["content"].(string)
 					entities, _ := contentMap["entities"].([]interface{})
@@ -231,7 +232,7 @@ func (rb *Robot) messagesListen(messages []*config.MessageResp) {
 						Header: config.MsgHeader{
 							RedDot: 1,
 						},
-						FromUID:     robotID.(string),
+						FromUID:     robotID,
 						ChannelID:   channelID,
 						ChannelType: message.ChannelType,
 						Payload: []byte(util.ToJson(map[string]interface{}{
