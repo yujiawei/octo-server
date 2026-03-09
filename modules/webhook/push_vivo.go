@@ -94,9 +94,14 @@ func (v *VIVOPush) Push(deviceToken string, payload Payload) error {
 	}
 
 	if resultMap != nil && resultMap["result"] != nil {
-		code, _ := resultMap["result"].(json.Number).Int64()
-		if code != 0 {
-			return errors.New(resultMap["desc"].(string))
+		if num, ok := resultMap["result"].(json.Number); ok {
+			code, _ := num.Int64()
+			if code != 0 {
+				if desc, ok := resultMap["desc"].(string); ok {
+					return errors.New(desc)
+				}
+				return fmt.Errorf("VIVO push failed with code %d", code)
+			}
 		}
 	}
 	return nil
@@ -129,12 +134,16 @@ func (v *VIVOPush) getAuthToken() string {
 		return authToken
 	}
 	if resultMap != nil && resultMap["result"] != nil {
-		code, _ := resultMap["result"].(json.Number).Int64()
-		message, _ := resultMap["desc"].(string)
-		if code != 0 {
-			v.Error("VIVO鉴权返回错误数据", zap.String("错误信息", message))
-		} else {
-			authToken = resultMap["authToken"].(string)
+		if num, ok := resultMap["result"].(json.Number); ok {
+			code, _ := num.Int64()
+			message, _ := resultMap["desc"].(string)
+			if code != 0 {
+				v.Error("VIVO鉴权返回错误数据", zap.String("错误信息", message))
+			} else {
+				if token, ok := resultMap["authToken"].(string); ok {
+					authToken = token
+				}
+			}
 		}
 	}
 	if authToken != "" {

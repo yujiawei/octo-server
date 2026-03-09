@@ -117,12 +117,15 @@ func getMessageAlert(msg msgOfflineNotify, toUser *user.Resp, ctx *config.Contex
 	}
 
 	var alert string
-	contentTypeInt64, _ := msg.PayloadMap["type"].(json.Number).Int64()
+	var contentTypeInt64 int64
+	if num, ok := msg.PayloadMap["type"].(json.Number); ok {
+		contentTypeInt64, _ = num.Int64()
+	}
 	contentType := common.ContentType(contentTypeInt64)
 	switch contentType {
 	case common.Text:
-		if msg.PayloadMap["content"] != nil {
-			alert = msg.PayloadMap["content"].(string)
+		if content, ok := msg.PayloadMap["content"].(string); ok {
+			alert = content
 		}
 	case common.Image:
 		alert = "[图片]"

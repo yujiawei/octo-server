@@ -127,9 +127,15 @@ func (h *HMSPush) Push(deviceToken string, payload Payload) error {
 		return err
 	}
 	if resultMap != nil && resultMap["code"] != nil {
-		code := resultMap["code"].(string)
+		code, ok := resultMap["code"].(string)
+		if !ok {
+			return fmt.Errorf("HMS push: unexpected code type %T", resultMap["code"])
+		}
 		if code != "80000000" {
-			return errors.New(resultMap["msg"].(string))
+			if msg, ok := resultMap["msg"].(string); ok {
+				return errors.New(msg)
+			}
+			return fmt.Errorf("HMS push failed with code %s", code)
 		}
 	}
 	return nil
