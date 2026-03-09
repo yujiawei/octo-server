@@ -63,6 +63,30 @@ func (rb *Robot) robotMessageListen(messages []*config.MessageResp) {
 			}
 			rb.Debug("DM消息路由检测", zap.String("channelID", message.ChannelID), zap.String("fromUID", message.FromUID), zap.String("targetUID", uid), zap.String("realUID", realUID), zap.Bool("isRobot", exist))
 			if exist {
+				// BotFather 跳过好友关系校验
+				if realUID != "botfather" {
+					isFriend, err := rb.userService.IsFriend(message.FromUID, realUID)
+					if err != nil {
+						rb.Error("查询好友关系失败", zap.Error(err), zap.String("fromUID", message.FromUID), zap.String("robotID", realUID))
+						continue
+					}
+					if !isFriend {
+						rb.Warn("用户与Bot非好友关系，拒绝转发消息", zap.String("fromUID", message.FromUID), zap.String("robotID", realUID))
+						rb.ctx.SendMessage(&config.MsgSendReq{
+							Header: config.MsgHeader{
+								RedDot: 1,
+							},
+							FromUID:     realUID,
+							ChannelID:   message.FromUID,
+							ChannelType: message.ChannelType,
+							Payload: []byte(util.ToJson(map[string]interface{}{
+								"content": "请先添加好友后再与我对话",
+								"type":    common.Text,
+							})),
+						})
+						continue
+					}
+				}
 				robotID = realUID
 			}
 
