@@ -319,3 +319,172 @@ func TestUpdateInviteInvalidCode(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 	assert.Contains(t, w.Body.String(), "邀请码不存在")
 }
+
+func TestJoinSpaceFullReturnsSpaceFullError(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	f.Route(s.GetRoute())
+
+	// 清空旧数据
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	// 创建测试 Space（max_users=1，只允许1人）
+	spaceId := "test-space-full"
+	inviteCode := "fullinvite"
+	ownerUID := "owner-uid"
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId:  spaceId,
+		Name:     "满员空间",
+		Creator:  ownerUID,
+		MaxUsers: 1,
+		Status:   1,
+	})
+	assert.NoError(t, err)
+
+	// 添加空间拥有者（占用唯一名额）
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId,
+		UID:     ownerUID,
+		Role:    2,
+		Status:  1,
+	})
+	assert.NoError(t, err)
+
+	// 创建邀请码
+	err = f.db.insertInvitation(&InvitationModel{
+		SpaceId:    spaceId,
+		InviteCode: inviteCode,
+		Creator:    ownerUID,
+		Status:     1,
+	})
+	assert.NoError(t, err)
+
+	// 新用户尝试加入（应返回 SPACE_FULL）
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("POST", "/v1/space/join",
+		bytes.NewReader([]byte(util.ToJson(map[string]string{
+			"invite_code": inviteCode,
+		}))))
+	req.Header.Set("token", testutil.Token)
+	assert.NoError(t, err)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	body := w.Body.String()
+	assert.Contains(t, body, `"status":"SPACE_FULL"`)
+	assert.Contains(t, body, "空间已满")
+}
+
+func TestJoinSpaceSuccessWithCapacity(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	f.Route(s.GetRoute())
+
+	// 清空旧数据
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	// 创建测试 Space（max_users=2，允许2人）
+	spaceId := "test-space-cap"
+	inviteCode := "capinvite"
+	ownerUID := "owner-uid-2"
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId:  spaceId,
+		Name:     "有空位的空间",
+		Creator:  ownerUID,
+		MaxUsers: 2,
+		Status:   1,
+	})
+	assert.NoError(t, err)
+
+	// 添加空间拥有者（占用1个名额）
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId,
+		UID:     ownerUID,
+		Role:    2,
+		Status:  1,
+	})
+	assert.NoError(t, err)
+
+	// 创建邀请码
+	err = f.db.insertInvitation(&InvitationModel{
+		SpaceId:    spaceId,
+		InviteCode: inviteCode,
+		Creator:    ownerUID,
+		Status:     1,
+	})
+	assert.NoError(t, err)
+
+	// 新用户加入（应成功）
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("POST", "/v1/space/join",
+		bytes.NewReader([]byte(util.ToJson(map[string]string{
+			"invite_code": inviteCode,
+		}))))
+	req.Header.Set("token", testutil.Token)
+	assert.NoError(t, err)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"space_id":"test-space-cap"`)
+
+	// 验证成员数
+	count, err := f.db.countActiveMembers(spaceId)
+	assert.NoError(t, err)
+	assert.Equal(t, 2, count)
+}
+
+func TestJoinSpaceUnlimitedCapacity(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	f.Route(s.GetRoute())
+
+	// 清空旧数据
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	// 创建测试 Space（max_users=0，不限制）
+	spaceId := "test-space-unlimited"
+	inviteCode := "unlimitedinvite"
+	ownerUID := "owner-uid-3"
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId:  spaceId,
+		Name:     "不限人数空间",
+		Creator:  ownerUID,
+		MaxUsers: 0, // 不限制
+		Status:   1,
+	})
+	assert.NoError(t, err)
+
+	// 添加空间拥有者
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId,
+		UID:     ownerUID,
+		Role:    2,
+		Status:  1,
+	})
+	assert.NoError(t, err)
+
+	// 创建邀请码
+	err = f.db.insertInvitation(&InvitationModel{
+		SpaceId:    spaceId,
+		InviteCode: inviteCode,
+		Creator:    ownerUID,
+		Status:     1,
+	})
+	assert.NoError(t, err)
+
+	// 新用户加入（应成功，不受限制）
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("POST", "/v1/space/join",
+		bytes.NewReader([]byte(util.ToJson(map[string]string{
+			"invite_code": inviteCode,
+		}))))
+	req.Header.Set("token", testutil.Token)
+	assert.NoError(t, err)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"space_id":"test-space-unlimited"`)
+}

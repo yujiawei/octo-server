@@ -3,6 +3,7 @@ package space
 import (
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strconv"
 	"time"
 
@@ -659,19 +660,6 @@ func (s *Space) joinSpace(c *wkhttp.Context) {
 		return
 	}
 
-	// 检查空间人数上限
-	if space.MaxUsers > 0 {
-		memberCount, countErr := s.db.countActiveMembers(invitation.SpaceId)
-		if countErr != nil {
-			c.ResponseError(errors.New("查询空间成员数失败"))
-			return
-		}
-		if memberCount >= space.MaxUsers {
-			c.ResponseError(errors.New("空间成员数已达上限"))
-			return
-		}
-	}
-
 	// 检查是否已经是成员
 	existing, err := s.db.queryMemberIncludeRemoved(invitation.SpaceId, loginUID)
 	if err != nil {
@@ -683,17 +671,20 @@ func (s *Space) joinSpace(c *wkhttp.Context) {
 			c.ResponseError(errors.New("你已经是该空间成员"))
 			return
 		}
-		// 重新激活
-		err = s.db.reactivateMember(invitation.SpaceId, loginUID, 0)
+		// 原子检查容量并重新激活成员
+		err = s.db.atomicReactivateMemberIfNotFull(invitation.SpaceId, loginUID, space.MaxUsers)
 	} else {
-		err = s.db.insertMemberNoTx(&MemberModel{
-			SpaceId: invitation.SpaceId,
-			UID:     loginUID,
-			Role:    0,
-			Status:  1,
-		})
+		// 原子检查容量并添加新成员
+		err = s.db.atomicAddMemberIfNotFull(invitation.SpaceId, loginUID, space.MaxUsers)
 	}
 	if err != nil {
+		if errors.Is(err, ErrSpaceFull) {
+			c.ResponseWithStatus(http.StatusBadRequest, map[string]interface{}{
+				"status": "SPACE_FULL",
+				"msg":    "空间已满，无法加入",
+			})
+			return
+		}
 		c.ResponseError(errors.New("加入空间失败"))
 		return
 	}

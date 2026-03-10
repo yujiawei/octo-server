@@ -1,6 +1,7 @@
 package space
 
 import (
+	"errors"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -332,4 +333,82 @@ func (d *DB) insertMemberIgnore(m *MemberModel) error {
 		m.SpaceId, m.UID, m.Role, m.Status,
 	).Exec()
 	return err
+}
+
+// ErrSpaceFull indicates the space has reached its member capacity
+var ErrSpaceFull = errors.New("SPACE_FULL")
+
+// atomicAddMemberIfNotFull atomically checks capacity and adds a member.
+// Uses SELECT ... FOR UPDATE to prevent race conditions.
+// Returns ErrSpaceFull if the space has reached its member limit.
+func (d *DB) atomicAddMemberIfNotFull(spaceId string, uid string, maxUsers int) error {
+	tx, err := d.session.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	// Lock the space row and get current member count atomically
+	var count int
+	_, err = tx.SelectBySql(`
+		SELECT COUNT(*) FROM space_member
+		WHERE space_id = ? AND status = 1
+		FOR UPDATE
+	`, spaceId).Load(&count)
+	if err != nil {
+		return err
+	}
+
+	// Check capacity
+	if maxUsers > 0 && count >= maxUsers {
+		return ErrSpaceFull
+	}
+
+	// Insert new member
+	_, err = tx.InsertBySql(
+		"INSERT INTO space_member (space_id, uid, role, status, created_at, updated_at) VALUES (?, ?, 0, 1, NOW(), NOW())",
+		spaceId, uid,
+	).Exec()
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+// atomicReactivateMemberIfNotFull atomically checks capacity and reactivates a member.
+// Returns ErrSpaceFull if the space has reached its member limit.
+func (d *DB) atomicReactivateMemberIfNotFull(spaceId string, uid string, maxUsers int) error {
+	tx, err := d.session.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	// Lock the space row and get current member count atomically
+	var count int
+	_, err = tx.SelectBySql(`
+		SELECT COUNT(*) FROM space_member
+		WHERE space_id = ? AND status = 1
+		FOR UPDATE
+	`, spaceId).Load(&count)
+	if err != nil {
+		return err
+	}
+
+	// Check capacity
+	if maxUsers > 0 && count >= maxUsers {
+		return ErrSpaceFull
+	}
+
+	// Reactivate member
+	_, err = tx.Update("space_member").
+		Set("status", 1).Set("role", 0).
+		Set("updated_at", time.Now()).
+		Where("space_id=? AND uid=?", spaceId, uid).Exec()
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
 }
