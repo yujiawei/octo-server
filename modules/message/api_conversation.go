@@ -586,13 +586,37 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	if hasSpaceFilter {
 		// 查用户的默认 Space（最早加入的），裸 UID 旧会话只在默认 Space 显示
 		defaultSpaceID := space.GetUserDefaultSpaceID(co.ctx, loginUID)
+
+		// 群聊的 channel_id 是裸 group_no（没有 Space 前缀），ParseChannelID 返回 spaceID=""。
+		// 需要从 group 表查出真实 space_id，避免其他 Space 的群出现在默认 Space。
+		groupSpaceMap := make(map[string]string) // group_no -> space_id
+		var bareGroupNos []string
+		for _, conv := range syncUserConversationResps {
+			if conv.SpaceID == "" && conv.ChannelType == common.ChannelTypeGroup.Uint8() {
+				bareGroupNos = append(bareGroupNos, conv.ChannelID)
+			}
+		}
+		if len(bareGroupNos) > 0 {
+			groupInfos, err := co.groupService.GetGroups(bareGroupNos)
+			if err == nil && len(groupInfos) > 0 {
+				for _, g := range groupInfos {
+					groupSpaceMap[g.GroupNo] = g.SpaceID
+				}
+			}
+		}
+
 		filtered := make([]*SyncUserConversationResp, 0, len(syncUserConversationResps))
 		for _, conv := range syncUserConversationResps {
-			if conv.SpaceID == filterSpaceID {
-				// Space 格式 channel_id，属于当前 Space
+			spaceID := conv.SpaceID
+			// 群聊用 group 表的 space_id 替代 ParseChannelID 的结果
+			if spaceID == "" && conv.ChannelType == common.ChannelTypeGroup.Uint8() {
+				spaceID = groupSpaceMap[conv.ChannelID]
+			}
+			if spaceID == filterSpaceID {
+				// 属于当前 Space
 				filtered = append(filtered, conv)
-			} else if conv.SpaceID == "" && filterSpaceID == defaultSpaceID {
-				// 裸 UID 旧会话（单聊+群聊）只在用户默认 Space 显示
+			} else if spaceID == "" && filterSpaceID == defaultSpaceID {
+				// 裸 UID 旧会话或老群（无 space_id）只在用户默认 Space 显示
 				filtered = append(filtered, conv)
 			}
 			// 其他情况（旧会话 + 非默认 Space）→ 不显示
