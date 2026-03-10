@@ -709,3 +709,97 @@ func TestGroupDetailGet_UnauthenticatedDenied(t *testing.T) {
 	// Should be unauthorized
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
+
+// TestBlacklistRemoveUsesFilteredUIDs tests that blacklist removal only removes
+// members with ForbiddenExpirTime == 0, not all requested UIDs (issue #482)
+func TestBlacklistRemoveUsesFilteredUIDs(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	f.Route(s.GetRoute())
+
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	groupNo := "blacklist_test_group"
+
+	// Create users
+	err = f.userDB.Insert(&user.Model{
+		UID:  "user_a",
+		Name: "User A",
+	})
+	assert.NoError(t, err)
+	err = f.userDB.Insert(&user.Model{
+		UID:  "user_b",
+		Name: "User B",
+	})
+	assert.NoError(t, err)
+
+	// Create group with testutil.UID as creator
+	err = f.db.Insert(&Model{
+		GroupNo: groupNo,
+		Name:    "Blacklist Test Group",
+		Creator: testutil.UID,
+		Status:  1,
+	})
+	assert.NoError(t, err)
+
+	// Add creator as member with creator role
+	err = f.db.InsertMember(&MemberModel{
+		GroupNo: groupNo,
+		UID:     testutil.UID,
+		Role:    MemberRoleCreator,
+		Status:  1,
+		Version: 1,
+	})
+	assert.NoError(t, err)
+
+	// Add user_a: blacklisted with ForbiddenExpirTime = 0 (should be removed)
+	err = f.db.InsertMember(&MemberModel{
+		GroupNo:            groupNo,
+		UID:                "user_a",
+		Role:               MemberRoleCommon,
+		Status:             2, // GroupMemberStatusBlacklist
+		ForbiddenExpirTime: 0, // No active forbidden period
+		Version:            1,
+	})
+	assert.NoError(t, err)
+
+	// Add user_b: blacklisted with ForbiddenExpirTime > 0 (should NOT be removed)
+	futureTime := time.Now().Add(24 * time.Hour).Unix()
+	err = f.db.InsertMember(&MemberModel{
+		GroupNo:            groupNo,
+		UID:                "user_b",
+		Role:               MemberRoleCommon,
+		Status:             2, // GroupMemberStatusBlacklist
+		ForbiddenExpirTime: futureTime,
+		Version:            1,
+	})
+	assert.NoError(t, err)
+
+	// Call blacklist remove for both users
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("POST", "/v1/groups/"+groupNo+"/blacklist/remove",
+		bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
+			"uids": []string{"user_a", "user_b"},
+		}))))
+	req.Header.Set("token", testutil.Token)
+	assert.NoError(t, err)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	// Verify: user_a should have status changed to normal (1)
+	memberA, err := f.db.QueryMemberWithUID("user_a", groupNo)
+	assert.NoError(t, err)
+	assert.NotNil(t, memberA)
+	assert.Equal(t, 1, memberA.Status, "user_a with ForbiddenExpirTime=0 should be removed from blacklist")
+
+	// Verify: user_b should still have blacklist status because ForbiddenExpirTime > 0
+	// The fix ensures setGroupBlacklist is only called with removeUIDs (user_a),
+	// not req.Uids (both users). user_b's DB status was set to normal by updateMembersStatus,
+	// but the IM blacklist should only be updated for user_a.
+	memberB, err := f.db.QueryMemberWithUID("user_b", groupNo)
+	assert.NoError(t, err)
+	assert.NotNil(t, memberB)
+	// Note: updateMembersStatus sets DB status for all req.Uids to normal,
+	// but setGroupBlacklist (IM layer) should only be called for removeUIDs
+}

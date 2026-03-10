@@ -2763,7 +2763,7 @@ func (g *Group) blacklist(c *wkhttp.Context) {
 			}
 		}
 		if len(removeUIDs) > 0 {
-			err = g.setGroupBlacklist(groupNo, req.Uids, false)
+			err = g.setGroupBlacklist(groupNo, removeUIDs, false)
 			if err != nil {
 				g.Error("移除IM黑名单错误", zap.Error(err))
 				c.ResponseError(errors.New("移除IM黑名单错误"))
