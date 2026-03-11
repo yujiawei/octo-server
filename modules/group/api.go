@@ -101,8 +101,11 @@ func (g *Group) Route(r *wkhttp.WKHttp) {
 	}
 	openGroups := r.Group("/v1/groups")
 	{ // 获取群头像
-		openGroups.GET("/:group_no/avatar", g.avatarGet)       // 获取群头像
-		openGroups.GET("/:group_no/scanjoin", g.groupScanJoin) // 扫码加入群
+		openGroups.GET("/:group_no/avatar", g.avatarGet) // 获取群头像
+	}
+	authGroups := r.Group("/v1/groups", g.ctx.AuthMiddleware(r))
+	{
+		authGroups.GET("/:group_no/scanjoin", g.groupScanJoin) // 扫码加入群（需要认证）
 	}
 	openGroup := r.Group("/v1/group")
 	{
@@ -1720,6 +1723,11 @@ func (g *Group) groupQRCode(c *wkhttp.Context) {
 
 // 加入群
 func (g *Group) groupScanJoin(c *wkhttp.Context) {
+	loginUID := c.GetLoginUID()
+	if loginUID == "" {
+		c.ResponseError(errors.New("请先登录"))
+		return
+	}
 	authCode := c.Query("auth_code")
 	groupNo := c.Param("group_no")
 	if groupNo == "" {
@@ -1786,6 +1794,10 @@ func (g *Group) groupScanJoin(c *wkhttp.Context) {
 	}
 	if strings.TrimSpace(scaner) == "" {
 		c.ResponseError(errors.New("没有二维码扫码信息！"))
+		return
+	}
+	if scaner != loginUID {
+		c.ResponseError(errors.New("授权码与当前登录用户不匹配"))
 		return
 	}
 	existMember, err := g.db.ExistMember(scaner, groupNo)
