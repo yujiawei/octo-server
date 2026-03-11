@@ -214,9 +214,21 @@ func (g *Group) membersGet(c *wkhttp.Context) {
 	if limit <= 0 || limit > 100000 {
 		limit = 100
 	}
+	// Verify user is a group member
+	loginUID := c.GetLoginUID()
+	isMember, err := g.db.ExistMember(loginUID, groupNo)
+	if err != nil {
+		g.Error("查询群成员关系失败", zap.Error(err))
+		c.ResponseError(errors.New("查询群成员关系失败"))
+		return
+	}
+	if !isMember {
+		c.ResponseError(errors.New("没有权限查看此群成员列表"))
+		return
+	}
+
 	var members []*MemberDetailModel
-	var err error
-	members, err = g.db.queryMembersWithKeyword(groupNo, c.GetLoginUID(), keyword, page, limit)
+	members, err = g.db.queryMembersWithKeyword(groupNo, loginUID, keyword, page, limit)
 	if err != nil {
 		g.Error("查询成员列表失败！", zap.Error(err))
 		c.ResponseError(errors.New("查询成员列表失败！"))
@@ -370,6 +382,19 @@ func (g *Group) syncMembers(c *wkhttp.Context) {
 		return
 	}
 
+	// Verify user is a group member
+	loginUID := c.GetLoginUID()
+	isMember, err := g.db.ExistMember(loginUID, groupNo)
+	if err != nil {
+		g.Error("查询群成员关系失败", zap.Error(err))
+		c.ResponseError(errors.New("查询群成员关系失败"))
+		return
+	}
+	if !isMember {
+		c.ResponseError(errors.New("没有权限同步此群成员"))
+		return
+	}
+
 	group, err := g.db.QueryWithGroupNo(groupNo)
 	if err != nil {
 		g.Error("查询群信息失败！", zap.Error(err), zap.String("groupNo", groupNo))
@@ -415,6 +440,18 @@ func (g *Group) groupGet(c *wkhttp.Context) {
 	// 	return
 	// }
 	uid := c.MustGet("uid").(string)
+
+	// Verify user is a group member
+	isMember, err := g.db.ExistMember(uid, groupNo)
+	if err != nil {
+		g.Error("查询群成员关系失败", zap.Error(err))
+		c.ResponseError(errors.New("查询群成员关系失败"))
+		return
+	}
+	if !isMember {
+		c.ResponseError(errors.New("没有权限查看此群信息"))
+		return
+	}
 
 	groupResp, err := g.groupService.GetGroupDetail(groupNo, uid)
 	if err != nil {
