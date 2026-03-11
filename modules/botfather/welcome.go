@@ -99,16 +99,13 @@ func (bf *BotFather) handleUserRegisterEvent(data []byte, commit config.EventCom
 }
 
 // sendWelcomeMessage sends a welcome message from BotFather to the new user
-// If spaceID is non-empty, the channelID is prefixed with Space format: s{spaceId}_{uid}
+// Note: DM always uses bare UID as channelID (WuKongIM DM doesn't support Space prefix)
 func (bf *BotFather) sendWelcomeMessage(toUID string, spaceID string) error {
 	// Use default welcome message
-	// Future: can be made configurable via database or env var
 	welcomeContent := DefaultWelcomeMessage
 
+	// DM must use bare UID — WuKongIM doesn't support Space-prefixed DM channel_id
 	channelID := toUID
-	if spaceID != "" {
-		channelID = "s" + spaceID + "_" + toUID
-	}
 
 	// Send message via IM
 	_, err := bf.ctx.SendMessageWithResult(&config.MsgSendReq{
