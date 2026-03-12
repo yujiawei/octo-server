@@ -845,6 +845,33 @@ func (m *Message) syncReaction(c *wkhttp.Context) {
 		c.ResponseError(errors.New("数据格式有误！"))
 		return
 	}
+	// Verify channel membership before syncing reaction data
+	if req.ChannelType == common.ChannelTypeGroup.Uint8() {
+		isMember, err := m.groupService.ExistMember(req.ChannelID, loginUID)
+		if err != nil {
+			m.Error("查询群成员关系错误", zap.Error(err))
+			c.ResponseError(errors.New("查询群成员关系错误"))
+			return
+		}
+		if !isMember {
+			c.ResponseError(errors.New("没有权限同步此频道的回应数据"))
+			return
+		}
+	} else if req.ChannelType == common.ChannelTypePerson.Uint8() {
+		if req.ChannelID != loginUID {
+			isFriend, err := m.userService.IsFriend(loginUID, req.ChannelID)
+			if err != nil {
+				m.Error("查询好友关系错误", zap.Error(err))
+				c.ResponseError(errors.New("查询好友关系错误"))
+				return
+			}
+			if !isFriend {
+				c.ResponseError(errors.New("没有权限同步此频道的回应数据"))
+				return
+			}
+		}
+	}
+
 	fakeChannelID := req.ChannelID
 	if req.ChannelType == common.ChannelTypePerson.Uint8() {
 		if !strings.Contains(req.ChannelID, "@") {
