@@ -212,9 +212,17 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 	if !strings.HasPrefix(path, "/") {
 		path = fmt.Sprintf("/%s", path)
 	}
-	// 修复客户端上传路径缺少扩展名点号的问题（如 HASHpdf → HASH.pdf）
-	if ext != "" && !strings.HasSuffix(strings.ToLower(path), ext) && strings.HasSuffix(strings.ToLower(path), ext[1:]) {
-		path = path[:len(path)-len(ext)+1] + ext
+	// 修复客户端上传路径缺少扩展名的问题
+	pathExt := strings.ToLower(filepath.Ext(path))
+	if ext != "" && pathExt == "" {
+		// 路径完全没有扩展名（如 /HASH），根据文件名追加（→ /HASH.jpg）
+		if strings.HasSuffix(strings.ToLower(path), ext[1:]) {
+			// 有扩展名文本但缺点号（如 HASHpdf → HASH.pdf）
+			path = path[:len(path)-len(ext)+1] + ext
+		} else {
+			// 完全没有扩展名（如纯HASH），直接追加
+			path = path + ext
+		}
 	}
 	var sign []byte
 	if signatureInt == 1 {
