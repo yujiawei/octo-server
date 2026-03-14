@@ -1244,9 +1244,13 @@ func (rb *Robot) botUploadFile(c *wkhttp.Context) {
 		return
 	}
 
-	previewPath := fmt.Sprintf("file/preview/%s%s", fileType, path)
+	fullURL, err := rb.fileService.DownloadURL(storagePath, fileName)
+	if err != nil {
+		rb.Warn("生成下载URL失败，回退到相对路径", zap.Error(err))
+		fullURL = fmt.Sprintf("file/preview/%s%s", fileType, path)
+	}
 	c.Response(gin.H{
-		"url":  previewPath,
+		"url":  fullURL,
 		"name": fileName,
 		"size": fileHeader.Size,
 	})
