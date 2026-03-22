@@ -14,7 +14,6 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/channel"
 	chservice "github.com/Mininglamp-OSS/octo-server/modules/channel/service"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
-	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/Mininglamp-OSS/octo-lib/common"
@@ -77,22 +76,25 @@ func NewConversation(ctx *config.Context) *Conversation {
 // Route 路由配置
 func (co *Conversation) Route(r *wkhttp.WKHttp) {
 
-	// TODO: 这个里的接口后面移到 conversation的组里，因为单词拼错了 😭
-	coversations := r.Group("/v1/coversations", co.ctx.AuthMiddleware(r))
-	{
-		// 获取最近会话 TODO: 此接口应该没有被使用了
-		coversations.GET("", co.getConversations)
-
+	// 拼写错误的旧路由（deprecated）
+	deprecatedLog := func(c *wkhttp.Context) {
+		co.Warn("deprecated route called, use /v1/conversation(s) instead", zap.String("path", c.Request.URL.Path))
+		// 废弃路由不处理 space_id，删除以免影响后续逻辑
+		q := c.Request.URL.Query()
+		q.Del("space_id")
+		c.Request.URL.RawQuery = q.Encode()
+		c.Next()
 	}
-
-	// TODO: 这个里的接口后面移到 conversation的组里，因为单词拼错了 😭
-	cnversation := r.Group("/v1/coversation", co.ctx.AuthMiddleware(r))
+	coversations := r.Group("/v1/coversations", co.ctx.AuthMiddleware(r), deprecatedLog)
+	{
+		coversations.GET("", co.getConversations)
+	}
+	cnversation := r.Group("/v1/coversation", co.ctx.AuthMiddleware(r), deprecatedLog)
 	{
 		cnversation.PUT("/clearUnread", co.clearConversationUnread)
-
 	}
 
-	conversation := r.Group("/v1/conversation", co.ctx.AuthMiddleware(r))
+	conversation := r.Group("/v1/conversation", co.ctx.AuthMiddleware(r), spacepkg.SpaceMiddleware(co.ctx))
 	{
 		// 离线的最近会话
 		conversation.POST("/sync", co.syncUserConversation)
@@ -278,9 +280,9 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 		return
 	}
 
-	// Space 过滤（可选参数）
-	filterSpaceID := c.Query("space_id")
-	hasSpaceFilter := c.Request.URL.Query().Has("space_id")
+	// Space 过滤（从 middleware 获取，已校验 membership）
+	filterSpaceID := spacepkg.GetSpaceID(c)
+	hasSpaceFilter := filterSpaceID != ""
 
 	version := req.Version
 	loginUID := c.GetLoginUID()
@@ -624,110 +626,9 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	}
 	// Space 过滤
 	if hasSpaceFilter {
-		// 查用户的默认 Space（最早加入的），裸 UID 旧会话只在默认 Space 显示
-		defaultSpaceID := space.GetUserDefaultSpaceID(co.ctx, loginUID)
-
-		// 群聊的 channel_id 是裸 group_no（没有 Space 前缀），ParseChannelID 返回 spaceID=""。
-		// 需要从 group 表查出真实 space_id，避免其他 Space 的群出现在默认 Space。
-		groupSpaceMap := make(map[string]string) // group_no -> space_id
-		var bareGroupNos []string
-		var bareDMUIDs []string // DM 会话中 spaceID=="" 的 channel_id（对方 UID）
-		for _, conv := range syncUserConversationResps {
-			if conv.SpaceID == "" && conv.ChannelType == common.ChannelTypeGroup.Uint8() {
-				bareGroupNos = append(bareGroupNos, conv.ChannelID)
-			}
-			if conv.SpaceID == "" && conv.ChannelType == common.ChannelTypePerson.Uint8() {
-				bareDMUIDs = append(bareDMUIDs, conv.ChannelID)
-			}
-		}
-		if len(bareGroupNos) > 0 {
-			groupInfos, err := co.groupService.GetGroups(bareGroupNos)
-			if err == nil && len(groupInfos) > 0 {
-				for _, g := range groupInfos {
-					groupSpaceMap[g.GroupNo] = g.SpaceID
-				}
-			}
-		}
-
-		// Bot DM 过滤：找出 DM 对方是 Bot 的 UID，再检查 Bot 是否在当前 Space
-		botSet := make(map[string]bool)        // 所有非系统 Bot UID
-		botInSpace := make(map[string]bool)    // 在 filterSpaceID 中的 Bot UID
-		skipBotFilter := false                 // DB 查询失败时跳过过滤，避免误删
-		systemBots := map[string]bool{"botfather": true, "u_10000": true, "fileHelper": true}
-		if filterSpaceID != "" && len(bareDMUIDs) > 0 {
-			// 批量查询哪些 UID 是 Bot（排除系统 Bot）
-			var nonSystemUIDs []string
-			for _, uid := range bareDMUIDs {
-				if !systemBots[uid] {
-					nonSystemUIDs = append(nonSystemUIDs, uid)
-				}
-			}
-			if len(nonSystemUIDs) > 0 {
-				var botUIDs []string
-				_, err := co.ctx.DB().Select("uid").From("`user`").
-					Where("uid IN ? AND robot=1", nonSystemUIDs).
-					Load(&botUIDs)
-				if err != nil {
-					co.Warn("查询Bot UID错误，跳过Bot过滤", zap.Error(err))
-					skipBotFilter = true
-				}
-				if !skipBotFilter {
-					for _, uid := range botUIDs {
-						botSet[uid] = true
-					}
-					if len(botUIDs) > 0 {
-						// 批量检查这些 Bot 是否在 filterSpaceID 中
-						var memberUIDs []string
-						_, err := co.ctx.DB().Select("uid").From("space_member").
-							Where("space_id=? AND uid IN ? AND status=1", filterSpaceID, botUIDs).
-							Load(&memberUIDs)
-						if err != nil {
-							co.Warn("查询Bot Space成员错误，跳过Bot过滤", zap.Error(err))
-							skipBotFilter = true
-						}
-						if !skipBotFilter {
-							for _, uid := range memberUIDs {
-								botInSpace[uid] = true
-							}
-						}
-					}
-				}
-			}
-		}
-
-		filtered := make([]*SyncUserConversationResp, 0, len(syncUserConversationResps))
-		for _, conv := range syncUserConversationResps {
-			spaceID := conv.SpaceID
-			// 群聊用 group 表的 space_id 替代 ParseChannelID 的结果
-			if spaceID == "" && conv.ChannelType == common.ChannelTypeGroup.Uint8() {
-				spaceID = groupSpaceMap[conv.ChannelID]
-			}
-			if spaceID == filterSpaceID {
-				filtered = append(filtered, conv)
-			} else if spaceID == "" && filterSpaceID == defaultSpaceID {
-				// 裸 UID 旧会话只在默认 Space 显示
-				// Bot DM：Bot 不在默认 Space 则排除（查询失败时不过滤，避免误删）
-				if !skipBotFilter && conv.ChannelType == common.ChannelTypePerson.Uint8() && botSet[conv.ChannelID] && !botInSpace[conv.ChannelID] {
-					continue
-				}
-				filtered = append(filtered, conv)
-			} else if spaceID == "" && conv.ChannelType == common.ChannelTypePerson.Uint8() {
-				// 非默认 Space 中的 DM 会话
-				if skipBotFilter {
-					// 查询失败时不过滤，保留所有 DM
-					filtered = append(filtered, conv)
-				} else if systemBots[conv.ChannelID] {
-					// 系统 Bot → 所有 Space 可见
-					filtered = append(filtered, conv)
-				} else if botSet[conv.ChannelID] && botInSpace[conv.ChannelID] {
-					// 普通 Bot 在此 Space → 显示
-					filtered = append(filtered, conv)
-				}
-				// 普通 DM 或 Bot 不在此 Space → 不显示
-			}
-			// 其他情况（旧群会话 + 非默认 Space）→ 不显示
-		}
-		syncUserConversationResps = filtered
+		syncUserConversationResps = FilterConversationsBySpace(
+			syncUserConversationResps, filterSpaceID, loginUID, co.ctx, co.groupService,
+		)
 	}
 
 	c.Response(SyncUserConversationRespWrap{

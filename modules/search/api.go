@@ -10,6 +10,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/message"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	"github.com/Mininglamp-OSS/octo-server/pkg/log"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	"github.com/Mininglamp-OSS/octo-server/pkg/util"
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -37,7 +38,7 @@ func New(ctx *config.Context) *Search {
 }
 
 func (s *Search) Route(r *wkhttp.WKHttp) {
-	searchs := r.Group("/v1/search", s.ctx.AuthMiddleware(r))
+	searchs := r.Group("/v1/search", s.ctx.AuthMiddleware(r), spacepkg.SpaceMiddleware(s.ctx))
 	{
 		searchs.POST("/global", s.global) // 全局搜索
 	}
@@ -236,26 +237,9 @@ func (s *Search) global(c *wkhttp.Context) {
 		}
 	}
 
-	// 加入的群（按 Space 过滤）
+	// 加入的群（按 Space 过滤，membership 已由 SpaceMiddleware 校验）
 	groupResps := make([]*channelResp, 0)
-	searchSpaceID := c.Query("space_id")
-	// Verify space membership if space_id filter is provided
-	if searchSpaceID != "" {
-		var spaceCount int
-		_, err := s.ctx.DB().SelectBySql(
-			"SELECT COUNT(*) FROM space_member WHERE space_id=? AND uid=? AND status=1",
-			searchSpaceID, loginUID,
-		).Load(&spaceCount)
-		if err != nil {
-			s.Error("查询Space成员关系错误", zap.Error(err))
-			c.ResponseError(errors.New("查询空间权限失败"))
-			return
-		}
-		if spaceCount == 0 {
-			c.ResponseError(errors.New("没有权限搜索此空间"))
-			return
-		}
-	}
+	searchSpaceID := spacepkg.GetSpaceID(c)
 	if req.OnlyMessage == 0 && len(joinedGroups) > 0 {
 		for _, g := range joinedGroups {
 			// Space 过滤：如果指定了 space_id，只显示该 Space 的群
@@ -347,57 +331,30 @@ func (s *Search) global(c *wkhttp.Context) {
 
 	// Space 过滤：排除不在当前 Space 的 Bot DM 消息
 	if searchSpaceID != "" && len(realMessages) > 0 {
-		systemBots := map[string]bool{"botfather": true, "u_10000": true, "fileHelper": true}
 		var dmUIDs []string
 		for _, m := range realMessages {
-			if m.ChannelType == common.ChannelTypePerson.Uint8() && !systemBots[m.ChannelID] {
+			if m.ChannelType == common.ChannelTypePerson.Uint8() && !spacepkg.SystemBots[m.ChannelID] {
 				dmUIDs = append(dmUIDs, m.ChannelID)
 			}
 		}
 		if len(dmUIDs) > 0 {
 			dmUIDs = util.RemoveRepeatedElement(dmUIDs)
-			skipBotFilter := false
-			// 批量查询哪些是 Bot
-			var botUIDs []string
-			_, err := s.ctx.DB().Select("uid").From("`user`").
-				Where("uid IN ? AND robot=1", dmUIDs).
-				Load(&botUIDs)
+			botSet, err := spacepkg.GetBotUIDs(s.ctx.DB(), dmUIDs)
 			if err != nil {
 				s.Warn("搜索查询Bot UID错误，跳过Bot过滤", zap.Error(err))
-				skipBotFilter = true
-			}
-			if !skipBotFilter && len(botUIDs) > 0 {
-				// 批量查询哪些 Bot 在 searchSpaceID 中
-				var memberUIDs []string
-				_, err := s.ctx.DB().Select("uid").From("space_member").
-					Where("space_id=? AND uid IN ? AND status=1", searchSpaceID, botUIDs).
-					Load(&memberUIDs)
+			} else if len(botSet) > 0 {
+				botInSpace, err := spacepkg.CheckBotsInSpace(s.ctx.DB(), searchSpaceID, botSet)
 				if err != nil {
 					s.Warn("搜索查询Bot Space成员错误，跳过Bot过滤", zap.Error(err))
-					skipBotFilter = true
-				}
-				if !skipBotFilter {
-					memberSet := make(map[string]bool, len(memberUIDs))
-					for _, uid := range memberUIDs {
-						memberSet[uid] = true
-					}
-					// 排除不在 Space 中的 Bot DM 消息
-					botExcluded := make(map[string]bool)
-					for _, uid := range botUIDs {
-						if !memberSet[uid] {
-							botExcluded[uid] = true
+				} else {
+					spaceFiltered := make([]*config.MessageResp, 0, len(realMessages))
+					for _, m := range realMessages {
+						if m.ChannelType == common.ChannelTypePerson.Uint8() && botSet[m.ChannelID] && !botInSpace[m.ChannelID] {
+							continue
 						}
+						spaceFiltered = append(spaceFiltered, m)
 					}
-					if len(botExcluded) > 0 {
-						spaceFiltered := make([]*config.MessageResp, 0, len(realMessages))
-						for _, m := range realMessages {
-							if m.ChannelType == common.ChannelTypePerson.Uint8() && botExcluded[m.ChannelID] {
-								continue
-							}
-							spaceFiltered = append(spaceFiltered, m)
-						}
-						realMessages = spaceFiltered
-					}
+					realMessages = spaceFiltered
 				}
 			}
 		}

@@ -99,6 +99,8 @@ dmworkim/
 │   ├── webhook/      # 推送
 │   ├── file/         # 文件
 │   └── ...
+├── pkg/
+│   └── space/        # Space 多租户隔离中间件
 ├── adapters/         # AI Agent 适配器
 ├── configs/          # 配置
 └── docker/           # 部署
