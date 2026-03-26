@@ -6,6 +6,7 @@ import (
 	"runtime/debug"
 
 	"github.com/Mininglamp-OSS/octo-server/modules/source"
+	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
@@ -297,14 +298,19 @@ func (f *Friend) handleUserRegister(data []byte, commit config.EventCommit) {
 		return
 	}
 	// 发送确认消息给对方
+	evtSpaceID := space.GetCommonSpaceID(f.ctx, uid, inviteUid)
+	evtCmdParam := map[string]interface{}{
+		"to_uid":    inviteUid,
+		"from_uid":  uid,
+		"from_name": userInfo.Name,
+	}
+	if evtSpaceID != "" {
+		evtCmdParam["space_id"] = evtSpaceID
+	}
 	err = f.ctx.SendCMD(config.MsgCMDReq{
 		CMD:         common.CMDFriendAccept,
 		Subscribers: []string{uid, inviteUid},
-		Param: map[string]interface{}{
-			"to_uid":    inviteUid,
-			"from_uid":  uid,
-			"from_name": userInfo.Name,
-		},
+		Param:       evtCmdParam,
 	})
 	if err != nil {
 		f.Error("发送消息失败！", zap.Error(err))
@@ -316,10 +322,14 @@ func (f *Friend) handleUserRegister(data []byte, commit config.EventCommit) {
 		content = f.ctx.GetConfig().Friend.AddedTipsText
 	}
 	// 发送消息
-	payload := []byte(util.ToJson(map[string]interface{}{
+	evtTipPayload := map[string]interface{}{
 		"content": content,
 		"type":    common.Tip,
-	}))
+	}
+	if evtSpaceID != "" {
+		evtTipPayload["space_id"] = evtSpaceID
+	}
+	payload := []byte(util.ToJson(evtTipPayload))
 
 	err = f.ctx.SendMessage(&config.MsgSendReq{
 		FromUID:     uid,
