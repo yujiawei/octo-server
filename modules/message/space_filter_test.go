@@ -33,8 +33,12 @@ func TestFilterConversationsBySpace_SystemBotsVisible(t *testing.T) {
 	}
 
 	// filterSpaceID != defaultSpaceID，所以走"非默认 Space 中的 DM"分支
-	result := filterConversationsCore(convs, "spaceB", "spaceA", nil, nil, nil, false, false)
-	// 系统 Bot 可见，custom_bot 不可见
+	// botSet=nil → custom_bot 不被识别为 Bot，当作普通 DM 保留
+	// 传入 botSet 标记 custom_bot 为 Bot，且不在此 Space → 不显示
+	botSet := map[string]bool{"custom_bot": true}
+	botInSpace := map[string]bool{}
+	result := filterConversationsCore(convs, "spaceB", "spaceA", nil, botSet, botInSpace, false, false)
+	// 系统 Bot 可见，custom_bot（Bot 不在此 Space）不可见
 	assert.Len(t, result, 3)
 	ids := []string{result[0].ChannelID, result[1].ChannelID, result[2].ChannelID}
 	assert.Contains(t, ids, "botfather")
@@ -53,9 +57,36 @@ func TestFilterConversationsBySpace_DefaultSpaceBareConvs(t *testing.T) {
 	result := filterConversationsCore(convs, "spaceA", "spaceA", nil, nil, nil, false, false)
 	assert.Len(t, result, 2)
 
-	// filterSpaceID != defaultSpaceID → 不显示普通 DM
+	// filterSpaceID != defaultSpaceID → 普通 DM 仍然可见
 	result = filterConversationsCore(convs, "spaceB", "spaceA", nil, nil, nil, false, false)
-	assert.Len(t, result, 0)
+	assert.Len(t, result, 2)
+}
+
+func TestFilterConversationsBySpace_NonDefaultSpaceDMVisible(t *testing.T) {
+	// 非默认 Space 中，普通 DM（非 Bot）应保留，Bot 不在此 Space 则不显示
+	convs := []*SyncUserConversationResp{
+		{ChannelID: "user1", ChannelType: common.ChannelTypePerson.Uint8(), SpaceID: ""},
+		{ChannelID: "user2", ChannelType: common.ChannelTypePerson.Uint8(), SpaceID: ""},
+		{ChannelID: "custom_bot", ChannelType: common.ChannelTypePerson.Uint8(), SpaceID: ""},
+		{ChannelID: "bot_in_space", ChannelType: common.ChannelTypePerson.Uint8(), SpaceID: ""},
+	}
+
+	botSet := map[string]bool{"custom_bot": true, "bot_in_space": true}
+	botInSpace := map[string]bool{"bot_in_space": true}
+
+	// filterSpaceID=spaceB != defaultSpaceID=spaceA
+	result := filterConversationsCore(convs, "spaceB", "spaceA", nil, botSet, botInSpace, false, false)
+
+	// user1, user2（普通 DM）保留；bot_in_space（Bot 在此 Space）保留；custom_bot（Bot 不在此 Space）不保留
+	assert.Len(t, result, 3)
+	ids := make([]string, len(result))
+	for i, r := range result {
+		ids[i] = r.ChannelID
+	}
+	assert.Contains(t, ids, "user1")
+	assert.Contains(t, ids, "user2")
+	assert.Contains(t, ids, "bot_in_space")
+	assert.NotContains(t, ids, "custom_bot")
 }
 
 func TestFilterConversationsBySpace_GroupSpaceMap(t *testing.T) {

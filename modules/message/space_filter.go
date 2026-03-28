@@ -112,8 +112,11 @@ func filterConversationsCore(
 			} else if botSet[conv.ChannelID] && botInSpace[conv.ChannelID] {
 				// 普通 Bot 在此 Space → 显示
 				filtered = append(filtered, conv)
+			} else if !botSet[conv.ChannelID] {
+				// 普通 DM（非 Bot） → 所有 Space 可见
+				filtered = append(filtered, conv)
 			}
-			// 普通 DM 或 Bot 不在此 Space → 不显示
+			// Bot 不在此 Space → 不显示
 		}
 		// 其他情况（旧群会话 + 非默认 Space）→ 不显示
 	}
