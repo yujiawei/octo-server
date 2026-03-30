@@ -119,8 +119,12 @@ func filterConversationsCore(
 				}
 			}
 			// Bot 不在此 Space → 不显示
+		} else if spaceID == "" && conv.ChannelType == common.ChannelTypeGroup.Uint8() {
+			// 旧群（无 space_id）在所有 Space 可见
+			// 这些是 Space 功能上线前创建的群，无法确定归属
+			// 成员关系已由 groupVailds 兜底，不会泄漏给非成员
+			filtered = append(filtered, conv)
 		}
-		// 其他情况（旧群会话 + 非默认 Space）→ 不显示
 	}
 	return filtered
 }
