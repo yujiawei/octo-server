@@ -184,6 +184,17 @@ func (f *File) uploadFile(c *wkhttp.Context) {
 		return
 	}
 
+	// If contentType is the default octet-stream, try to infer from file extension
+	if contentType == "application/octet-stream" {
+		if detected := mime.TypeByExtension(ext); detected != "" {
+			contentType = detected
+		} else if fallback, ok := extMIMEFallback[ext]; ok {
+			contentType = fallback
+		}
+	}
+	// Ensure text content types include charset=utf-8
+	contentType = ensureTextCharset(contentType)
+
 	// 读取文件头部用于魔数验证（最多读取 16 字节）
 	magicHeader := make([]byte, 16)
 	n, err := file.Read(magicHeader)
@@ -349,6 +360,25 @@ func sanitizePath(p string) (string, error) {
 		return "", errors.New("路径不允许包含目录遍历字符")
 	}
 	return cleaned, nil
+}
+
+// extMIMEFallback covers extensions that may be missing from the OS mime
+// database (e.g. .md on macOS).
+var extMIMEFallback = map[string]string{
+	".md":       "text/markdown",
+	".markdown": "text/markdown",
+	".yaml":     "text/yaml",
+	".yml":      "text/yaml",
+}
+
+// ensureTextCharset appends "; charset=utf-8" to text/* content types that
+// don't already specify a charset. This prevents garbled text when browsers
+// render files served from object storage without explicit encoding metadata.
+func ensureTextCharset(contentType string) string {
+	if strings.HasPrefix(contentType, "text/") && !strings.Contains(strings.ToLower(contentType), "charset") {
+		return contentType + "; charset=utf-8"
+	}
+	return contentType
 }
 
 func (f *File) checkReq(fileType Type, path string) error {
