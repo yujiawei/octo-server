@@ -94,7 +94,7 @@ func (v *Voice) transcribe(c *wkhttp.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"status": http.StatusOK,
 		"text":   text,
-		"model":  model,
+		"m":      shortenModelName(model),
 	})
 }
 
@@ -105,4 +105,17 @@ func (v *Voice) getConfig(c *wkhttp.Context) {
 		"enabled":      enabled,
 		"max_duration": v.cfg.MaxDuration,
 	})
+}
+
+func shortenModelName(model string) string {
+	switch model {
+	case "gemini-3.1-pro-preview":
+		return "g31pp"
+	case "gemini-3-flash-preview":
+		return "g3fp"
+	case "gemini-2.5-pro":
+		return "g25p"
+	default:
+		return model
+	}
 }
