@@ -2,6 +2,7 @@ package modules
 
 // 引入模块
 import (
+	_ "github.com/Mininglamp-OSS/octo-server/modules/backup"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/base"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/botfather"
 	_ "github.com/Mininglamp-OSS/octo-server/modules/channel"
