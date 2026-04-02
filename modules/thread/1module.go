@@ -3,10 +3,13 @@ package thread
 import (
 	"embed"
 	"fmt"
+	"os"
+	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/model"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/register"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
 )
@@ -16,6 +19,14 @@ var sqlFS embed.FS
 
 func init() {
 	register.AddModule(func(ctx interface{}) register.Module {
+		// Beta 功能开关：DM_THREAD_ON=true 启用
+		threadOn := strings.ToLower(os.Getenv("DM_THREAD_ON"))
+		if threadOn != "true" && threadOn != "1" {
+			lg := log.NewTLog("Thread")
+			lg.Info("thread module disabled: set DM_THREAD_ON=true to enable")
+			return register.Module{Name: "thread"}
+		}
+
 		api := New(ctx.(*config.Context))
 		groupService := group.NewService(ctx.(*config.Context))
 
