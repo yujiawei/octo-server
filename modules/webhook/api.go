@@ -60,7 +60,25 @@ func New(ctx *config.Context) *Webhook {
 	vivo := ctx.GetConfig().Push.VIVO
 	firebase := ctx.GetConfig().Push.FIREBASE
 
-	if apns.Topic != "" && apns.Cert != "" {
+	// iOS APNs 推送：优先使用 p8 Token 认证，否则使用 p12 证书
+	p8Path, keyID, teamID := loadAPNsP8Config()
+	if p8Path != "" && keyID != "" && teamID != "" {
+		// 使用 p8 Token 认证
+		topic := apns.Topic
+		if topic == "" {
+			topic = os.Getenv("DM_PUSH_APNS_TOPIC")
+		}
+		dev := apns.Dev
+		if envDev := os.Getenv("DM_PUSH_APNS_DEV"); envDev != "" {
+			dev = envDev == "true" || envDev == "1"
+		}
+		if topic != "" {
+			pushMap[common.DeviceTypeIOS] = map[string]Push{
+				topic: NewIOSPushWithToken(topic, dev, p8Path, keyID, teamID),
+			}
+		}
+	} else if apns.Topic != "" && apns.Cert != "" {
+		// Fallback 到 p12 证书认证
 		pushMap[common.DeviceTypeIOS] = map[string]Push{
 			ctx.GetConfig().Push.APNS.Topic: NewIOSPush(apns.Topic, apns.Dev, apns.Cert, apns.Password),
 		}
