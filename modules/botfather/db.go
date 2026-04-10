@@ -238,10 +238,9 @@ func (d *botfatherDB) isBotInSpace(robotID string, spaceID string) (bool, error)
 // Checks both space_member.status=1 and space.status=1.
 func (d *botfatherDB) querySpaceIDByRobotID(robotID string) (string, error) {
 	var spaceID string
-	err := d.session.Select("sm.space_id").
-		From("space_member sm").
-		Join("space s", "s.space_id = sm.space_id").
-		Where("sm.uid=? AND sm.status=1 AND s.status=1", robotID).
-		LoadOne(&spaceID)
+	err := d.session.SelectBySql(
+		"SELECT sm.space_id FROM space_member sm INNER JOIN space s ON s.space_id = sm.space_id WHERE sm.uid=? AND sm.status=1 AND s.status=1",
+		robotID,
+	).LoadOne(&spaceID)
 	return spaceID, err
 }
