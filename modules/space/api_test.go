@@ -832,7 +832,7 @@ func TestJoinSpaceApprovalMode_CreatesPendingApply(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, w.Code)
 	body := w.Body.String()
-	assert.Contains(t, body, `"status":"pending"`)
+	assert.Contains(t, body, `"status":"NEED_APPROVAL"`)
 	assert.Contains(t, body, spaceId)
 
 	// 验证用户没有成为成员
@@ -880,7 +880,7 @@ func TestJoinSpaceApprovalMode_DuplicateApply(t *testing.T) {
 	req.Header.Set("token", testutil.Token)
 	s.GetRoute().ServeHTTP(w, req)
 	assert.Equal(t, http.StatusOK, w.Code)
-	assert.Contains(t, w.Body.String(), `"status":"pending"`)
+	assert.Contains(t, w.Body.String(), `"status":"NEED_APPROVAL"`)
 
 	w2 := httptest.NewRecorder()
 	req2, _ := http.NewRequest("POST", "/v1/space/join",
@@ -888,7 +888,7 @@ func TestJoinSpaceApprovalMode_DuplicateApply(t *testing.T) {
 	req2.Header.Set("token", testutil.Token)
 	s.GetRoute().ServeHTTP(w2, req2)
 	assert.Equal(t, http.StatusOK, w2.Code)
-	assert.Contains(t, w2.Body.String(), `"status":"pending"`)
+	assert.Contains(t, w2.Body.String(), `"status":"PENDING"`)
 }
 
 func TestJoinSpaceApprovalMode_AlreadyMember(t *testing.T) {

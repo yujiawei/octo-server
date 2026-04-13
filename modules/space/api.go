@@ -102,6 +102,10 @@ func (s *Space) createSpace(c *wkhttp.Context) {
 		c.ResponseError(errors.New("空间名称不能为空"))
 		return
 	}
+	if req.JoinMode < JoinModeDirect || req.JoinMode > JoinModeApproval {
+		c.ResponseError(errors.New("无效的加入模式，仅支持 0(直接加入) 或 1(需要审批)"))
+		return
+	}
 
 	spaceId := util.GenerUUID()
 	inviteCode := util.GenerUUID()[:8]
@@ -119,6 +123,7 @@ func (s *Space) createSpace(c *wkhttp.Context) {
 		Description: req.Description,
 		Logo:        req.Logo,
 		Creator:     loginUID,
+		JoinMode:    req.JoinMode,
 		Status:      1,
 	}, tx)
 	if err != nil {
@@ -148,6 +153,7 @@ func (s *Space) createSpace(c *wkhttp.Context) {
 		"name":        req.Name,
 		"description": req.Description,
 		"logo":        req.Logo,
+		"join_mode":   req.JoinMode,
 	}
 	inviteErr := s.db.insertInvitation(&InvitationModel{
 		SpaceId:    spaceId,
@@ -247,7 +253,7 @@ func (s *Space) updateSpace(c *wkhttp.Context) {
 		c.ResponseError(errors.New("请求参数错误"))
 		return
 	}
-	if req.JoinMode != nil && (*req.JoinMode < 0 || *req.JoinMode > 1) {
+	if req.JoinMode != nil && (*req.JoinMode < JoinModeDirect || *req.JoinMode > JoinModeApproval) {
 		c.ResponseError(errors.New("无效的加入模式，仅支持 0(直接加入) 或 1(需要审批)"))
 		return
 	}
@@ -681,7 +687,7 @@ func (s *Space) joinSpace(c *wkhttp.Context) {
 	}
 
 	// 需要审批模式
-	if space.JoinMode == 1 {
+	if space.JoinMode == JoinModeApproval {
 		// 只读校验邀请码次数（不消耗，审批通过时也跳过）
 		if invitation.MaxUses > 0 && invitation.UsedCount >= invitation.MaxUses {
 			c.ResponseError(errors.New("邀请码已达到使用次数上限"))
@@ -707,7 +713,7 @@ func (s *Space) joinSpace(c *wkhttp.Context) {
 		}
 		if pendingApply != nil {
 			c.Response(map[string]interface{}{
-				"status":   "pending",
+				"status":   "PENDING",
 				"space_id": invitation.SpaceId,
 				"msg":      "申请已提交，请等待审批",
 			})
@@ -729,9 +735,9 @@ func (s *Space) joinSpace(c *wkhttp.Context) {
 		go s.notifyAdminsNewJoinApply(loginUID, invitation.SpaceId, space.Name, applyID)
 
 		c.Response(map[string]interface{}{
-			"status":   "pending",
+			"status":   "NEED_APPROVAL",
 			"space_id": invitation.SpaceId,
-			"msg":      "申请已提交，请等待审批",
+			"msg":      "该空间需要管理员审批，申请已提交",
 		})
 		return
 	}
@@ -896,6 +902,7 @@ func (s *Space) getInviteInfo(c *wkhttp.Context) {
 		UsedCount:   invitation.UsedCount,
 		ExpiresAt:   expiresAtStr,
 		MemberCount: memberCount,
+		JoinMode:    space.JoinMode,
 	})
 }
 
@@ -945,8 +952,9 @@ func (s *Space) getInvitePreview(c *wkhttp.Context) {
 		MaxUses:     invitation.MaxUses,
 		UsedCount:   invitation.UsedCount,
 		ExpiresAt:   expiresAtStr,
-		MemberCount: 0,   // 不暴露精确成员数量
-		Bots:        nil, // 不暴露 Bot 列表
+		MemberCount: 0,            // 不暴露精确成员数量
+		JoinMode:    space.JoinMode, // 告知客户端是否需要审批
+		Bots:        nil,          // 不暴露 Bot 列表
 	})
 }
 
