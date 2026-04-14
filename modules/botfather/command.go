@@ -490,7 +490,7 @@ func (h *commandHandler) handleQuickstart(fromUID string) {
 	apiKeyFormatted := "`" + apiKey + "`"
 	h.reply(fromUID, fmt.Sprintf(`🚀 **Quickstart**
 
-将下面的提示词复制发给你的 AI Agent：
+将下面的提示词复制发送给你的 OpenClaw：
 
 ---
 Read %s/v1/bot/skill.md to learn the DMWork Bot API (includes User API, multi-bot config, and OpenClaw setup).
@@ -1088,25 +1088,19 @@ func (h *commandHandler) sendConnectPrompt(toUID string, bot *robotModel) {
 **Bot Token:** %s
 **API Server:** %s
 
-**终端安装（推荐）：**
+**安装插件并配置 bot：**
 `+"```"+`
 npx -y openclaw-channel-dmwork install --bot-token %s --api-url %s --account-id %s
 `+"```"+`
 
-**或在 OpenClaw 对话中执行：**
-`+"```"+`
-/dmwork_add_account %s %s %s
-`+"```"+`
+**CLI 命令说明：** %s/v1/bot/cli-guide.md
+**OpenClaw API 文档：** %s/v1/bot/skill.md
 
-**API 文档：** %s/v1/bot/skill.md
-
-💡 支持 OpenClaw、Claude Code、及任何能读取 URL 的 AI Agent
 ⚙️ 群聊默认只有 @机器人 时才回复（可在配置中修改）
 🔌 断开连接请发送 /disconnect`,
 		bot.RobotID, bot.RobotID, bot.BotToken, apiURL,
 		bot.BotToken, apiURL, bot.RobotID,
-		bot.RobotID, bot.BotToken, apiURL,
-		apiURL)
+		apiURL, apiURL)
 
 	h.reply(toUID, prompt)
 }
@@ -1124,27 +1118,21 @@ func (h *commandHandler) sendCreatedPrompt(toUID string, name string, bot *robot
 **Bot Token:** %s
 **API Server:** %s
 
-📋 **连接 Agent**
+📋 **连接 OpenClaw**
 
-**终端安装（推荐）：**
+**安装插件并配置 bot：**
 `+"```"+`
 npx -y openclaw-channel-dmwork install --bot-token %s --api-url %s --account-id %s
 `+"```"+`
 
-**或在 OpenClaw 对话中执行：**
-`+"```"+`
-/dmwork_add_account %s %s %s
-`+"```"+`
+**CLI 命令说明：** %s/v1/bot/cli-guide.md
+**OpenClaw API 文档：** %s/v1/bot/skill.md
 
-**API 文档：** %s/v1/bot/skill.md
-
-💡 支持 OpenClaw、Claude Code、及任何能读取 URL 的 AI Agent
 ⚙️ 群聊默认只有 @机器人 时才回复（可在配置中修改）
 🔌 断开连接请发送 /disconnect`,
 		name, bot.RobotID, bot.BotToken, apiURL,
 		bot.BotToken, apiURL, bot.RobotID,
-		bot.RobotID, bot.BotToken, apiURL,
-		apiURL)
+		apiURL, apiURL)
 
 	h.reply(toUID, msg)
 }
