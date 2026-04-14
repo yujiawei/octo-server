@@ -29,6 +29,42 @@ func NewVoiceService(cfg *VoiceConfig) *VoiceService {
 	}
 }
 
+// effectiveURL returns the API base URL for the current engine.
+func (s *VoiceService) effectiveURL() string {
+	if s.config.Engine == EngineQwen && s.config.QwenUrl != "" {
+		return s.config.QwenUrl
+	}
+	return s.config.LiteLLMUrl
+}
+
+// effectiveKey returns the API key for the current engine.
+func (s *VoiceService) effectiveKey() string {
+	if s.config.Engine == EngineQwen && s.config.QwenKey != "" {
+		return s.config.QwenKey
+	}
+	return s.config.LiteLLMKey
+}
+
+// effectiveTimeout returns the per-model timeout for the current engine.
+func (s *VoiceService) effectiveTimeout() int {
+	if s.config.Engine == EngineQwen && s.config.QwenTimeout > 0 {
+		return s.config.QwenTimeout
+	}
+	return s.config.Timeout
+}
+
+// chatCompletionModels returns the model fallback chain for the current
+// chat/completions engine (Gemini or Qwen). Not used by the GPT engine,
+// which has its own model list (GPTModels) and uses audio/transcriptions.
+func (s *VoiceService) chatCompletionModels() []string {
+	switch s.config.Engine {
+	case EngineQwen:
+		return s.config.QwenModels
+	default: // gemini
+		return s.config.Models
+	}
+}
+
 // TranscribeOptions holds per-request overrides for transcription
 type TranscribeOptions struct {
 	// Mode overrides the transcription mode: "append" or "edit".
@@ -56,16 +92,19 @@ func (s *VoiceService) TranscribeWithOptions(audioData []byte, mimeType, context
 		mode = opts.Mode
 	}
 
-	if s.config.Engine == "gpt" && mode == "edit" {
+	if s.config.Engine == EngineGPT && mode == "edit" {
 		return "", "", ErrGPTEditNotSupported
 	}
 
 	svc := s
 	if opts.Model != "" {
 		cfgCopy := *s.config
-		if s.config.Engine == "gpt" {
+		switch s.config.Engine {
+		case EngineGPT:
 			cfgCopy.GPTModels = append([]string{opts.Model}, s.config.GPTModels...)
-		} else {
+		case EngineQwen:
+			cfgCopy.QwenModels = append([]string{opts.Model}, s.config.QwenModels...)
+		default: // gemini
 			cfgCopy.Models = append([]string{opts.Model}, s.config.Models...)
 		}
 		svc = &VoiceService{config: &cfgCopy, client: s.client}
@@ -89,10 +128,11 @@ func (s *VoiceService) transcribeAppend(audioData []byte, mimeType string,
 	var text, model string
 	var err error
 	switch s.config.Engine {
-	case "gpt":
+	case EngineGPT:
 		text, model, err = s.callGPTWithModelFallback(audioData, mimeType, prompt)
-	default: // gemini
-		text, model, err = s.callWithModelFallback(audioData, mimeType, prompt)
+	default: // gemini, qwen — both use chat/completions with input_audio
+		text, model, err = s.callChatCompletionWithFallback(audioData, mimeType, prompt,
+			s.chatCompletionModels())
 	}
 	if err != nil {
 		return "", "", err
@@ -114,14 +154,15 @@ func (s *VoiceService) transcribeAppend(audioData []byte, mimeType string,
 	return text, model, nil
 }
 
-// transcribeEdit — Gemini only, LLM performs editing + whitespace restore.
+// transcribeEdit — Gemini/Qwen, LLM performs editing + whitespace restore.
 // NO_SPEECH: only [NO_SPEECH] sentinel is silence; empty string is legitimate "delete everything".
 func (s *VoiceService) transcribeEdit(audioData []byte, mimeType string,
 	contextText string, chatContext string) (string, string, error) {
 
 	prompt := buildPrompt(contextText, chatContext)
 
-	text, model, err := s.callWithModelFallback(audioData, mimeType, prompt)
+	text, model, err := s.callChatCompletionWithFallback(audioData, mimeType, prompt,
+		s.chatCompletionModels())
 	if err != nil {
 		return "", "", err
 	}
@@ -142,21 +183,21 @@ func (s *VoiceService) transcribeEdit(audioData []byte, mimeType string,
 	return text, model, nil
 }
 
-// callWithModelFallback wraps callLiteLLM with model loop + total timeout.
-func (s *VoiceService) callWithModelFallback(audioData []byte, mimeType string,
-	prompt string) (string, string, error) {
+// callChatCompletionWithFallback wraps callChatCompletion with model loop + total timeout.
+func (s *VoiceService) callChatCompletionWithFallback(audioData []byte, mimeType string,
+	prompt string, models []string) (string, string, error) {
 
 	totalCtx, totalCancel := context.WithTimeout(context.Background(),
 		time.Duration(s.config.TotalTimeout)*time.Second)
 	defer totalCancel()
 
 	var lastErr error
-	for _, model := range s.config.Models {
+	for _, model := range models {
 		if totalCtx.Err() != nil {
 			break
 		}
 
-		text, err := s.callLiteLLM(totalCtx, model, audioData, mimeType, prompt)
+		text, err := s.callChatCompletion(totalCtx, model, audioData, mimeType, prompt)
 		if err == nil {
 			return text, model, nil
 		}
@@ -204,13 +245,16 @@ func (s *VoiceService) callGPTWithModelFallback(audioData []byte, mimeType strin
 	return "", "", fmt.Errorf("all GPT models failed: %w", lastErr)
 }
 
-// callLiteLLM sends a chat completion request to LiteLLM with audio content.
-func (s *VoiceService) callLiteLLM(totalCtx context.Context, model string, audioData []byte, mimeType string, prompt string) (string, error) {
+// callChatCompletion sends a chat completion request with audio content.
+// Used by both Gemini and Qwen engines. Qwen Omni natively supports the
+// OpenAI-compatible input_audio content part, so the same request format
+// works for both engines without any adaptation.
+func (s *VoiceService) callChatCompletion(totalCtx context.Context, model string, audioData []byte, mimeType string, prompt string) (string, error) {
 	b64Audio := base64.StdEncoding.EncodeToString(audioData)
 
 	// Only use reasoning_effort=low for Gemini 3.1 Pro (reduces latency without hurting quality)
 	var reasoningEffort string
-	if strings.Contains(model, "3.1-pro") {
+	if s.config.Engine == EngineGemini && strings.Contains(model, "3.1-pro") {
 		reasoningEffort = "low"
 	}
 
@@ -242,16 +286,17 @@ func (s *VoiceService) callLiteLLM(totalCtx context.Context, model string, audio
 		return "", fmt.Errorf("marshal request: %w", err)
 	}
 
-	perModelTimeout := time.Duration(s.config.Timeout) * time.Second
+	perModelTimeout := time.Duration(s.effectiveTimeout()) * time.Second
 	ctx, cancel := context.WithTimeout(totalCtx, perModelTimeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, "POST", strings.TrimRight(s.config.LiteLLMUrl, "/")+"/chat/completions", bytes.NewReader(bodyBytes))
+	url := strings.TrimRight(s.effectiveURL(), "/") + "/chat/completions"
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return "", fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+s.config.LiteLLMKey)
+	req.Header.Set("Authorization", "Bearer "+s.effectiveKey())
 
 	resp, err := s.client.Do(req)
 	if err != nil {

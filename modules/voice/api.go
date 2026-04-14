@@ -105,7 +105,7 @@ func (v *Voice) transcribe(c *wkhttp.Context) {
 		"status": http.StatusOK,
 		"text":   text,
 		"m":      shortenModelName(model),
-		"engine": shortenEngineName(v.cfg.Engine),
+		"engine": ShortenEngineName(v.cfg.Engine),
 	})
 }
 
@@ -116,7 +116,7 @@ func (v *Voice) getConfig(c *wkhttp.Context) {
 		"enabled":       enabled,
 		"max_duration":  v.cfg.MaxDuration,
 		"max_file_size": v.cfg.MaxFileSize,
-		"engine":        shortenEngineName(v.cfg.Engine),
+		"engine":        ShortenEngineName(v.cfg.Engine),
 		"edit_mode":     v.cfg.EditMode,
 	})
 }
@@ -170,12 +170,15 @@ func shortenModelName(model string) string {
 	return ShortenModelName(model)
 }
 
-func shortenEngineName(engine string) string {
+// ShortenEngineName returns a short identifier for an engine name.
+func ShortenEngineName(engine string) string {
 	switch engine {
-	case "gemini":
+	case EngineGemini:
 		return "gm"
-	case "gpt":
+	case EngineGPT:
 		return "gp"
+	case EngineQwen:
+		return "qw"
 	default:
 		return engine
 	}

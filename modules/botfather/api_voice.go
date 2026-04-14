@@ -199,7 +199,7 @@ func (bf *BotFather) botTranscribe(c *wkhttp.Context) {
 	if effectiveMode == "" {
 		effectiveMode = bf.voiceCfg.EditMode
 	}
-	if bf.voiceCfg.Engine == "gpt" && effectiveMode == "edit" {
+	if bf.voiceCfg.Engine == voice.EngineGPT && effectiveMode == "edit" {
 		c.ResponseErrorWithStatus(voice.ErrGPTEditNotSupported, http.StatusBadRequest)
 		return
 	}
@@ -221,5 +221,6 @@ func (bf *BotFather) botTranscribe(c *wkhttp.Context) {
 		"status": http.StatusOK,
 		"text":   text,
 		"m":      voice.ShortenModelName(usedModel),
+		"engine": voice.ShortenEngineName(bf.voiceCfg.Engine),
 	})
 }

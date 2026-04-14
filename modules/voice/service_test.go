@@ -1046,9 +1046,9 @@ func TestTranscribeEdit_NoSpeech_Sentinel_NoContext(t *testing.T) {
 	assert.Equal(t, "", text)
 }
 
-// --- callWithModelFallback tests ---
+// --- callChatCompletionWithFallback tests ---
 
-func TestCallWithModelFallback_Success(t *testing.T) {
+func TestCallChatCompletionWithFallback_Success(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		resp := chatCompletionResponse{
 			Choices: []choice{{Message: responseMessage{Content: "ok"}}},
@@ -1061,13 +1061,13 @@ func TestCallWithModelFallback_Success(t *testing.T) {
 	cfg.Models = []string{"model-a"}
 	svc := NewVoiceService(cfg)
 
-	text, model, err := svc.callWithModelFallback([]byte("audio"), "audio/wav", "prompt")
+	text, model, err := svc.callChatCompletionWithFallback([]byte("audio"), "audio/wav", "prompt", cfg.Models)
 	assert.NoError(t, err)
 	assert.Equal(t, "ok", text)
 	assert.Equal(t, "model-a", model)
 }
 
-func TestCallWithModelFallback_NoModels(t *testing.T) {
+func TestCallChatCompletionWithFallback_NoModels(t *testing.T) {
 	cfg := &VoiceConfig{
 		LiteLLMUrl:   "http://unused",
 		LiteLLMKey:   "key",
@@ -1077,7 +1077,7 @@ func TestCallWithModelFallback_NoModels(t *testing.T) {
 	}
 	svc := NewVoiceService(cfg)
 
-	_, _, err := svc.callWithModelFallback([]byte("audio"), "audio/wav", "prompt")
+	_, _, err := svc.callChatCompletionWithFallback([]byte("audio"), "audio/wav", "prompt", cfg.Models)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "no models configured")
 }
@@ -1171,4 +1171,234 @@ func TestTranscribeWithOptions_GPT_EditModeRejected(t *testing.T) {
 
 func TestMaxContextTextLength_Constant(t *testing.T) {
 	assert.Equal(t, 10000, MaxContextTextLength)
+}
+
+// --- Qwen engine tests ---
+
+func newQwenTestConfig(serverURL string) *VoiceConfig {
+	return &VoiceConfig{
+		QwenUrl:      serverURL,
+		QwenKey:      "qwen-test-key",
+		Timeout:      5,
+		TotalTimeout: 10,
+		QwenModels:   []string{"qwen3.5-omni-plus", "qwen3.5-omni"},
+		QwenTimeout:  8,
+		MaxDuration:  60,
+		MaxFileSize:  5 * 1024 * 1024,
+		Engine:       "qwen",
+		EditMode:     "edit",
+	}
+}
+
+func TestQwenTranscribe_Success(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/chat/completions", r.URL.Path)
+		assert.Equal(t, "Bearer qwen-test-key", r.Header.Get("Authorization"))
+
+		var req chatCompletionRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		assert.Equal(t, "qwen3.5-omni-plus", req.Model)
+		// Verify no reasoning_effort for qwen
+		assert.Empty(t, req.ReasoningEffort)
+
+		resp := chatCompletionResponse{
+			Choices: []choice{{Message: responseMessage{Content: "你好世界"}}},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	cfg := newQwenTestConfig(server.URL)
+	svc := NewVoiceService(cfg)
+
+	text, model, err := svc.Transcribe([]byte("fake-audio"), "audio/wav", "", "")
+	assert.NoError(t, err)
+	assert.Equal(t, "你好世界", text)
+	assert.Equal(t, "qwen3.5-omni-plus", model)
+}
+
+func TestQwenTranscribe_EditMode(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := chatCompletionResponse{
+			Choices: []choice{{Message: responseMessage{Content: "修改后的文本"}}},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	cfg := newQwenTestConfig(server.URL)
+	cfg.EditMode = "edit"
+	svc := NewVoiceService(cfg)
+
+	text, _, err := svc.TranscribeWithOptions(
+		[]byte("fake-audio"), "audio/wav",
+		"原始文本", "",
+		TranscribeOptions{Mode: "edit"},
+	)
+	assert.NoError(t, err)
+	assert.Equal(t, "修改后的文本", text)
+}
+
+func TestQwenTranscribe_UsesQwenSpecificConfig(t *testing.T) {
+	// Verify that qwen engine uses QwenUrl/QwenKey instead of global LiteLLMUrl/LiteLLMKey
+	qwenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "Bearer qwen-specific-key", r.Header.Get("Authorization"))
+		resp := chatCompletionResponse{
+			Choices: []choice{{Message: responseMessage{Content: "ok"}}},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer qwenServer.Close()
+
+	cfg := &VoiceConfig{
+		LiteLLMUrl:   "https://should-not-be-used.example.com",
+		LiteLLMKey:   "should-not-be-used",
+		QwenUrl:      qwenServer.URL,
+		QwenKey:      "qwen-specific-key",
+		QwenModels:   []string{"qwen3.5-omni-plus"},
+		Engine:       "qwen",
+		EditMode:     "edit",
+		Timeout:      5,
+		TotalTimeout: 10,
+	}
+	svc := NewVoiceService(cfg)
+
+	text, _, err := svc.Transcribe([]byte("audio"), "audio/wav", "", "")
+	assert.NoError(t, err)
+	assert.Equal(t, "ok", text)
+}
+
+func TestQwenTranscribe_FallbackToGlobalURL(t *testing.T) {
+	// When QwenUrl is empty, should fall back to LiteLLMUrl
+	globalServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "Bearer global-key", r.Header.Get("Authorization"))
+		resp := chatCompletionResponse{
+			Choices: []choice{{Message: responseMessage{Content: "via global"}}},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer globalServer.Close()
+
+	cfg := &VoiceConfig{
+		LiteLLMUrl:   globalServer.URL,
+		LiteLLMKey:   "global-key",
+		QwenModels:   []string{"qwen3.5-omni-plus"},
+		Engine:       "qwen",
+		EditMode:     "edit",
+		Timeout:      5,
+		TotalTimeout: 10,
+	}
+	svc := NewVoiceService(cfg)
+
+	text, _, err := svc.Transcribe([]byte("audio"), "audio/wav", "", "")
+	assert.NoError(t, err)
+	assert.Equal(t, "via global", text)
+}
+
+func TestQwenTranscribe_ModelOverride(t *testing.T) {
+	var requestedModel string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req chatCompletionRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		requestedModel = req.Model
+		resp := chatCompletionResponse{
+			Choices: []choice{{Message: responseMessage{Content: "ok"}}},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	cfg := newQwenTestConfig(server.URL)
+	svc := NewVoiceService(cfg)
+
+	_, usedModel, err := svc.TranscribeWithOptions([]byte("audio"), "audio/wav", "", "",
+		TranscribeOptions{Model: "qwen-custom"})
+	assert.NoError(t, err)
+	assert.Equal(t, "qwen-custom", requestedModel)
+	assert.Equal(t, "qwen-custom", usedModel)
+}
+
+func TestQwenTranscribe_ModelFallback(t *testing.T) {
+	var callCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := atomic.AddInt32(&callCount, 1)
+		var req chatCompletionRequest
+		json.NewDecoder(r.Body).Decode(&req)
+
+		if count == 1 {
+			assert.Equal(t, "qwen3.5-omni-plus", req.Model)
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`{"error": "internal error"}`))
+			return
+		}
+
+		assert.Equal(t, "qwen3.5-omni", req.Model)
+		resp := chatCompletionResponse{
+			Choices: []choice{{Message: responseMessage{Content: "fallback ok"}}},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	cfg := newQwenTestConfig(server.URL)
+	svc := NewVoiceService(cfg)
+
+	text, model, err := svc.Transcribe([]byte("audio"), "audio/wav", "", "")
+	assert.NoError(t, err)
+	assert.Equal(t, "fallback ok", text)
+	assert.Equal(t, "qwen3.5-omni", model)
+}
+
+func TestQwenTranscribe_AppendNoSpeech(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := chatCompletionResponse{
+			Choices: []choice{{Message: responseMessage{Content: "[NO_SPEECH]"}}},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	cfg := newQwenTestConfig(server.URL)
+	cfg.EditMode = "append"
+	svc := NewVoiceService(cfg)
+
+	text, _, err := svc.Transcribe([]byte("audio"), "audio/wav", "keep this", "")
+	assert.NoError(t, err)
+	assert.Equal(t, "keep this", text) // returns contextText on no speech
+}
+
+func TestQwenTranscribe_EditNoSpeech(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := chatCompletionResponse{
+			Choices: []choice{{Message: responseMessage{Content: "[NO_SPEECH]"}}},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	cfg := newQwenTestConfig(server.URL)
+	cfg.EditMode = "edit"
+	svc := NewVoiceService(cfg)
+
+	text, _, err := svc.Transcribe([]byte("audio"), "audio/wav", "keep this", "")
+	assert.NoError(t, err)
+	assert.Equal(t, "keep this", text) // returns contextText on no speech sentinel
+}
+
+func TestQwenTranscribe_AppendMode(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := chatCompletionResponse{
+			Choices: []choice{{Message: responseMessage{Content: "新内容"}}},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	cfg := newQwenTestConfig(server.URL)
+	cfg.EditMode = "append"
+	svc := NewVoiceService(cfg)
+
+	text, _, err := svc.Transcribe([]byte("audio"), "audio/wav", "原有文本", "")
+	assert.NoError(t, err)
+	assert.Equal(t, "原有文本新内容", text) // CJK join, no space
 }
