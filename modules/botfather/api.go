@@ -133,6 +133,8 @@ func (bf *BotFather) Route(r *wkhttp.WKHttp) {
 		botAPI.GET("/groups/:group_no/threads/:short_id/members", bf.botListThreadMembers)
 		botAPI.POST("/groups/:group_no/threads/:short_id/join", bf.botJoinThread)
 		botAPI.POST("/groups/:group_no/threads/:short_id/leave", bf.botLeaveThread)
+		botAPI.GET("/groups/:group_no/threads/:short_id/md", bf.botGetThreadMd)
+		botAPI.PUT("/groups/:group_no/threads/:short_id/md", bf.botUpdateThreadMd)
 		botAPI.POST("/setCommands", bf.setCommands)
 		// Bot File API (#433)
 		botAPI.POST("/file/upload", bf.botUploadFile)

@@ -60,6 +60,14 @@ type IService interface {
 	IsMember(groupNo, shortID, uid string) (bool, error)
 	// RemoveUserFromGroupThreads 退群时移除用户在该群所有子区的成员身份和 IM 订阅
 	RemoveUserFromGroupThreads(groupNo, uid string) error
+	// GetThreadMd 获取子区 GROUP.md
+	GetThreadMd(groupNo, shortID string) (*ThreadMdResult, error)
+	// UpdateThreadMd 更新子区 GROUP.md（纯透传，不含权限检查）
+	UpdateThreadMd(groupNo, shortID, content, updatedBy string) (int64, error)
+	// DeleteThreadMd 删除子区 GROUP.md（纯透传，不含权限检查）
+	DeleteThreadMd(groupNo, shortID, deletedBy string) (int64, error)
+	// CanEditThreadMd 检查是否有编辑子区 GROUP.md 的权限（供 API Handler 层调用）
+	CanEditThreadMd(groupNo, shortID, uid string) (bool, error)
 }
 
 // Service 子区服务实现
@@ -108,8 +116,12 @@ type ThreadResp struct {
 	LastMessageContent    string `json:"last_message_content,omitempty"`
 	LastMessageSenderName string `json:"last_message_sender_name,omitempty"`
 	LastMessageAt         string `json:"last_message_at"`
-	CreatedAt             string `json:"created_at"`
-	UpdatedAt             string `json:"updated_at"`
+	// GROUP.md 摘要信息
+	HasThreadMd       bool   `json:"has_thread_md"`
+	ThreadMdVersion   int64  `json:"thread_md_version"`
+	ThreadMdUpdatedAt string `json:"thread_md_updated_at"`
+	CreatedAt         string `json:"created_at"`
+	UpdatedAt         string `json:"updated_at"`
 }
 
 // MemberResp 子区成员响应
@@ -363,8 +375,13 @@ func (s *Service) GetThreads(groupNo string) ([]*ThreadResp, error) {
 			LastMessageContent:    t.LastMessageContent,
 			LastMessageSenderName: senderNames[t.LastMessageSenderUID],
 			LastMessageAt:         util.ToyyyyMMddHHmmss(time.Time(t.CreatedAt)), // 默认 created_at
+			HasThreadMd:           t.ThreadMd != nil,
+			ThreadMdVersion:       t.ThreadMdVersion,
 			CreatedAt:             util.ToyyyyMMddHHmmss(time.Time(t.CreatedAt)),
 			UpdatedAt:             util.ToyyyyMMddHHmmss(time.Time(t.UpdatedAt)),
+		}
+		if t.ThreadMdUpdatedAt != nil {
+			resp.ThreadMdUpdatedAt = util.ToyyyyMMddHHmmss(*t.ThreadMdUpdatedAt)
 		}
 		if t.LastMessageAt != nil {
 			resp.LastMessageAt = util.ToyyyyMMddHHmmss(*t.LastMessageAt)
@@ -533,6 +550,30 @@ func (s *Service) canOperate(groupNo, shortID, uid string) (bool, error) {
 	return isManager, nil
 }
 
+// GetThreadMd 获取子区 GROUP.md
+func (s *Service) GetThreadMd(groupNo, shortID string) (*ThreadMdResult, error) {
+	return s.db.QueryThreadMd(groupNo, shortID)
+}
+
+// UpdateThreadMd 更新子区 GROUP.md
+// 纯数据操作透传，权限检查由 API Handler 层完成
+func (s *Service) UpdateThreadMd(groupNo, shortID, content, updatedBy string) (int64, error) {
+	return s.db.UpdateThreadMd(groupNo, shortID, content, updatedBy)
+}
+
+// DeleteThreadMd 删除子区 GROUP.md
+// 纯数据操作透传，权限检查由 API Handler 层完成
+func (s *Service) DeleteThreadMd(groupNo, shortID, deletedBy string) (int64, error) {
+	return s.db.DeleteThreadMd(groupNo, shortID, deletedBy)
+}
+
+// CanEditThreadMd 检查是否有编辑子区 GROUP.md 的权限
+// 权限规则：子区创建者 或 群创建者/管理员
+// 供 API Handler 层在调用 UpdateThreadMd/DeleteThreadMd 前使用
+func (s *Service) CanEditThreadMd(groupNo, shortID, uid string) (bool, error) {
+	return s.canOperate(groupNo, shortID, uid)
+}
+
 // toThreadResp 转换为响应（需要额外查询 ID）
 func (s *Service) toThreadResp(m *Model) *ThreadResp {
 	// 如果 Model 没有 ID，需要查询
@@ -562,8 +603,13 @@ func (s *Service) toThreadRespWithID(m *Model) *ThreadResp {
 		MessageCount:       m.MessageCount,
 		LastMessageContent: m.LastMessageContent,
 		LastMessageAt:      util.ToyyyyMMddHHmmss(time.Time(m.CreatedAt)), // 默认 created_at
+		HasThreadMd:        m.ThreadMd != nil,
+		ThreadMdVersion:    m.ThreadMdVersion,
 		CreatedAt:          util.ToyyyyMMddHHmmss(time.Time(m.CreatedAt)),
 		UpdatedAt:          util.ToyyyyMMddHHmmss(time.Time(m.UpdatedAt)),
+	}
+	if m.ThreadMdUpdatedAt != nil {
+		resp.ThreadMdUpdatedAt = util.ToyyyyMMddHHmmss(*m.ThreadMdUpdatedAt)
 	}
 	if m.LastMessageSenderUID != "" {
 		resp.LastMessageSenderName = s.getUserName(m.LastMessageSenderUID)

@@ -462,3 +462,334 @@ func TestRemoveUserFromGroupThreads_OnlyAffectsTargetGroup(t *testing.T) {
 	isMember2, _ := svc.IsMember(groupNo2, t2.ShortID, "user2")
 	assert.True(t, isMember2)
 }
+
+// ==================== DB 层 ThreadMd 测试 ====================
+
+func TestQueryThreadMd_NotSet(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	db := NewDB(ctx)
+
+	groupNo := "00000000000000000000000000000001"
+	shortID := fmt.Sprintf("%d", ctx.UserIDGen.Generate().Int64())
+	err = db.Insert(&Model{
+		ShortID:    shortID,
+		GroupNo:    groupNo,
+		Name:       "md测试",
+		CreatorUID: "u1",
+		Status:     ThreadStatusActive,
+		Version:    1,
+	})
+	assert.NoError(t, err)
+
+	// 未设置时应返回空内容
+	result, err := db.QueryThreadMd(groupNo, shortID)
+	assert.NoError(t, err)
+	assert.NotNil(t, result)
+	assert.Equal(t, "", result.Content)
+	assert.Equal(t, int64(0), result.Version)
+	assert.Nil(t, result.UpdatedAt)
+	assert.Equal(t, "", result.UpdatedBy)
+}
+
+func TestQueryThreadMd_NonExistentThread(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	db := NewDB(ctx)
+
+	// 查询不存在的子区
+	result, err := db.QueryThreadMd("00000000000000000000000000000001", "999999999999999")
+	assert.NoError(t, err)
+	assert.Nil(t, result)
+}
+
+func TestQueryThreadMd_DeletedThread(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	db := NewDB(ctx)
+
+	groupNo := "00000000000000000000000000000001"
+	shortID := fmt.Sprintf("%d", ctx.UserIDGen.Generate().Int64())
+	err = db.Insert(&Model{
+		ShortID:    shortID,
+		GroupNo:    groupNo,
+		Name:       "已删除",
+		CreatorUID: "u1",
+		Status:     ThreadStatusDeleted,
+		Version:    1,
+	})
+	assert.NoError(t, err)
+
+	// 已删除的子区不应返回
+	result, err := db.QueryThreadMd(groupNo, shortID)
+	assert.NoError(t, err)
+	assert.Nil(t, result)
+}
+
+func TestUpdateThreadMd(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	db := NewDB(ctx)
+
+	groupNo := "00000000000000000000000000000001"
+	shortID := fmt.Sprintf("%d", ctx.UserIDGen.Generate().Int64())
+	err = db.Insert(&Model{
+		ShortID:    shortID,
+		GroupNo:    groupNo,
+		Name:       "更新测试",
+		CreatorUID: "u1",
+		Status:     ThreadStatusActive,
+		Version:    1,
+	})
+	assert.NoError(t, err)
+
+	// 第一次更新
+	v1, err := db.UpdateThreadMd(groupNo, shortID, "# 子区规范 v1", "u1")
+	assert.NoError(t, err)
+	assert.Equal(t, int64(1), v1)
+
+	// 验证内容
+	result, err := db.QueryThreadMd(groupNo, shortID)
+	assert.NoError(t, err)
+	assert.Equal(t, "# 子区规范 v1", result.Content)
+	assert.Equal(t, int64(1), result.Version)
+	assert.NotNil(t, result.UpdatedAt)
+	assert.Equal(t, "u1", result.UpdatedBy)
+
+	// 第二次更新（版本号递增）
+	v2, err := db.UpdateThreadMd(groupNo, shortID, "# 子区规范 v2", "u2")
+	assert.NoError(t, err)
+	assert.Equal(t, int64(2), v2)
+
+	result, err = db.QueryThreadMd(groupNo, shortID)
+	assert.NoError(t, err)
+	assert.Equal(t, "# 子区规范 v2", result.Content)
+	assert.Equal(t, int64(2), result.Version)
+	assert.Equal(t, "u2", result.UpdatedBy)
+}
+
+func TestUpdateThreadMd_NonExistentThread(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	db := NewDB(ctx)
+
+	// 更新不存在的子区
+	_, err = db.UpdateThreadMd("00000000000000000000000000000001", "999999999999999", "content", "u1")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "thread not found or already deleted")
+}
+
+func TestUpdateThreadMd_DeletedThread(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	db := NewDB(ctx)
+
+	groupNo := "00000000000000000000000000000001"
+	shortID := fmt.Sprintf("%d", ctx.UserIDGen.Generate().Int64())
+	err = db.Insert(&Model{
+		ShortID:    shortID,
+		GroupNo:    groupNo,
+		Name:       "已删除",
+		CreatorUID: "u1",
+		Status:     ThreadStatusDeleted,
+		Version:    1,
+	})
+	assert.NoError(t, err)
+
+	// 更新已删除的子区
+	_, err = db.UpdateThreadMd(groupNo, shortID, "content", "u1")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "thread not found or already deleted")
+}
+
+func TestDeleteThreadMd(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	db := NewDB(ctx)
+
+	groupNo := "00000000000000000000000000000001"
+	shortID := fmt.Sprintf("%d", ctx.UserIDGen.Generate().Int64())
+	err = db.Insert(&Model{
+		ShortID:    shortID,
+		GroupNo:    groupNo,
+		Name:       "删除测试",
+		CreatorUID: "u1",
+		Status:     ThreadStatusActive,
+		Version:    1,
+	})
+	assert.NoError(t, err)
+
+	// 先设置内容
+	_, err = db.UpdateThreadMd(groupNo, shortID, "# 待删除内容", "u1")
+	assert.NoError(t, err)
+
+	// 删除
+	v, err := db.DeleteThreadMd(groupNo, shortID, "u2")
+	assert.NoError(t, err)
+	assert.Equal(t, int64(2), v)
+
+	// 验证内容已被清空
+	result, err := db.QueryThreadMd(groupNo, shortID)
+	assert.NoError(t, err)
+	assert.Equal(t, "", result.Content) // IFNULL 转换后为空字符串
+	assert.Equal(t, int64(2), result.Version)
+	assert.Equal(t, "u2", result.UpdatedBy) // 保留删除者 UID
+}
+
+func TestDeleteThreadMd_NonExistentThread(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	db := NewDB(ctx)
+
+	// 删除不存在的子区
+	_, err = db.DeleteThreadMd("00000000000000000000000000000001", "999999999999999", "u1")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "thread not found or already deleted")
+}
+
+func TestThreadMd_VersionAutoIncrement(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	db := NewDB(ctx)
+
+	groupNo := "00000000000000000000000000000001"
+	shortID := fmt.Sprintf("%d", ctx.UserIDGen.Generate().Int64())
+	err = db.Insert(&Model{
+		ShortID:    shortID,
+		GroupNo:    groupNo,
+		Name:       "版本测试",
+		CreatorUID: "u1",
+		Status:     ThreadStatusActive,
+		Version:    1,
+	})
+	assert.NoError(t, err)
+
+	// 连续更新和删除，版本号应连续递增
+	v1, err := db.UpdateThreadMd(groupNo, shortID, "v1", "u1")
+	assert.NoError(t, err)
+	assert.Equal(t, int64(1), v1)
+
+	v2, err := db.UpdateThreadMd(groupNo, shortID, "v2", "u1")
+	assert.NoError(t, err)
+	assert.Equal(t, int64(2), v2)
+
+	v3, err := db.DeleteThreadMd(groupNo, shortID, "u1")
+	assert.NoError(t, err)
+	assert.Equal(t, int64(3), v3)
+
+	v4, err := db.UpdateThreadMd(groupNo, shortID, "v4", "u1")
+	assert.NoError(t, err)
+	assert.Equal(t, int64(4), v4)
+}
+
+func TestQueryThreadMd_ArchivedThread(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	db := NewDB(ctx)
+
+	groupNo := "00000000000000000000000000000001"
+	shortID := fmt.Sprintf("%d", ctx.UserIDGen.Generate().Int64())
+	err = db.Insert(&Model{
+		ShortID:    shortID,
+		GroupNo:    groupNo,
+		Name:       "归档测试",
+		CreatorUID: "u1",
+		Status:     ThreadStatusArchived,
+		Version:    1,
+	})
+	assert.NoError(t, err)
+
+	// 归档子区的 GROUP.md 仍可读取
+	_, err = db.UpdateThreadMd(groupNo, shortID, "归档内容", "u1")
+	assert.NoError(t, err)
+
+	result, err := db.QueryThreadMd(groupNo, shortID)
+	assert.NoError(t, err)
+	assert.Equal(t, "归档内容", result.Content)
+}
+
+// ==================== Service 层 ThreadMd 测试 ====================
+
+func TestServiceCanEditThreadMd(t *testing.T) {
+	svc, groupNo := setupServiceTestData(t)
+
+	// 创建子区（testutil.UID 是创建者）
+	thread1, err := svc.CreateThread(&CreateThreadReq{GroupNo: groupNo, Name: "权限测试", CreatorUID: testutil.UID, CreatorName: "用户1"})
+	assert.NoError(t, err)
+
+	// 子区创建者可以编辑
+	canEdit, err := svc.CanEditThreadMd(groupNo, thread1.ShortID, testutil.UID)
+	assert.NoError(t, err)
+	assert.True(t, canEdit)
+
+	// 群创建者也是 testutil.UID（同上），已测试
+
+	// 普通群成员不能编辑
+	canEdit, err = svc.CanEditThreadMd(groupNo, thread1.ShortID, "user2")
+	assert.NoError(t, err)
+	assert.False(t, canEdit)
+}
+
+func TestServiceGetThreadMd(t *testing.T) {
+	svc, groupNo := setupServiceTestData(t)
+
+	thread1, err := svc.CreateThread(&CreateThreadReq{GroupNo: groupNo, Name: "服务测试", CreatorUID: testutil.UID, CreatorName: "用户1"})
+	assert.NoError(t, err)
+
+	// 未设置时
+	result, err := svc.GetThreadMd(groupNo, thread1.ShortID)
+	assert.NoError(t, err)
+	assert.NotNil(t, result)
+	assert.Equal(t, "", result.Content)
+
+	// 设置后
+	v, err := svc.UpdateThreadMd(groupNo, thread1.ShortID, "# 服务层测试", testutil.UID)
+	assert.NoError(t, err)
+	assert.Equal(t, int64(1), v)
+
+	result, err = svc.GetThreadMd(groupNo, thread1.ShortID)
+	assert.NoError(t, err)
+	assert.Equal(t, "# 服务层测试", result.Content)
+	assert.Equal(t, int64(1), result.Version)
+}
+
+func TestServiceDeleteThreadMd(t *testing.T) {
+	svc, groupNo := setupServiceTestData(t)
+
+	thread1, err := svc.CreateThread(&CreateThreadReq{GroupNo: groupNo, Name: "删除测试", CreatorUID: testutil.UID, CreatorName: "用户1"})
+	assert.NoError(t, err)
+
+	// 设置内容
+	_, err = svc.UpdateThreadMd(groupNo, thread1.ShortID, "# 待删除", testutil.UID)
+	assert.NoError(t, err)
+
+	// 删除
+	v, err := svc.DeleteThreadMd(groupNo, thread1.ShortID, testutil.UID)
+	assert.NoError(t, err)
+	assert.Equal(t, int64(2), v)
+
+	// 验证已删除
+	result, err := svc.GetThreadMd(groupNo, thread1.ShortID)
+	assert.NoError(t, err)
+	assert.Equal(t, "", result.Content)
+}

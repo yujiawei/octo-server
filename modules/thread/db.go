@@ -1,6 +1,7 @@
 package thread
 
 import (
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"time"
@@ -38,7 +39,20 @@ type Model struct {
 	LastMessageAt        *time.Time `json:"last_message_at"`
 	LastMessageContent   string     `json:"last_message_content"`
 	LastMessageSenderUID string     `json:"last_message_sender_uid"`
+	// GROUP.md 相关字段
+	ThreadMd          *string    `json:"thread_md"`
+	ThreadMdVersion   int64      `json:"thread_md_version"`
+	ThreadMdUpdatedAt *time.Time `json:"thread_md_updated_at"`
+	ThreadMdUpdatedBy string     `json:"thread_md_updated_by"`
 	db.BaseModel
+}
+
+// ThreadMdResult 子区 GROUP.md 查询结果
+type ThreadMdResult struct {
+	Content   string     `json:"content"`
+	Version   int64      `json:"version"`
+	UpdatedAt *time.Time `json:"updated_at"`
+	UpdatedBy string     `json:"updated_by"`
 }
 
 // Insert 插入子区
@@ -313,6 +327,78 @@ func (d *DB) UpdateMessageStats(shortID string, content string, senderUID string
 		"last_message_sender_uid": senderUID,
 	}).Where("short_id=?", shortID).Exec()
 	return err
+}
+
+// QueryThreadMd 查询子区 GROUP.md 内容
+func (d *DB) QueryThreadMd(groupNo, shortID string) (*ThreadMdResult, error) {
+	var result *ThreadMdResult
+	_, err := d.session.Select(
+		"IFNULL(thread_md,'') as content",
+		"thread_md_version as version",
+		"thread_md_updated_at as updated_at",
+		"thread_md_updated_by as updated_by",
+	).From("thread").
+		Where("group_no=? AND short_id=? AND status!=?", groupNo, shortID, ThreadStatusDeleted).
+		Load(&result)
+	return result, err
+}
+
+// UpdateThreadMd 更新子区 GROUP.md 内容，返回新版本号
+func (d *DB) UpdateThreadMd(groupNo, shortID, content, updatedBy string) (int64, error) {
+	tx, err := d.session.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	result, err := tx.UpdateBySql(
+		"UPDATE `thread` SET thread_md=?, thread_md_version=LAST_INSERT_ID(thread_md_version+1), thread_md_updated_at=NOW(), thread_md_updated_by=? WHERE group_no=? AND short_id=? AND status!=?",
+		content, updatedBy, groupNo, shortID, ThreadStatusDeleted,
+	).Exec()
+	if err != nil {
+		return 0, err
+	}
+
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		return 0, errors.New("thread not found or already deleted")
+	}
+
+	var newVersion int64
+	_, err = tx.SelectBySql("SELECT LAST_INSERT_ID()").Load(&newVersion)
+	if err != nil {
+		return 0, err
+	}
+	return newVersion, tx.Commit()
+}
+
+// DeleteThreadMd 删除子区 GROUP.md 内容，保留删除者 UID，返回新版本号
+func (d *DB) DeleteThreadMd(groupNo, shortID, deletedBy string) (int64, error) {
+	tx, err := d.session.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	result, err := tx.UpdateBySql(
+		"UPDATE `thread` SET thread_md=NULL, thread_md_version=LAST_INSERT_ID(thread_md_version+1), thread_md_updated_at=NOW(), thread_md_updated_by=? WHERE group_no=? AND short_id=? AND status!=?",
+		deletedBy, groupNo, shortID, ThreadStatusDeleted,
+	).Exec()
+	if err != nil {
+		return 0, err
+	}
+
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		return 0, errors.New("thread not found or already deleted")
+	}
+
+	var newVersion int64
+	_, err = tx.SelectBySql("SELECT LAST_INSERT_ID()").Load(&newVersion)
+	if err != nil {
+		return 0, err
+	}
+	return newVersion, tx.Commit()
 }
 
 // QueryMessageFromUID 根据 channelID 和 messageID 查询消息发送者
