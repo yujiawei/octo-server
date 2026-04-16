@@ -1,6 +1,11 @@
 -- +migrate Up
 
+-- 0. 统一 group_category 表 collation，与数据库默认保持一致（必须在存储过程之前执行）
+ALTER TABLE `group_category` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+
 -- 1. 清理重复的默认分组：迁移群聊关联到保留的分组，再删除多余行
+DROP PROCEDURE IF EXISTS _dedup_default_categories;
+
 -- +migrate StatementBegin
 CREATE PROCEDURE _dedup_default_categories()
 BEGIN
@@ -31,11 +36,12 @@ BEGIN
     SET gs.category_id = kc.keep_category_id;
 
     -- 标记重复行为已删除
-    UPDATE group_category
-    SET status = 2
-    WHERE is_default = 1
-      AND status = 1
-      AND id NOT IN (SELECT keep_id FROM _keep);
+    UPDATE group_category gc
+    INNER JOIN _keep k ON k.uid = gc.uid AND k.space_id = gc.space_id
+    SET gc.status = 2
+    WHERE gc.is_default = 1
+      AND gc.status = 1
+      AND gc.id != k.keep_id;
 
     DROP TEMPORARY TABLE _keep;
     DROP TEMPORARY TABLE _keep_cat;
