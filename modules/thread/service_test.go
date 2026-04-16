@@ -301,6 +301,122 @@ func TestQueryThreadMetaByShortIDs(t *testing.T) {
 	assert.Nil(t, srcResult[shortID3])
 }
 
+// ==================== QueryThreadMetaByShortIDs 过滤已删除子区 ====================
+
+func TestQueryThreadMetaByShortIDs_ExcludeDeleted(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	db := NewDB(ctx)
+
+	shortIDActive := fmt.Sprintf("%d", ctx.UserIDGen.Generate().Int64())
+	shortIDDeleted := fmt.Sprintf("%d", ctx.UserIDGen.Generate().Int64())
+	shortIDArchived := fmt.Sprintf("%d", ctx.UserIDGen.Generate().Int64())
+
+	srcMsg1 := int64(200001)
+	srcMsg2 := int64(200002)
+	srcMsg3 := int64(200003)
+
+	err = db.Insert(&Model{
+		ShortID:         shortIDActive,
+		GroupNo:         "00000000000000000000000000000001",
+		Name:            "活跃子区",
+		CreatorUID:      "u1",
+		SourceMessageID: &srcMsg1,
+		Status:          ThreadStatusActive,
+		Version:         1,
+	})
+	assert.NoError(t, err)
+
+	err = db.Insert(&Model{
+		ShortID:         shortIDDeleted,
+		GroupNo:         "00000000000000000000000000000001",
+		Name:            "已删除子区",
+		CreatorUID:      "u1",
+		SourceMessageID: &srcMsg2,
+		Status:          ThreadStatusDeleted,
+		Version:         1,
+	})
+	assert.NoError(t, err)
+
+	err = db.Insert(&Model{
+		ShortID:         shortIDArchived,
+		GroupNo:         "00000000000000000000000000000001",
+		Name:            "已归档子区",
+		CreatorUID:      "u1",
+		SourceMessageID: &srcMsg3,
+		Status:          ThreadStatusArchived,
+		Version:         1,
+	})
+	assert.NoError(t, err)
+
+	result, err := db.QueryThreadMetaByShortIDs([]string{shortIDActive, shortIDDeleted, shortIDArchived})
+	assert.NoError(t, err)
+
+	// 已删除的子区不应出现在结果中
+	assert.Len(t, result, 2)
+	assert.Contains(t, result, shortIDActive)
+	assert.Contains(t, result, shortIDArchived)
+	assert.NotContains(t, result, shortIDDeleted)
+}
+
+// ==================== DB 层 QueryNonDeletedShortIDs 测试 ====================
+
+func TestQueryNonDeletedShortIDs(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	db := NewDB(ctx)
+
+	shortIDActive := fmt.Sprintf("%d", ctx.UserIDGen.Generate().Int64())
+	shortIDDeleted := fmt.Sprintf("%d", ctx.UserIDGen.Generate().Int64())
+	shortIDArchived := fmt.Sprintf("%d", ctx.UserIDGen.Generate().Int64())
+
+	err = db.Insert(&Model{
+		ShortID:    shortIDActive,
+		GroupNo:    "00000000000000000000000000000001",
+		Name:       "活跃",
+		CreatorUID: "u1",
+		Status:     ThreadStatusActive,
+		Version:    1,
+	})
+	assert.NoError(t, err)
+
+	err = db.Insert(&Model{
+		ShortID:    shortIDDeleted,
+		GroupNo:    "00000000000000000000000000000001",
+		Name:       "已删除",
+		CreatorUID: "u1",
+		Status:     ThreadStatusDeleted,
+		Version:    1,
+	})
+	assert.NoError(t, err)
+
+	err = db.Insert(&Model{
+		ShortID:    shortIDArchived,
+		GroupNo:    "00000000000000000000000000000001",
+		Name:       "已归档",
+		CreatorUID: "u1",
+		Status:     ThreadStatusArchived,
+		Version:    1,
+	})
+	assert.NoError(t, err)
+
+	activeIDs, err := db.QueryNonDeletedShortIDs([]string{shortIDActive, shortIDDeleted, shortIDArchived})
+	assert.NoError(t, err)
+	assert.Len(t, activeIDs, 2)
+	assert.Contains(t, activeIDs, shortIDActive)
+	assert.Contains(t, activeIDs, shortIDArchived)
+	assert.NotContains(t, activeIDs, shortIDDeleted)
+
+	// 空列表不报错
+	emptyResult, err := db.QueryNonDeletedShortIDs([]string{})
+	assert.NoError(t, err)
+	assert.Len(t, emptyResult, 0)
+}
+
 // ==================== DB 层 UpdateMessageStats 测试 ====================
 
 func TestUpdateMessageStats(t *testing.T) {

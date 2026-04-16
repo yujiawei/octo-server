@@ -116,13 +116,28 @@ func (d *DB) QueryThreadMetaByShortIDs(shortIDs []string) (map[string]*ThreadMet
 	}
 	var rows []*ThreadMetaRow
 	_, err := d.session.Select("short_id", "source_message_id", "message_count").From("thread").
-		Where("short_id IN ?", shortIDs).
+		Where("short_id IN ? AND status != ?", shortIDs, ThreadStatusDeleted).
 		Load(&rows)
 	if err != nil {
 		return nil, err
 	}
 	for _, row := range rows {
 		result[row.ShortID] = row
+	}
+	return result, nil
+}
+
+// QueryNonDeletedShortIDs 批量查询未删除的子区 shortID
+func (d *DB) QueryNonDeletedShortIDs(shortIDs []string) ([]string, error) {
+	if len(shortIDs) == 0 {
+		return []string{}, nil
+	}
+	var result []string
+	_, err := d.session.Select("short_id").From("thread").
+		Where("short_id IN ? AND status != ?", shortIDs, ThreadStatusDeleted).
+		Load(&result)
+	if err != nil {
+		return nil, err
 	}
 	return result, nil
 }

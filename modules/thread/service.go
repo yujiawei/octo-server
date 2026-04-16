@@ -547,6 +547,17 @@ func (s *Service) DeleteThread(groupNo, shortID, operatorUID string) error {
 	if err := s.db.UpdateStatus(shortID, ThreadStatusDeleted, version); err != nil {
 		return fmt.Errorf("update thread status: %w", err)
 	}
+
+	channelID := BuildChannelID(groupNo, shortID)
+	err = s.ctx.IMCreateOrUpdateChannelInfo(&config.ChannelInfoCreateReq{
+		ChannelID:   channelID,
+		ChannelType: common.ChannelTypeCommunityTopic.Uint8(),
+		Ban:         1,
+	})
+	if err != nil {
+		s.Warn("通知 WuKongIM 禁用已删除子区频道失败", zap.String("channelID", channelID), zap.Error(err))
+	}
+
 	return nil
 }
 
