@@ -184,7 +184,7 @@ func (c *Category) list(ctx *wkhttp.Context) {
 				UID:        loginUID,
 				Name:       "未分类",
 				Sort:       maxSort + 1,
-				IsDefault:  1,
+				IsDefault:  intPtr(1),
 			}
 			if err = c.db.insertDefaultCategory(newDefault); err != nil {
 				c.Error("创建默认类别失败", zap.Error(err))
@@ -202,9 +202,14 @@ func (c *Category) list(ctx *wkhttp.Context) {
 	}
 
 	result := make([]categoryResp, 0, len(categories))
+	defaultSeen := false
 	for _, cat := range categories {
 		catID := cat.CategoryID
-		if cat.IsDefault == 1 {
+		if cat.isDefault() {
+			if defaultSeen {
+				continue
+			}
+			defaultSeen = true
 			if uncategorized == nil {
 				uncategorized = make([]groupInCategoryResp, 0)
 			}
@@ -256,7 +261,7 @@ func (c *Category) update(ctx *wkhttp.Context) {
 		ctx.ResponseError(errors.New("无权限修改此分类"))
 		return
 	}
-	if cat.IsDefault == 1 {
+	if cat.isDefault() {
 		ctx.ResponseError(errors.New("默认分类不可修改"))
 		return
 	}
@@ -304,7 +309,7 @@ func (c *Category) delete(ctx *wkhttp.Context) {
 		ctx.ResponseError(errors.New("无权限删除此分类"))
 		return
 	}
-	if cat.IsDefault == 1 {
+	if cat.isDefault() {
 		ctx.ResponseError(errors.New("默认分类不可删除"))
 		return
 	}

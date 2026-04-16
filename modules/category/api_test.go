@@ -733,7 +733,7 @@ func TestCategory_ListAutoCreatesDefault(t *testing.T) {
 	defaultCat, err := f.db.queryDefaultCategory(testutil.UID, spaceID)
 	assert.NoError(t, err)
 	assert.NotNil(t, defaultCat)
-	assert.Equal(t, 1, defaultCat.IsDefault)
+	assert.Equal(t, intPtr(1), defaultCat.IsDefault)
 }
 
 func TestCategory_ListDefaultIdempotent(t *testing.T) {
@@ -1024,6 +1024,81 @@ func TestCategory_MoveGroupToDefaultCategory(t *testing.T) {
 }
 
 // ---------- Edge Cases ----------
+
+func TestCategory_InsertDefaultCategoryIdempotent(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	f := New(ctx)
+
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	spaceID := "space-idem-default-001"
+	seedSpaceAndMember(t, f, spaceID, 0)
+
+	// simulate concurrent inserts: call insertDefaultCategory twice with different UUIDs
+	m1 := &CategoryModel{
+		CategoryID: "default-uuid-001",
+		SpaceID:    spaceID,
+		UID:        testutil.UID,
+		Name:       "未分类",
+		Sort:       0,
+	}
+	err = f.db.insertDefaultCategory(m1)
+	assert.NoError(t, err)
+
+	m2 := &CategoryModel{
+		CategoryID: "default-uuid-002",
+		SpaceID:    spaceID,
+		UID:        testutil.UID,
+		Name:       "未分类",
+		Sort:       0,
+	}
+	err = f.db.insertDefaultCategory(m2)
+	assert.NoError(t, err)
+
+	// should only have 1 default category in DB
+	var count int
+	_, err = f.db.session.Select("count(*)").From("group_category").
+		Where("uid=? and space_id=? and is_default=1 and status=1", testutil.UID, spaceID).
+		Load(&count)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, count, "insertDefaultCategory should be idempotent — only one default row")
+}
+
+func TestCategory_UniqueIndexPreventsDefaultDuplicate(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	f := New(ctx)
+
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	spaceID := "space-uidx-default-001"
+	seedSpaceAndMember(t, f, spaceID, 0)
+
+	// first insert succeeds
+	err = f.db.insertCategory(&CategoryModel{
+		CategoryID: "uidx-default-001",
+		SpaceID:    spaceID,
+		UID:        testutil.UID,
+		Name:       "未分类",
+		Sort:       0,
+		Status:     1,
+		IsDefault:  intPtr(1),
+	})
+	assert.NoError(t, err)
+
+	// second insert with different ID but same (uid, space_id, is_default=1) should be rejected
+	err = f.db.insertCategory(&CategoryModel{
+		CategoryID: "uidx-default-002",
+		SpaceID:    spaceID,
+		UID:        testutil.UID,
+		Name:       "未分类",
+		Sort:       0,
+		Status:     1,
+		IsDefault:  intPtr(1),
+	})
+	assert.Error(t, err, "unique index should prevent duplicate default categories")
+}
 
 func TestCategory_SortCountMismatch(t *testing.T) {
 	s, ctx := testutil.NewTestServer()

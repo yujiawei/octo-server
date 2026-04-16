@@ -10,9 +10,15 @@ type CategoryModel struct {
 	Name       string
 	Sort       int
 	Status     int
-	IsDefault  int
+	IsDefault  *int
 	db.BaseModel
 }
+
+func (m *CategoryModel) isDefault() bool {
+	return m.IsDefault != nil && *m.IsDefault == 1
+}
+
+func intPtr(v int) *int { return &v }
 
 // groupSettingCategoryRow group_setting 表 category 相关字段投影
 type groupSettingCategoryRow struct {

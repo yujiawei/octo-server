@@ -42,7 +42,7 @@ func (d *categoryDB) queryDefaultCategory(uid, spaceID string) (*CategoryModel, 
 }
 
 func (d *categoryDB) insertDefaultCategory(m *CategoryModel) error {
-	m.IsDefault = 1
+	m.IsDefault = intPtr(1)
 	m.Status = 1
 	_, err := d.session.InsertBySql(
 		"INSERT IGNORE INTO group_category (category_id, space_id, uid, name, sort, status, is_default) VALUES (?, ?, ?, ?, ?, 1, 1)",
@@ -62,7 +62,7 @@ func (d *categoryDB) queryCategoryByID(categoryID string) (*CategoryModel, error
 func (d *categoryDB) countCategoriesByUIDAndSpaceID(uid, spaceID string) (int, error) {
 	var count int
 	_, err := d.session.Select("count(*)").From("group_category").
-		Where("uid=? and space_id=? and status=1 and is_default=0", uid, spaceID).
+		Where("uid=? and space_id=? and status=1 and (is_default IS NULL)", uid, spaceID).
 		Load(&count)
 	return count, err
 }
