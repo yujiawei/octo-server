@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -30,7 +29,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis"
 	"github.com/gocraft/dbr/v2"
-	sts "github.com/tencentyun/qcloud-cos-sts-sdk/go"
 	"github.com/tidwall/gjson"
 	"go.uber.org/zap"
 )
@@ -140,7 +138,7 @@ func (bf *BotFather) Route(r *wkhttp.WKHttp) {
 		botAPI.POST("/file/upload", bf.botUploadFile)
 		botAPI.POST("/upload", bf.botUploadFile) // 兼容旧路径 (/v1/bot/upload)
 		botAPI.GET("/file/download/*path", bf.botFileDownload)
-		botAPI.GET("/upload/credentials", bf.botUploadCredentials) // STS 临时密钥签发
+		botAPI.GET("/upload/credentials", bf.botUploadCredentials) // 预签名上传 URL 签发
 		botAPI.POST("/message/edit", bf.botMessageEdit)            // Bot 编辑消息
 		botAPI.GET("/user/info", bf.getUserInfo)                    // 查询用户基本信息 (#852)
 		// Voice context API
@@ -1320,7 +1318,7 @@ func (bf *BotFather) syncAllBotTokens() {
 	bf.Info("Bot token 启动同步完成", zap.Int("total", len(robots)), zap.Int("success", successCount))
 }
 
-// botUploadCredentials 签发 STS 临时密钥，供客户端直传 COS（/v1/bot/upload/credentials）
+// botUploadCredentials 签发预签名 PUT URL，供客户端直传文件（/v1/bot/upload/credentials）
 func (bf *BotFather) botUploadCredentials(c *wkhttp.Context) {
 	filename := c.Query("filename")
 	if strings.TrimSpace(filename) == "" {
@@ -1328,74 +1326,23 @@ func (bf *BotFather) botUploadCredentials(c *wkhttp.Context) {
 		return
 	}
 
-	cosConfig := bf.ctx.GetConfig().COS
-	if cosConfig.SecretID == "" || cosConfig.SecretKey == "" || cosConfig.Bucket == "" {
-		bf.Error("COS 配置不完整")
-		c.ResponseError(errors.New("COS 未配置"))
-		return
-	}
-
-	// 生成对象 key：{prefix}/chat/{timestamp}/{random}_{filename}
-	prefix := strings.TrimSpace(cosConfig.Prefix)
 	objectPath := fmt.Sprintf("chat/%d/%s_%s", time.Now().Unix(), util.GenerUUID(), url.PathEscape(filename))
-	var key string
-	if prefix != "" {
-		key = path.Join(prefix, objectPath)
-	} else {
-		key = objectPath
-	}
+	contentType := c.DefaultQuery("contentType", "application/octet-stream")
 
-	bucket := cosConfig.Bucket
-	region := cosConfig.Region
-
-	// 从 bucket 名中提取 appId（格式：bucketname-appid）
-	appId := ""
-	if idx := strings.LastIndex(bucket, "-"); idx > 0 {
-		appId = bucket[idx+1:]
-	}
-	if appId == "" {
-		bf.Error("无法从 bucket 名称中提取 appId", zap.String("bucket", bucket))
-		c.ResponseError(errors.New("COS 配置错误：bucket 格式不正确"))
-		return
-	}
-
-	// 使用 STS SDK 生成临时密钥
-	client := sts.NewClient(cosConfig.SecretID, cosConfig.SecretKey, nil)
-	opt := &sts.CredentialOptions{
-		DurationSeconds: 1800,
-		Region:          region,
-		Policy: &sts.CredentialPolicy{
-			Statement: []sts.CredentialPolicyStatement{
-				{
-					Action: []string{"cos:PutObject"},
-					Effect: "allow",
-					Resource: []string{
-						fmt.Sprintf("qcs::cos:%s:uid/%s:%s/%s", region, appId, bucket, key),
-					},
-				},
-			},
-		},
-	}
-
-	res, err := client.GetCredential(opt)
+	uploadURL, downloadURL, err := bf.fileService.PresignedPutURL(objectPath, contentType, 30*time.Minute)
 	if err != nil {
-		bf.Error("获取 STS 临时密钥失败", zap.Error(err))
-		c.ResponseError(errors.New("获取临时密钥失败"))
+		bf.Error("生成预签名上传URL失败", zap.Error(err))
+		c.ResponseError(errors.New("生成上传URL失败"))
 		return
 	}
 
 	c.Response(gin.H{
-		"bucket": bucket,
-		"region": region,
-		"key":    key,
-		"credentials": gin.H{
-			"tmpSecretId":  res.Credentials.TmpSecretID,
-			"tmpSecretKey": res.Credentials.TmpSecretKey,
-			"sessionToken": res.Credentials.SessionToken,
-		},
-		"startTime":   res.StartTime,
-		"expiredTime": res.ExpiredTime,
-		"cdnBaseUrl":  cosConfig.BucketURL,
+		"method":      "PUT",
+		"uploadUrl":   uploadURL,
+		"downloadUrl": downloadURL,
+		"contentType": contentType,
+		"key":         objectPath,
+		"expiresIn":   1800,
 	})
 }
 
