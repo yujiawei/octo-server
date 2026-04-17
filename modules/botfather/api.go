@@ -606,13 +606,29 @@ func (bf *BotFather) register(c *wkhttp.Context) {
 	}
 
 	// 可选解析版本信息（兼容旧客户端空 body）
+	// 只更新实际传入的非空字段，缺失字段保持现有值
 	var req BotRegisterReq
 	_ = c.ShouldBindJSON(&req) // 忽略解析错误
 	if req.AgentPlatform != "" || req.AgentVersion != "" || req.PluginVersion != "" {
-		if robot.AgentPlatform != req.AgentPlatform ||
-			robot.AgentVersion != req.AgentVersion ||
-			robot.PluginVersion != req.PluginVersion {
-			if updateErr := bf.db.updateRobotAgentInfo(robot.RobotID, req.AgentPlatform, req.AgentVersion, req.PluginVersion); updateErr != nil {
+		// Merge: 缺失字段用现有值填充
+		merged := struct{ platform, version, plugin string }{
+			platform: req.AgentPlatform,
+			version:  req.AgentVersion,
+			plugin:   req.PluginVersion,
+		}
+		if merged.platform == "" {
+			merged.platform = robot.AgentPlatform
+		}
+		if merged.version == "" {
+			merged.version = robot.AgentVersion
+		}
+		if merged.plugin == "" {
+			merged.plugin = robot.PluginVersion
+		}
+		if robot.AgentPlatform != merged.platform ||
+			robot.AgentVersion != merged.version ||
+			robot.PluginVersion != merged.plugin {
+			if updateErr := bf.db.updateRobotAgentInfo(robot.RobotID, merged.platform, merged.version, merged.plugin); updateErr != nil {
 				bf.Warn("更新Agent信息失败", zap.Error(updateErr), zap.String("robotID", robot.RobotID))
 			}
 		}
