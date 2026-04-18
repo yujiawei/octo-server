@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
@@ -15,6 +16,11 @@ import (
 )
 
 // ---------- helpers ----------
+
+func resetDefaultCategoryName() {
+	_defaultCategoryNameOnce = sync.Once{}
+	_defaultCategoryName = ""
+}
 
 // seedSpaceAndMember inserts a space and makes testutil.UID a member with given role.
 func seedSpaceAndMember(t *testing.T, f *Category, spaceID string, role int) {
@@ -139,18 +145,18 @@ func TestCategory_List(t *testing.T) {
 	assert.Equal(t, http.StatusOK, wl.Code)
 
 	cats := parseJSONArray(t, wl)
-	// should have 3 entries: 工作, 生活, 未分类(default)
+	// should have 3 entries: 工作, 生活, 默认分组(default)
 	assert.Equal(t, 3, len(cats))
 
-	// last entry is 未分类 (now with a real ID)
+	// last entry is 默认分组 (now with a real ID)
 	assert.NotNil(t, cats[2]["category_id"])
-	assert.Equal(t, "未分类", cats[2]["name"])
+	assert.Equal(t, defaultCategoryNameFallback, cats[2]["name"])
 
 	// 工作 category should have 1 group
 	workGroups := cats[0]["groups"].([]interface{})
 	assert.Equal(t, 1, len(workGroups))
 
-	// 未分类 should have 1 group
+	// 默认分组 should have 1 group
 	uncatGroups := cats[2]["groups"].([]interface{})
 	assert.Equal(t, 1, len(uncatGroups))
 }
@@ -723,17 +729,18 @@ func TestCategory_ListAutoCreatesDefault(t *testing.T) {
 	catID, ok := cats[0]["category_id"].(string)
 	assert.True(t, ok)
 	assert.NotEmpty(t, catID)
-	assert.Equal(t, "未分类", cats[0]["name"])
+	assert.Equal(t, defaultCategoryNameFallback, cats[0]["name"])
 
 	// the uncategorized group should be under this default category
 	groups := cats[0]["groups"].([]interface{})
 	assert.Equal(t, 1, len(groups))
 
-	// verify DB row has is_default=1
+	// verify DB row has is_default=1 and stores placeholder (not display name)
 	defaultCat, err := f.db.queryDefaultCategory(testutil.UID, spaceID)
 	assert.NoError(t, err)
 	assert.NotNil(t, defaultCat)
 	assert.Equal(t, intPtr(1), defaultCat.IsDefault)
+	assert.Equal(t, defaultCategoryNamePlaceholder, defaultCat.Name)
 }
 
 func TestCategory_ListDefaultIdempotent(t *testing.T) {
@@ -798,7 +805,7 @@ func TestCategory_ListWithCategoriesAndDefault(t *testing.T) {
 	// find the default category
 	var defaultCat map[string]interface{}
 	for _, c := range cats {
-		if c["name"] == "未分类" {
+		if c["name"] == defaultCategoryNameFallback {
 			defaultCat = c
 		}
 	}
@@ -886,7 +893,7 @@ func TestCategory_SortWithDefault(t *testing.T) {
 
 	var defaultCatID string
 	for _, c := range cats {
-		if c["name"] == "未分类" {
+		if c["name"] == defaultCategoryNameFallback {
 			defaultCatID = c["category_id"].(string)
 		}
 	}
@@ -907,9 +914,32 @@ func TestCategory_SortWithDefault(t *testing.T) {
 	cats2 := parseJSONArray(t, wl2)
 
 	assert.Equal(t, 3, len(cats2))
-	assert.Equal(t, "未分类", cats2[0]["name"])
+	assert.Equal(t, defaultCategoryNameFallback, cats2[0]["name"])
 	assert.Equal(t, "B", cats2[1]["name"])
 	assert.Equal(t, "A", cats2[2]["name"])
+}
+
+func TestCategory_DefaultNameFromEnv(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	spaceID := "space-default-env-001"
+	seedSpaceAndMember(t, f, spaceID, 0)
+	seedGroup(t, f, "group-default-env-001", spaceID)
+
+	t.Setenv("DM_DEFAULT_CATEGORY_NAME", "自定义分组")
+	resetDefaultCategoryName()
+	t.Cleanup(resetDefaultCategoryName)
+
+	wl := doRequest(t, s.GetRoute(), "GET", "/v1/spaces/"+spaceID+"/categories", nil)
+	assert.Equal(t, http.StatusOK, wl.Code)
+
+	cats := parseJSONArray(t, wl)
+	assert.Equal(t, 1, len(cats))
+	assert.Equal(t, "自定义分组", cats[0]["name"])
 }
 
 func TestCategory_DefaultNotCountedInLimit(t *testing.T) {
@@ -1040,7 +1070,7 @@ func TestCategory_InsertDefaultCategoryIdempotent(t *testing.T) {
 		CategoryID: "default-uuid-001",
 		SpaceID:    spaceID,
 		UID:        testutil.UID,
-		Name:       "未分类",
+		Name:       defaultCategoryNamePlaceholder,
 		Sort:       0,
 	}
 	err = f.db.insertDefaultCategory(m1)
@@ -1050,7 +1080,7 @@ func TestCategory_InsertDefaultCategoryIdempotent(t *testing.T) {
 		CategoryID: "default-uuid-002",
 		SpaceID:    spaceID,
 		UID:        testutil.UID,
-		Name:       "未分类",
+		Name:       defaultCategoryNamePlaceholder,
 		Sort:       0,
 	}
 	err = f.db.insertDefaultCategory(m2)
@@ -1080,7 +1110,7 @@ func TestCategory_UniqueIndexPreventsDefaultDuplicate(t *testing.T) {
 		CategoryID: "uidx-default-001",
 		SpaceID:    spaceID,
 		UID:        testutil.UID,
-		Name:       "未分类",
+		Name:       defaultCategoryNamePlaceholder,
 		Sort:       0,
 		Status:     1,
 		IsDefault:  intPtr(1),
@@ -1092,7 +1122,7 @@ func TestCategory_UniqueIndexPreventsDefaultDuplicate(t *testing.T) {
 		CategoryID: "uidx-default-002",
 		SpaceID:    spaceID,
 		UID:        testutil.UID,
-		Name:       "未分类",
+		Name:       defaultCategoryNamePlaceholder,
 		Sort:       0,
 		Status:     1,
 		IsDefault:  intPtr(1),
