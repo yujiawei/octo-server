@@ -133,6 +133,7 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 		// 获取用户的会话信息
 		// auth.GET("/users/:uid/conversation", u.userConversationInfoGet)
 
+		auth.GET("/user/search", u.search)
 		auth.POST("/users/:uid/avatar", u.uploadAvatar)              //上传用户头像
 		auth.PUT("/users/:uid/setting", u.setting.userSettingUpdate) // 更新用户设置
 	}
@@ -193,7 +194,6 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 		//v.POST("user/wxlogin", u.wxLogin)
 		v.POST("/user/sms/forgetpwd", u.getForgetPwdSMS) //获取忘记密码验证码
 		v.POST("/user/pwdforget", u.pwdforget)           //重置登录密码
-		v.GET("/user/search", u.search)                  // 搜索用户
 		v.GET("/users/:uid/avatar", u.UserAvatar)        // 用户头像
 		v.GET("/users/:uid/im", u.userIM)                // 获取用户所在IM节点信息
 		v.GET("/user/loginuuid", u.getLoginUUID)         // 获取扫描用的登录uuid
