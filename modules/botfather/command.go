@@ -473,7 +473,7 @@ func (h *commandHandler) handleQuickstart(fromUID string) {
 		apiURL = fmt.Sprintf("http://%s:8090", cfg.External.IP)
 	}
 
-	h.reply(fromUID, fmt.Sprintf("🚀 **Quickstart**\n\n📋 把下面框内全部内容复制发给 OpenClaw 模型执行。\n如未安装 DMWork 插件，先使用 /install 获取安装指南。\n\n```\n为所有 agent 批量创建并绑定 DMWork bot：\nnpx -y openclaw-channel-dmwork quickstart --api-key %s --api-url %s\n```",
+	h.reply(fromUID, fmt.Sprintf("🚀 **Quickstart**\n\n一键为你的所有 OpenClaw Agent 创建对应的 DMWork bot 并完成绑定，让每个 Agent 都能通过 DMWork 收发消息。\n\n📋 把下面框内全部内容复制发给 OpenClaw 模型执行。\n如未安装 DMWork 插件，先使用 /install 获取安装指南。\n\n```\n为所有 agent 批量创建并绑定 DMWork bot：\nnpx -y openclaw-channel-dmwork quickstart --api-key %s --api-url %s\n```",
 		apiKey, apiURL))
 }
 
