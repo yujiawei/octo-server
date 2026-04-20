@@ -1,6 +1,7 @@
 package wkhttp
 
 import (
+	"context"
 	"math"
 	"net"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	libwkhttp "github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/gin-gonic/gin"
 	"golang.org/x/time/rate"
@@ -29,23 +31,30 @@ type keyedLimiter struct {
 	burst    int
 }
 
-func newKeyedLimiter(rps float64, burst int) *keyedLimiter {
+// newKeyedLimiter 创建限流器并启动后台清理 goroutine。
+// ctx 取消时 cleanupLoop 退出，避免长生命周期之外的 goroutine 泄漏（主要服务测试场景）。
+func newKeyedLimiter(ctx context.Context, rps float64, burst int) *keyedLimiter {
 	k := &keyedLimiter{rps: rps, burst: burst}
-	go k.cleanupLoop()
+	go k.cleanupLoop(ctx)
 	return k
 }
 
-func (k *keyedLimiter) cleanupLoop() {
+func (k *keyedLimiter) cleanupLoop(ctx context.Context) {
 	ticker := time.NewTicker(3 * time.Minute)
 	defer ticker.Stop()
-	for range ticker.C {
-		k.limiters.Range(func(key, value any) bool {
-			entry := value.(*limiterEntry)
-			if time.Since(time.Unix(0, entry.lastSeen.Load())) > 10*time.Minute {
-				k.limiters.Delete(key)
-			}
-			return true
-		})
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			k.limiters.Range(func(key, value any) bool {
+				entry := value.(*limiterEntry)
+				if time.Since(time.Unix(0, entry.lastSeen.Load())) > 10*time.Minute {
+					k.limiters.Delete(key)
+				}
+				return true
+			})
+		}
 	}
 }
 
@@ -67,7 +76,13 @@ func (k *keyedLimiter) entryFor(key string) *limiterEntry {
 }
 
 // setRateLimitHeaders 写入标准限流响应头，allowed=false 时同时写 Retry-After。
-// Tokens() 在 Allow() 之后读取，高并发下 Remaining 可能略有偏差（可接受）。
+//
+// Tokens() 在 Allow() 扣减之后读取，非原子序列下存在两种可见的边界：
+//  1. 并发请求间，Tokens() 可能读到其他请求刚扣减后的值，Remaining 数字小于预期但合理
+//  2. Allow() 成功但 Tokens() 读到接近 0 或负值时 clamp 为 0，
+//     表现为"请求成功但 Remaining=0"，客户端不应据此推断下一请求必被拒
+//
+// 这是性能与强一致的权衡，对防 DDoS 场景可接受。
 // Retry-After 按 RFC 7231 用整秒表达，rps > 1 时总是返回 1（sub-second 不可表达）。
 func setRateLimitHeaders(h http.Header, entry *limiterEntry, burst int, rps float64, allowed bool) {
 	h.Set("X-RateLimit-Limit", strconv.Itoa(burst))
@@ -108,13 +123,16 @@ func getClientIP(r *http.Request) string {
 }
 
 // RateLimitMiddleware 全局 per-IP 限流，作为 DDoS 底线（挂载点：UseGin）。
-func RateLimitMiddleware(rps float64, burst int, excludePaths ...string) gin.HandlerFunc {
-	kl := newKeyedLimiter(rps, burst)
+// ctx 取消时后台清理 goroutine 退出，生产通常传 context.Background()。
+func RateLimitMiddleware(ctx context.Context, rps float64, burst int, excludePaths ...string) gin.HandlerFunc {
+	kl := newKeyedLimiter(ctx, rps, burst)
 
 	excludeSet := make(map[string]struct{}, len(excludePaths))
 	for _, p := range excludePaths {
 		excludeSet[p] = struct{}{}
 	}
+
+	var unknownIPWarnOnce sync.Once
 
 	return func(c *gin.Context) {
 		if _, ok := excludeSet[c.Request.URL.Path]; ok {
@@ -125,6 +143,9 @@ func RateLimitMiddleware(rps float64, burst int, excludePaths ...string) gin.Han
 		// fail-closed: 拿不到 IP 时走全局桶，不放行
 		ip := getClientIP(c.Request)
 		if ip == "" {
+			unknownIPWarnOnce.Do(func() {
+				log.Warn("rate limit: client IP unavailable, falling back to shared bucket; check reverse proxy / XFF configuration")
+			})
 			ip = unknownIPKey
 		}
 
@@ -148,14 +169,16 @@ func RateLimitMiddleware(rps float64, burst int, excludePaths ...string) gin.Han
 //
 // ⚠️ 挂载要求：必须挂在 AuthMiddleware 之后，且只用于认证路由组。
 //
-//	r.Group("/v1/foo", ctx.AuthMiddleware(r), wkhttp.UIDRateLimitMiddleware(1, 2))
+//	r.Group("/v1/foo", ctx.AuthMiddleware(r), wkhttp.UIDRateLimitMiddleware(ctx, 1, 2))
 //
 // Fail-open 语义：读不到 uid（未经 AuthMiddleware 或 token 无效）时直接放行，
 // 不会按任何维度限流。这意味着本中间件**不具备**未认证场景的防护能力，
 // 需配合全局 per-IP RateLimitMiddleware 作为底线。错误的挂载顺序会
 // 导致限流静默失效，请务必用 AuthMiddleware 前置并在测试中验证。
-func UIDRateLimitMiddleware(rps float64, burst int) libwkhttp.HandlerFunc {
-	kl := newKeyedLimiter(rps, burst)
+//
+// ctx 取消时后台清理 goroutine 退出。
+func UIDRateLimitMiddleware(ctx context.Context, rps float64, burst int) libwkhttp.HandlerFunc {
+	kl := newKeyedLimiter(ctx, rps, burst)
 	return func(c *libwkhttp.Context) {
 		uidAny, exists := c.Get("uid")
 		if !exists {

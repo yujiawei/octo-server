@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -105,7 +106,7 @@ func runAPI(ctx *config.Context) {
 			burst = n
 		}
 	}
-	s.GetRoute().UseGin(wkhttp.RateLimitMiddleware(rps, burst, "/v1/ping"))
+	s.GetRoute().UseGin(wkhttp.RateLimitMiddleware(context.Background(), rps, burst, "/v1/ping"))
 	// 模块安装
 	err := module.Setup(ctx)
 	if err != nil {

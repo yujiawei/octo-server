@@ -1,10 +1,13 @@
 package wkhttp
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strconv"
 	"testing"
+	"time"
 
 	libwkhttp "github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/gin-gonic/gin"
@@ -13,10 +16,11 @@ import (
 
 func TestRateLimitMiddleware(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	ctx := context.Background()
 
 	t.Run("allows requests within limit", func(t *testing.T) {
 		r := gin.New()
-		r.Use(RateLimitMiddleware(10, 10))
+		r.Use(RateLimitMiddleware(ctx, 10, 10))
 		r.GET("/test", func(c *gin.Context) {
 			c.JSON(200, gin.H{"ok": true})
 		})
@@ -32,7 +36,7 @@ func TestRateLimitMiddleware(t *testing.T) {
 
 	t.Run("blocks requests exceeding limit", func(t *testing.T) {
 		r := gin.New()
-		r.Use(RateLimitMiddleware(1, 2))
+		r.Use(RateLimitMiddleware(ctx, 1, 2))
 		r.GET("/test", func(c *gin.Context) {
 			c.JSON(200, gin.H{"ok": true})
 		})
@@ -52,7 +56,7 @@ func TestRateLimitMiddleware(t *testing.T) {
 
 	t.Run("excludes configured paths", func(t *testing.T) {
 		r := gin.New()
-		r.Use(RateLimitMiddleware(1, 1, "/health"))
+		r.Use(RateLimitMiddleware(ctx, 1, 1, "/health"))
 		r.GET("/health", func(c *gin.Context) {
 			c.JSON(200, gin.H{"ok": true})
 		})
@@ -68,7 +72,7 @@ func TestRateLimitMiddleware(t *testing.T) {
 
 	t.Run("isolates rate limits per IP", func(t *testing.T) {
 		r := gin.New()
-		r.Use(RateLimitMiddleware(1, 2))
+		r.Use(RateLimitMiddleware(ctx, 1, 2))
 		r.GET("/test", func(c *gin.Context) {
 			c.JSON(200, gin.H{"ok": true})
 		})
@@ -108,7 +112,7 @@ func TestRateLimitMiddleware(t *testing.T) {
 
 	t.Run("fail-closed when no IP available", func(t *testing.T) {
 		r := gin.New()
-		r.Use(RateLimitMiddleware(1, 1))
+		r.Use(RateLimitMiddleware(ctx, 1, 1))
 		r.GET("/test", func(c *gin.Context) {
 			c.JSON(200, gin.H{"ok": true})
 		})
@@ -128,7 +132,7 @@ func TestRateLimitMiddleware(t *testing.T) {
 
 	t.Run("sets X-RateLimit headers on successful request", func(t *testing.T) {
 		r := gin.New()
-		r.Use(RateLimitMiddleware(10, 20))
+		r.Use(RateLimitMiddleware(ctx, 10, 20))
 		r.GET("/test", func(c *gin.Context) {
 			c.JSON(200, gin.H{"ok": true})
 		})
@@ -147,7 +151,7 @@ func TestRateLimitMiddleware(t *testing.T) {
 
 	t.Run("sets Retry-After header on 429", func(t *testing.T) {
 		r := gin.New()
-		r.Use(RateLimitMiddleware(1, 1))
+		r.Use(RateLimitMiddleware(ctx, 1, 1))
 		r.GET("/test", func(c *gin.Context) {
 			c.JSON(200, gin.H{"ok": true})
 		})
@@ -172,9 +176,12 @@ func TestRateLimitMiddleware(t *testing.T) {
 
 func TestUIDRateLimitMiddleware(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	ctx := context.Background()
 
-	// newTestRouter wraps the libwkhttp middleware into a gin handler, simulating
-	// the same bridging done by libwkhttp.WKHttp.
+	// newTestRouter 将 libwkhttp 中间件桥接到 gin engine。
+	// 注意：测试中刻意在多个 router 上复用同一个 mw 实例（见 "isolates rate limits per uid"），
+	// 以验证限流状态是挂在 mw 闭包的 keyedLimiter 上、不随 router 变化。
+	// 若改成每个 router 自建 mw，将失去隔离性验证的意义。
 	newTestRouter := func(mw libwkhttp.HandlerFunc, uid string) *gin.Engine {
 		r := gin.New()
 		r.Use(func(c *gin.Context) {
@@ -194,7 +201,7 @@ func TestUIDRateLimitMiddleware(t *testing.T) {
 	}
 
 	t.Run("allows requests within limit", func(t *testing.T) {
-		r := newTestRouter(UIDRateLimitMiddleware(10, 10), "user1")
+		r := newTestRouter(UIDRateLimitMiddleware(ctx, 10, 10), "user1")
 		for i := 0; i < 10; i++ {
 			w := httptest.NewRecorder()
 			req := httptest.NewRequest("GET", "/test", nil)
@@ -204,7 +211,7 @@ func TestUIDRateLimitMiddleware(t *testing.T) {
 	})
 
 	t.Run("blocks requests exceeding limit", func(t *testing.T) {
-		r := newTestRouter(UIDRateLimitMiddleware(1, 2), "user2")
+		r := newTestRouter(UIDRateLimitMiddleware(ctx, 1, 2), "user2")
 		blocked := 0
 		for i := 0; i < 10; i++ {
 			w := httptest.NewRecorder()
@@ -218,9 +225,9 @@ func TestUIDRateLimitMiddleware(t *testing.T) {
 	})
 
 	t.Run("isolates rate limits per uid", func(t *testing.T) {
-		mw := UIDRateLimitMiddleware(1, 2)
+		// 同一个 mw 实例，两个不同 uid 的 router：耗尽 user3 的额度后 user4 不应受影响。
+		mw := UIDRateLimitMiddleware(ctx, 1, 2)
 
-		// Exhaust user3's quota
 		r1 := newTestRouter(mw, "user3")
 		for i := 0; i < 5; i++ {
 			w := httptest.NewRecorder()
@@ -228,7 +235,6 @@ func TestUIDRateLimitMiddleware(t *testing.T) {
 			r1.ServeHTTP(w, req)
 		}
 
-		// user4 should still have quota
 		r2 := newTestRouter(mw, "user4")
 		w := httptest.NewRecorder()
 		req := httptest.NewRequest("GET", "/test", nil)
@@ -237,8 +243,8 @@ func TestUIDRateLimitMiddleware(t *testing.T) {
 	})
 
 	t.Run("skips when uid is absent", func(t *testing.T) {
-		r := newTestRouter(UIDRateLimitMiddleware(1, 1), "")
-		// Without uid, middleware should not limit (misconfiguration fail-open)
+		r := newTestRouter(UIDRateLimitMiddleware(ctx, 1, 1), "")
+		// Fail-open：未经 AuthMiddleware 时应放行，不施加任何限流。
 		for i := 0; i < 10; i++ {
 			w := httptest.NewRecorder()
 			req := httptest.NewRequest("GET", "/test", nil)
@@ -248,11 +254,35 @@ func TestUIDRateLimitMiddleware(t *testing.T) {
 	})
 
 	t.Run("sets X-RateLimit headers on successful request", func(t *testing.T) {
-		r := newTestRouter(UIDRateLimitMiddleware(10, 20), "user5")
+		r := newTestRouter(UIDRateLimitMiddleware(ctx, 10, 20), "user5")
 		w := httptest.NewRecorder()
 		req := httptest.NewRequest("GET", "/test", nil)
 		r.ServeHTTP(w, req)
 
 		assert.Equal(t, "20", w.Header().Get("X-RateLimit-Limit"))
 	})
+}
+
+func TestCleanupLoopExitsOnContextCancel(t *testing.T) {
+	before := runtime.NumGoroutine()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	for i := 0; i < 20; i++ {
+		_ = newKeyedLimiter(ctx, 100, 100)
+	}
+
+	after := runtime.NumGoroutine()
+	assert.Greater(t, after, before, "expected goroutines to be spawned")
+
+	cancel()
+
+	// 等待 goroutine 退出（select 立即响应 ctx.Done，不需要等 ticker 触发）
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if runtime.NumGoroutine() <= before+2 { // 容忍少量调度抖动
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("goroutines did not exit after context cancel: before=%d now=%d", before, runtime.NumGoroutine())
 }
