@@ -320,6 +320,11 @@ func (r *RouterGroup) PUT(relativePath string, handlers ...HandlerFunc) {
 //
 // 历史上本函数将请求 Origin 直接反射（见 issue #135/#1015），
 // 已被替换为白名单实现，禁止在未评审的情况下改回反射语义。
+//
+// Deprecated: 本仓库运行时的 CORS 由 dmwork-lib 的 server.New 注入，
+// 实际覆盖逻辑走 SecureCORSOverrideMiddleware。本函数保留仅为：
+// 1) 历史 API 兼容；2) 防止 lib 未来同步本仓库代码时拉回反射版。
+// 新代码请直接使用 SecureCORSOverrideMiddleware。
 func CORSMiddleware(allowedOrigins ...string) HandlerFunc {
 	return func(c *Context) {
 		origin := c.Request.Header.Get(headerOrigin)

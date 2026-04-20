@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/Mininglamp-OSS/octo-server/pkg/log"
 	"github.com/gin-gonic/gin"
 )
 
@@ -15,6 +16,9 @@ const (
 )
 
 // ParseAllowedOrigins 解析逗号分隔的来源白名单。空项被忽略，前后空白被裁剪。
+// 裸 "*" 会被显式丢弃并打 warning——CORS 规范不允许 "*" 与
+// Access-Control-Allow-Credentials: true 同时出现，此处也不应接受这种语义。
+// 运维若想允许全部来源，应在反代层显式授权或使用精确域名。
 func ParseAllowedOrigins(raw string) []string {
 	if raw == "" {
 		return nil
@@ -22,9 +26,15 @@ func ParseAllowedOrigins(raw string) []string {
 	parts := strings.Split(raw, ",")
 	out := make([]string, 0, len(parts))
 	for _, p := range parts {
-		if s := strings.TrimSpace(p); s != "" {
-			out = append(out, s)
+		s := strings.TrimSpace(p)
+		if s == "" {
+			continue
 		}
+		if s == "*" {
+			log.Warn(`CORS: literal "*" in DM_CORS_ALLOWED_ORIGINS is ignored; use explicit origins or "*.domain" for subdomain matching`)
+			continue
+		}
+		out = append(out, s)
 	}
 	if len(out) == 0 {
 		return nil
@@ -32,11 +42,14 @@ func ParseAllowedOrigins(raw string) []string {
 	return out
 }
 
-// addVaryOrigin 幂等追加 Vary: Origin，避免与同链路其他中间件产生重复值。
+// addVaryOrigin 幂等追加 Vary: Origin，兼容单 header 多字段（"Origin, Accept-Encoding"）
+// 与多 header 值两种写法，避免与同链路其他中间件产生重复值。
 func addVaryOrigin(h http.Header) {
 	for _, v := range h.Values(headerVary) {
-		if v == headerOrigin {
-			return
+		for _, field := range strings.Split(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(field), headerOrigin) {
+				return
+			}
 		}
 	}
 	h.Add(headerVary, headerOrigin)
@@ -44,6 +57,7 @@ func addVaryOrigin(h http.Header) {
 
 // IsOriginAllowed 判断 origin 是否命中白名单。
 // 支持精确匹配以及 "*.host" / "scheme://*.host" 的严格子域通配（不匹配裸主机）。
+// scheme 与 host 比较均大小写不敏感（遵循 RFC 6454 §4）。
 // 注意：不带 scheme 的通配（"*.host"）会同时匹配 http 与 https 来源；
 // 要限制为 https，请使用 "https://*.host"。
 func IsOriginAllowed(origin string, allowed []string) bool {
@@ -54,7 +68,7 @@ func IsOriginAllowed(origin string, allowed []string) bool {
 		if entry == "" {
 			continue
 		}
-		if entry == origin {
+		if strings.EqualFold(entry, origin) {
 			return true
 		}
 		if matchWildcardOrigin(entry, origin) {
@@ -67,14 +81,15 @@ func IsOriginAllowed(origin string, allowed []string) bool {
 func matchWildcardOrigin(pattern, origin string) bool {
 	patScheme, patHost := splitScheme(pattern)
 	oriScheme, oriHost := splitScheme(origin)
-	if patScheme != "" && patScheme != oriScheme {
+	if patScheme != "" && !strings.EqualFold(patScheme, oriScheme) {
 		return false
 	}
 	if !strings.HasPrefix(patHost, "*.") {
 		return false
 	}
-	suffix := patHost[1:]
-	return len(oriHost) > len(suffix) && strings.HasSuffix(oriHost, suffix)
+	suffix := strings.ToLower(patHost[1:])
+	oriHostLower := strings.ToLower(oriHost)
+	return len(oriHostLower) > len(suffix) && strings.HasSuffix(oriHostLower, suffix)
 }
 
 func splitScheme(s string) (scheme, host string) {
@@ -88,6 +103,10 @@ func splitScheme(s string) (scheme, host string) {
 // 已写入响应头之后，按白名单重写/剥离 Access-Control-Allow-Origin 与
 // Access-Control-Allow-Credentials，并追加 Vary: Origin。
 //
+// **顺序要求**：本中间件必须注册在上游 CORS 中间件（当前实现来自
+// dmwork-lib 的 server.New）**之后**，否则其 Header.Set 会被上游覆盖，
+// 导致本中间件失效。调用点见 main.go 的 runAPI。
+//
 // 行为：
 //   - 请求无 Origin：删除两个 CORS 头，保持同源语义。
 //   - Origin 命中白名单：反射该 Origin，Allow-Credentials: true，Vary: Origin。
@@ -95,7 +114,8 @@ func splitScheme(s string) (scheme, host string) {
 //
 // 注意：预检（OPTIONS）通常被上游中间件提前 Abort，不会进入本中间件。
 // 当上游发出的是规范不合法的组合（如 "*" + credentials=true），浏览器本身
-// 会拒绝跨域 credentialed 预检，因此攻击路径依然被封堵。
+// 会拒绝跨域 credentialed 预检，因此攻击路径依然被封堵。非 credentialed
+// 预检的彻底修复需要 lib 侧同步白名单，追踪见独立 issue。
 func SecureCORSOverrideMiddleware(allowed []string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		origin := c.Request.Header.Get(headerOrigin)
