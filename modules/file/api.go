@@ -52,6 +52,8 @@ func (f *File) Route(r *wkhttp.WKHttp) {
 		// 预签名上传 URL 签发
 		auth.GET("/upload/presigned", f.getUploadCredentials)
 		auth.GET("/upload/credentials", f.getUploadCredentials) // 兼容旧路径
+		// 预签名下载 URL
+		auth.GET("/download/url", f.getDownloadURL)
 	}
 }
 
@@ -455,6 +457,39 @@ func (f *File) getUploadCredentials(c *wkhttp.Context) {
 		resp["contentDisposition"] = contentDisposition
 	}
 	c.Response(resp)
+}
+
+// getDownloadURL 返回预签名 GET URL，用于客户端下载带正确文件名的文件
+func (f *File) getDownloadURL(c *wkhttp.Context) {
+	ph := c.Query("path")
+	if strings.TrimSpace(ph) == "" {
+		c.ResponseError(errors.New("path参数不能为空"))
+		return
+	}
+	sanitized, err := sanitizePath(ph)
+	if err != nil {
+		c.ResponseError(errors.New("无效的文件路径"))
+		return
+	}
+
+	filename := c.Query("filename")
+	if strings.TrimSpace(filename) == "" {
+		filename = filepath.Base(sanitized)
+	}
+	filename = sanitizeFilename(filename)
+
+	expiry := 30 * time.Minute
+	signedURL, err := f.service.PresignedGetURL(sanitized, filename, expiry)
+	if err != nil {
+		f.Error("生成预签名下载URL失败", zap.Error(err))
+		c.ResponseError(errors.New("生成预签名下载URL失败"))
+		return
+	}
+
+	c.Response(gin.H{
+		"url":      signedURL,
+		"filename": filename,
+	})
 }
 
 // buildContentDisposition 根据文件名构造 RFC 6266 兼容的 Content-Disposition 头。

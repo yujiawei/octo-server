@@ -162,8 +162,7 @@ func (sc *ServiceCOS) PresignedPutURL(objectPath string, contentType string, con
 
 	uploadURL = presigned.String()
 
-	filename := extractFilenameFromDisposition(contentDisposition)
-	downloadURL, dlErr := sc.DownloadURL(objectPath, filename)
+	downloadURL, dlErr := sc.DownloadURL(objectPath, "")
 	if dlErr != nil {
 		sc.Warn("生成下载URL失败", zap.Error(dlErr))
 	}
@@ -211,11 +210,38 @@ func (sc *ServiceCOS) DownloadURL(ph string, filename string) (string, error) {
 
 	ph = sc.withPrefix(ph)
 	result, _ := url.JoinPath(downloadBase, ph)
-	if strings.TrimSpace(filename) == "" {
-		return result, nil
+	return result, nil
+}
+
+// PresignedGetURL 生成预签名 GET URL，带 response-content-disposition 用于下载。
+func (sc *ServiceCOS) PresignedGetURL(objectPath string, filename string, expires time.Duration) (string, error) {
+	cosConfig := sc.ctx.GetConfig().COS
+	client, err := sc.getClient()
+	if err != nil {
+		return "", err
 	}
-	vals := url.Values{}
-	encodedFilename := "UTF-8''" + url.QueryEscape(filename)
-	vals.Set("response-content-disposition", fmt.Sprintf("attachment; filename*=%s", encodedFilename))
-	return fmt.Sprintf("%s?%s", result, vals.Encode()), nil
+
+	key := sc.withPrefix(objectPath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	encodedFilename := "UTF-8''" + rfc5987Encode(filename)
+	params := url.Values{}
+	params.Set("response-content-disposition", fmt.Sprintf("attachment; filename*=%s", encodedFilename))
+
+	presigned, err := client.PresignHeader(ctx, http.MethodGet, cosConfig.Bucket, key, expires, params, nil)
+	if err != nil {
+		return "", fmt.Errorf("生成预签名GET URL失败: %w", err)
+	}
+
+	if customBase := strings.TrimSpace(cosConfig.BucketURL); customBase != "" {
+		parsed, parseErr := url.Parse(strings.TrimRight(customBase, "/"))
+		if parseErr == nil {
+			presigned.Host = parsed.Host
+			presigned.Scheme = parsed.Scheme
+		}
+	}
+
+	return presigned.String(), nil
 }
