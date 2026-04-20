@@ -19,6 +19,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/server"
 	"github.com/gin-gonic/gin"
+	rd "github.com/go-redis/redis"
 	"github.com/judwhite/go-svc"
 	"github.com/robfig/cron"
 	"github.com/spf13/viper"
@@ -112,7 +113,16 @@ func runAPI(ctx *config.Context) {
 			burst = n
 		}
 	}
-	s.GetRoute().UseGin(wkhttp.RateLimitMiddleware(context.Background(), rps, burst, "/v1/ping"))
+	// 限流状态存 Redis，多副本共享配额；与 dmwork-lib 的 GetRedisConn 指向同一实例。
+	// 独立构造 client 的原因：lib 的 redis.Conn 未暴露 Eval/Script 接口，
+	// 而令牌桶需要 Lua 脚本保证原子性。
+	// 生命周期：跟随进程存续，不显式 Close——与 lib 自身的 redis.Conn 处理方式一致。
+	rlRedis := rd.NewClient(&rd.Options{
+		Addr:       ctx.GetConfig().DB.RedisAddr,
+		Password:   ctx.GetConfig().DB.RedisPass,
+		MaxRetries: 1,
+	})
+	s.GetRoute().UseGin(wkhttp.RateLimitMiddleware(context.Background(), rlRedis, rps, burst, "/v1/ping"))
 	// 模块安装
 	err := module.Setup(ctx)
 	if err != nil {

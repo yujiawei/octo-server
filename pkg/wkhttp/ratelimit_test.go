@@ -4,23 +4,62 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"runtime"
 	"strconv"
 	"testing"
-	"time"
 
 	libwkhttp "github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/gin-gonic/gin"
+	rd "github.com/go-redis/redis"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+// newTestRedis 连接到 testenv-redis-1，并在 setup/teardown 只清理 ratelimit:* 前缀。
+// 之所以不 FlushDB：这份 Redis 容器可能与其他测试共用，全库 flush 会误伤无关数据。
+// 项目未引入 miniredis，直接使用 testenv 上的真实 Redis 容器（127.0.0.1:6399）。
+func newTestRedis(t *testing.T) *rd.Client {
+	t.Helper()
+	c := rd.NewClient(&rd.Options{Addr: "127.0.0.1:6399"})
+	if err := c.Ping().Err(); err != nil {
+		t.Skipf("testenv redis unavailable at 127.0.0.1:6399: %v", err)
+	}
+	cleanRateLimitKeys(t, c)
+	t.Cleanup(func() {
+		cleanRateLimitKeys(t, c)
+		_ = c.Close()
+	})
+	return c
+}
+
+// cleanRateLimitKeys 扫描并删除所有 ratelimit:* 键。testenv keyspace 很小，
+// KEYS 的 O(N) 阻塞可接受；生产代码不应这样写。
+func cleanRateLimitKeys(t *testing.T, c *rd.Client) {
+	t.Helper()
+	keys, err := c.Keys("ratelimit:*").Result()
+	require.NoError(t, err)
+	if len(keys) > 0 {
+		require.NoError(t, c.Del(keys...).Err())
+	}
+}
+
+// newDeadRedis 返回指向不可达地址的 client，用于验证 fail-open 行为。
+func newDeadRedis(t *testing.T) *rd.Client {
+	t.Helper()
+	// 指向一个大概率不会监听的端口，1 次重试后快速失败
+	return rd.NewClient(&rd.Options{
+		Addr:       "127.0.0.1:1",
+		MaxRetries: 0,
+	})
+}
 
 func TestRateLimitMiddleware(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx := context.Background()
 
 	t.Run("allows requests within limit", func(t *testing.T) {
+		client := newTestRedis(t)
 		r := gin.New()
-		r.Use(RateLimitMiddleware(ctx, 10, 10))
+		r.Use(RateLimitMiddleware(ctx, client, 10, 10))
 		r.GET("/test", func(c *gin.Context) {
 			c.JSON(200, gin.H{"ok": true})
 		})
@@ -35,8 +74,9 @@ func TestRateLimitMiddleware(t *testing.T) {
 	})
 
 	t.Run("blocks requests exceeding limit", func(t *testing.T) {
+		client := newTestRedis(t)
 		r := gin.New()
-		r.Use(RateLimitMiddleware(ctx, 1, 2))
+		r.Use(RateLimitMiddleware(ctx, client, 1, 2))
 		r.GET("/test", func(c *gin.Context) {
 			c.JSON(200, gin.H{"ok": true})
 		})
@@ -55,8 +95,9 @@ func TestRateLimitMiddleware(t *testing.T) {
 	})
 
 	t.Run("excludes configured paths", func(t *testing.T) {
+		client := newTestRedis(t)
 		r := gin.New()
-		r.Use(RateLimitMiddleware(ctx, 1, 1, "/health"))
+		r.Use(RateLimitMiddleware(ctx, client, 1, 1, "/health"))
 		r.GET("/health", func(c *gin.Context) {
 			c.JSON(200, gin.H{"ok": true})
 		})
@@ -71,8 +112,9 @@ func TestRateLimitMiddleware(t *testing.T) {
 	})
 
 	t.Run("isolates rate limits per IP", func(t *testing.T) {
+		client := newTestRedis(t)
 		r := gin.New()
-		r.Use(RateLimitMiddleware(ctx, 1, 2))
+		r.Use(RateLimitMiddleware(ctx, client, 1, 2))
 		r.GET("/test", func(c *gin.Context) {
 			c.JSON(200, gin.H{"ok": true})
 		})
@@ -111,8 +153,9 @@ func TestRateLimitMiddleware(t *testing.T) {
 	})
 
 	t.Run("fail-closed when no IP available", func(t *testing.T) {
+		client := newTestRedis(t)
 		r := gin.New()
-		r.Use(RateLimitMiddleware(ctx, 1, 1))
+		r.Use(RateLimitMiddleware(ctx, client, 1, 1))
 		r.GET("/test", func(c *gin.Context) {
 			c.JSON(200, gin.H{"ok": true})
 		})
@@ -131,8 +174,9 @@ func TestRateLimitMiddleware(t *testing.T) {
 	})
 
 	t.Run("sets X-RateLimit headers on successful request", func(t *testing.T) {
+		client := newTestRedis(t)
 		r := gin.New()
-		r.Use(RateLimitMiddleware(ctx, 10, 20))
+		r.Use(RateLimitMiddleware(ctx, client, 10, 20))
 		r.GET("/test", func(c *gin.Context) {
 			c.JSON(200, gin.H{"ok": true})
 		})
@@ -150,8 +194,9 @@ func TestRateLimitMiddleware(t *testing.T) {
 	})
 
 	t.Run("sets Retry-After header on 429", func(t *testing.T) {
+		client := newTestRedis(t)
 		r := gin.New()
-		r.Use(RateLimitMiddleware(ctx, 1, 1))
+		r.Use(RateLimitMiddleware(ctx, client, 1, 1))
 		r.GET("/test", func(c *gin.Context) {
 			c.JSON(200, gin.H{"ok": true})
 		})
@@ -172,6 +217,53 @@ func TestRateLimitMiddleware(t *testing.T) {
 		}
 		assert.True(t, got429, "expected at least one 429 response")
 	})
+
+	// fail-open：Redis 不可达时放行，不因基础设施抖动导致 HTTP 503。
+	// 监控应基于 redis 客户端自身的 metrics / 日志来报警，而非 HTTP 层的 429。
+	t.Run("fails open when redis is unreachable", func(t *testing.T) {
+		client := newDeadRedis(t)
+		r := gin.New()
+		r.Use(RateLimitMiddleware(ctx, client, 1, 1))
+		r.GET("/test", func(c *gin.Context) {
+			c.JSON(200, gin.H{"ok": true})
+		})
+
+		for i := 0; i < 10; i++ {
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest("GET", "/test", nil)
+			req.RemoteAddr = "7.7.7.7:1234"
+			r.ServeHTTP(w, req)
+			assert.Equal(t, 200, w.Code, "redis down should fail-open")
+		}
+	})
+
+	// 跨 middleware 实例共享 Redis 状态：验证"滚动部署 / 多副本"的核心诉求。
+	// 这是旧内存实现完全没法做到的行为，也是本次重写的主要动机。
+	t.Run("shares state across middleware instances (multi-replica)", func(t *testing.T) {
+		client := newTestRedis(t)
+
+		newRouter := func() *gin.Engine {
+			r := gin.New()
+			r.Use(RateLimitMiddleware(ctx, client, 1, 2))
+			r.GET("/test", func(c *gin.Context) {
+				c.JSON(200, gin.H{"ok": true})
+			})
+			return r
+		}
+
+		blocked := 0
+		for i := 0; i < 10; i++ {
+			r := newRouter() // 每次新实例，模拟不同 pod
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest("GET", "/test", nil)
+			req.RemoteAddr = "8.8.8.8:1234"
+			r.ServeHTTP(w, req)
+			if w.Code == http.StatusTooManyRequests {
+				blocked++
+			}
+		}
+		assert.Greater(t, blocked, 0, "expected cross-instance blocking via shared redis state")
+	})
 }
 
 func TestUIDRateLimitMiddleware(t *testing.T) {
@@ -180,8 +272,7 @@ func TestUIDRateLimitMiddleware(t *testing.T) {
 
 	// newTestRouter 将 libwkhttp 中间件桥接到 gin engine。
 	// 注意：测试中刻意在多个 router 上复用同一个 mw 实例（见 "isolates rate limits per uid"），
-	// 以验证限流状态是挂在 mw 闭包的 keyedLimiter 上、不随 router 变化。
-	// 若改成每个 router 自建 mw，将失去隔离性验证的意义。
+	// 以验证限流状态是挂在底层 Redis、不随 router 变化。
 	newTestRouter := func(mw libwkhttp.HandlerFunc, uid string) *gin.Engine {
 		r := gin.New()
 		r.Use(func(c *gin.Context) {
@@ -201,7 +292,8 @@ func TestUIDRateLimitMiddleware(t *testing.T) {
 	}
 
 	t.Run("allows requests within limit", func(t *testing.T) {
-		r := newTestRouter(UIDRateLimitMiddleware(ctx, 10, 10), "user1")
+		client := newTestRedis(t)
+		r := newTestRouter(UIDRateLimitMiddleware(ctx, client, 10, 10), "user1")
 		for i := 0; i < 10; i++ {
 			w := httptest.NewRecorder()
 			req := httptest.NewRequest("GET", "/test", nil)
@@ -211,7 +303,8 @@ func TestUIDRateLimitMiddleware(t *testing.T) {
 	})
 
 	t.Run("blocks requests exceeding limit", func(t *testing.T) {
-		r := newTestRouter(UIDRateLimitMiddleware(ctx, 1, 2), "user2")
+		client := newTestRedis(t)
+		r := newTestRouter(UIDRateLimitMiddleware(ctx, client, 1, 2), "user2")
 		blocked := 0
 		for i := 0; i < 10; i++ {
 			w := httptest.NewRecorder()
@@ -225,8 +318,8 @@ func TestUIDRateLimitMiddleware(t *testing.T) {
 	})
 
 	t.Run("isolates rate limits per uid", func(t *testing.T) {
-		// 同一个 mw 实例，两个不同 uid 的 router：耗尽 user3 的额度后 user4 不应受影响。
-		mw := UIDRateLimitMiddleware(ctx, 1, 2)
+		client := newTestRedis(t)
+		mw := UIDRateLimitMiddleware(ctx, client, 1, 2)
 
 		r1 := newTestRouter(mw, "user3")
 		for i := 0; i < 5; i++ {
@@ -243,8 +336,8 @@ func TestUIDRateLimitMiddleware(t *testing.T) {
 	})
 
 	t.Run("skips when uid is absent", func(t *testing.T) {
-		r := newTestRouter(UIDRateLimitMiddleware(ctx, 1, 1), "")
-		// Fail-open：未经 AuthMiddleware 时应放行，不施加任何限流。
+		client := newTestRedis(t)
+		r := newTestRouter(UIDRateLimitMiddleware(ctx, client, 1, 1), "")
 		for i := 0; i < 10; i++ {
 			w := httptest.NewRecorder()
 			req := httptest.NewRequest("GET", "/test", nil)
@@ -254,12 +347,24 @@ func TestUIDRateLimitMiddleware(t *testing.T) {
 	})
 
 	t.Run("sets X-RateLimit headers on successful request", func(t *testing.T) {
-		r := newTestRouter(UIDRateLimitMiddleware(ctx, 10, 20), "user5")
+		client := newTestRedis(t)
+		r := newTestRouter(UIDRateLimitMiddleware(ctx, client, 10, 20), "user5")
 		w := httptest.NewRecorder()
 		req := httptest.NewRequest("GET", "/test", nil)
 		r.ServeHTTP(w, req)
 
 		assert.Equal(t, "20", w.Header().Get("X-RateLimit-Limit"))
+	})
+
+	t.Run("fails open when redis is unreachable", func(t *testing.T) {
+		client := newDeadRedis(t)
+		r := newTestRouter(UIDRateLimitMiddleware(ctx, client, 1, 1), "user6")
+		for i := 0; i < 10; i++ {
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest("GET", "/test", nil)
+			r.ServeHTTP(w, req)
+			assert.Equal(t, 200, w.Code)
+		}
 	})
 }
 
@@ -267,8 +372,6 @@ func TestStrictIPRateLimitMiddleware(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx := context.Background()
 
-	// newTestRouter 把 lib wkhttp 中间件桥接到 gin engine。
-	// remoteAddr 决定客户端 IP，用于按 IP 隔离的测试。
 	newTestRouter := func(mw libwkhttp.HandlerFunc) *gin.Engine {
 		r := gin.New()
 		r.Use(func(c *gin.Context) {
@@ -282,7 +385,8 @@ func TestStrictIPRateLimitMiddleware(t *testing.T) {
 	}
 
 	t.Run("allows requests within limit", func(t *testing.T) {
-		r := newTestRouter(StrictIPRateLimitMiddleware(ctx, 10, 10))
+		client := newTestRedis(t)
+		r := newTestRouter(StrictIPRateLimitMiddleware(ctx, client, "login", 10, 10))
 		for i := 0; i < 10; i++ {
 			w := httptest.NewRecorder()
 			req := httptest.NewRequest("POST", "/test", nil)
@@ -293,7 +397,8 @@ func TestStrictIPRateLimitMiddleware(t *testing.T) {
 	})
 
 	t.Run("blocks requests exceeding limit", func(t *testing.T) {
-		r := newTestRouter(StrictIPRateLimitMiddleware(ctx, 1, 2))
+		client := newTestRedis(t)
+		r := newTestRouter(StrictIPRateLimitMiddleware(ctx, client, "login", 1, 2))
 		blocked := 0
 		for i := 0; i < 10; i++ {
 			w := httptest.NewRecorder()
@@ -308,11 +413,10 @@ func TestStrictIPRateLimitMiddleware(t *testing.T) {
 	})
 
 	t.Run("isolates rate limits per IP", func(t *testing.T) {
-		// 同一个 mw 实例，两个不同 IP 各自独立配额。
-		mw := StrictIPRateLimitMiddleware(ctx, 1, 2)
+		client := newTestRedis(t)
+		mw := StrictIPRateLimitMiddleware(ctx, client, "login", 1, 2)
 		r := newTestRouter(mw)
 
-		// 耗尽 IP A
 		for i := 0; i < 10; i++ {
 			w := httptest.NewRecorder()
 			req := httptest.NewRequest("POST", "/test", nil)
@@ -320,7 +424,6 @@ func TestStrictIPRateLimitMiddleware(t *testing.T) {
 			r.ServeHTTP(w, req)
 		}
 
-		// IP B 应该还能成功
 		w := httptest.NewRecorder()
 		req := httptest.NewRequest("POST", "/test", nil)
 		req.RemoteAddr = "4.4.4.4:1000"
@@ -328,8 +431,32 @@ func TestStrictIPRateLimitMiddleware(t *testing.T) {
 		assert.Equal(t, 200, w.Code)
 	})
 
+	// 不同 tag 互相隔离：登录组耗尽配额后，注册组不应受影响。
+	// 这是引入 tag 参数的核心动机（原内存实现靠独立 sync.Map，Redis 需要 keyspace 分离）。
+	t.Run("isolates rate limits per tag", func(t *testing.T) {
+		client := newTestRedis(t)
+		login := StrictIPRateLimitMiddleware(ctx, client, "login", 1, 2)
+		register := StrictIPRateLimitMiddleware(ctx, client, "register", 1, 2)
+
+		rl := newTestRouter(login)
+		for i := 0; i < 10; i++ {
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest("POST", "/test", nil)
+			req.RemoteAddr = "6.6.6.6:1000"
+			rl.ServeHTTP(w, req)
+		}
+
+		rr := newTestRouter(register)
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/test", nil)
+		req.RemoteAddr = "6.6.6.6:1000"
+		rr.ServeHTTP(w, req)
+		assert.Equal(t, 200, w.Code, "different tag must not share quota")
+	})
+
 	t.Run("fail-closed when no IP available", func(t *testing.T) {
-		r := newTestRouter(StrictIPRateLimitMiddleware(ctx, 1, 1))
+		client := newTestRedis(t)
+		r := newTestRouter(StrictIPRateLimitMiddleware(ctx, client, "login", 1, 1))
 		blocked := 0
 		for i := 0; i < 5; i++ {
 			w := httptest.NewRecorder()
@@ -344,9 +471,9 @@ func TestStrictIPRateLimitMiddleware(t *testing.T) {
 	})
 
 	t.Run("sets X-RateLimit and Retry-After headers", func(t *testing.T) {
-		r := newTestRouter(StrictIPRateLimitMiddleware(ctx, 1, 1))
+		client := newTestRedis(t)
+		r := newTestRouter(StrictIPRateLimitMiddleware(ctx, client, "login", 1, 1))
 
-		// 第一次成功，设 X-RateLimit-Limit
 		w1 := httptest.NewRecorder()
 		req1 := httptest.NewRequest("POST", "/test", nil)
 		req1.RemoteAddr = "5.5.5.5:1000"
@@ -354,7 +481,6 @@ func TestStrictIPRateLimitMiddleware(t *testing.T) {
 		assert.Equal(t, 200, w1.Code)
 		assert.Equal(t, "1", w1.Header().Get("X-RateLimit-Limit"))
 
-		// 后续应触发 429 并设 Retry-After
 		got429 := false
 		for i := 0; i < 5; i++ {
 			w := httptest.NewRecorder()
@@ -371,28 +497,16 @@ func TestStrictIPRateLimitMiddleware(t *testing.T) {
 		}
 		assert.True(t, got429, "expected at least one 429")
 	})
-}
 
-func TestCleanupLoopExitsOnContextCancel(t *testing.T) {
-	before := runtime.NumGoroutine()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	for i := 0; i < 20; i++ {
-		_ = newKeyedLimiter(ctx, 100, 100)
-	}
-
-	after := runtime.NumGoroutine()
-	assert.Greater(t, after, before, "expected goroutines to be spawned")
-
-	cancel()
-
-	// 等待 goroutine 退出（select 立即响应 ctx.Done，不需要等 ticker 触发）
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if runtime.NumGoroutine() <= before+2 { // 容忍少量调度抖动
-			return
+	t.Run("fails open when redis is unreachable", func(t *testing.T) {
+		client := newDeadRedis(t)
+		r := newTestRouter(StrictIPRateLimitMiddleware(ctx, client, "login", 1, 1))
+		for i := 0; i < 10; i++ {
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest("POST", "/test", nil)
+			req.RemoteAddr = "7.7.7.7:1000"
+			r.ServeHTTP(w, req)
+			assert.Equal(t, 200, w.Code)
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("goroutines did not exit after context cancel: before=%d now=%d", before, runtime.NumGoroutine())
+	})
 }

@@ -23,6 +23,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/source"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
+	rd "github.com/go-redis/redis"
 	"github.com/gocraft/dbr/v2"
 	"github.com/opentracing/opentracing-go"
 	"github.com/opentracing/opentracing-go/ext"
@@ -132,11 +133,18 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 	// 端点级严格 per-IP 限流：防暴力破解 / 撞库 / 手机号枚举 / SMS 费用 DoS
 	// 同类端点共享一个限流器实例，使同一 IP 的总配额受控，避免攻击者跨端点分散
 	rlCtx := context.Background()
+	// 限流状态存 Redis，多副本共享配额；生命周期跟随进程，与 main.go 的做法一致
+	rlRedis := rd.NewClient(&rd.Options{
+		Addr:       u.ctx.GetConfig().DB.RedisAddr,
+		Password:   u.ctx.GetConfig().DB.RedisPass,
+		MaxRetries: 1,
+	})
 	// burst 取小值：人类正常重试容忍 + 不给攻击者初始白嫖窗口
-	loginLimit := appwkhttp.StrictIPRateLimitMiddleware(rlCtx, 10.0/60, 5)   // 10 req/min, burst 5
-	registerLimit := appwkhttp.StrictIPRateLimitMiddleware(rlCtx, 5.0/60, 3) // 5 req/min, burst 3
-	smsLimit := appwkhttp.StrictIPRateLimitMiddleware(rlCtx, 5.0/60, 3)      // 5 req/min, burst 3
-	searchLimit := appwkhttp.StrictIPRateLimitMiddleware(rlCtx, 30.0/60, 15) // 30 req/min, burst 15
+	// tag 用稳定字符串分离 keyspace；注意 register 和 sms 参数相同但语义不同，必须分开
+	loginLimit := appwkhttp.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "login", 10.0/60, 5)      // 10 req/min, burst 5
+	registerLimit := appwkhttp.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "register", 5.0/60, 3) // 5 req/min, burst 3
+	smsLimit := appwkhttp.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "sms", 5.0/60, 3)           // 5 req/min, burst 3
+	searchLimit := appwkhttp.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "search", 30.0/60, 15)   // 30 req/min, burst 15
 
 	auth := r.Group("/v1", u.ctx.AuthMiddleware(r))
 	{
