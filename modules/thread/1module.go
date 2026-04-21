@@ -17,6 +17,9 @@ import (
 //go:embed sql
 var sqlFS embed.FS
 
+//go:embed swagger/api.yaml
+var swaggerContent string
+
 func init() {
 	register.AddModule(func(ctx interface{}) register.Module {
 		// Beta 功能开关：DM_THREAD_ON=true 启用
@@ -35,7 +38,8 @@ func init() {
 			SetupAPI: func() register.APIRouter {
 				return api
 			},
-			SQLDir: register.NewSQLFS(sqlFS),
+			Swagger: swaggerContent,
+			SQLDir:  register.NewSQLFS(sqlFS),
 			IMDatasource: register.IMDatasource{
 				HasData: func(channelID string, channelType uint8) register.IMDatasourceType {
 					// 只处理 ChannelTypeCommunityTopic (=5)

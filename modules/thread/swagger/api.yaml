@@ -1,0 +1,514 @@
+swagger: "2.0"
+info:
+  description: "DMWork 群子区（Thread）模块 API"
+  version: "1.0.0"
+  title: "DMWork Thread API"
+host: "api.botgate.cn"
+basePath: "/v1"
+schemes:
+  - "https"
+tags:
+  - name: "thread"
+    description: "群子区（以群为父级的轻量会话）"
+  - name: "threadMember"
+    description: "子区成员"
+  - name: "threadMd"
+    description: "子区 GROUP.md"
+
+paths:
+  /groups/{group_no}/threads:
+    post:
+      tags:
+        - "thread"
+      summary: "创建子区"
+      description: "在指定群下创建一个子区，调用者必须是该群成员"
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      parameters:
+        - in: "path"
+          name: "group_no"
+          type: string
+          required: true
+          description: "群编号"
+        - in: "body"
+          name: "body"
+          required: true
+          schema:
+            $ref: "#/definitions/createThreadReq"
+      responses:
+        200:
+          description: "创建成功"
+          schema:
+            $ref: "#/definitions/threadResp"
+        400:
+          description: "参数错误或非群成员"
+          schema:
+            $ref: "#/definitions/errorResp"
+
+    get:
+      tags:
+        - "thread"
+      summary: "分页列出群下的子区"
+      description: "按 created_at 降序分页返回群下的活跃子区。调用者必须是该群成员。"
+      produces:
+        - "application/json"
+      parameters:
+        - in: "path"
+          name: "group_no"
+          type: string
+          required: true
+          description: "群编号"
+        - in: "query"
+          name: "page_index"
+          type: integer
+          required: false
+          default: 1
+          minimum: 1
+          description: "页码，从 1 开始，默认 1"
+        - in: "query"
+          name: "page_size"
+          type: integer
+          required: false
+          default: 15
+          minimum: 1
+          maximum: 100
+          description: "每页条数，默认 15，最大 100。超出上限或非法值时夹回默认值"
+      responses:
+        200:
+          description: "分页结果"
+          schema:
+            type: object
+            properties:
+              count:
+                type: integer
+                format: int64
+                description: "该群活跃子区总数"
+              list:
+                type: array
+                items:
+                  $ref: "#/definitions/threadResp"
+        400:
+          description: "参数错误或非群成员"
+          schema:
+            $ref: "#/definitions/errorResp"
+
+  /groups/{group_no}/threads/{short_id}:
+    get:
+      tags:
+        - "thread"
+      summary: "获取子区详情"
+      produces:
+        - "application/json"
+      parameters:
+        - $ref: "#/parameters/groupNoPath"
+        - $ref: "#/parameters/shortIdPath"
+      responses:
+        200:
+          description: "子区详情"
+          schema:
+            $ref: "#/definitions/threadResp"
+        400:
+          description: "参数非法、非群成员或子区不存在"
+          schema:
+            $ref: "#/definitions/errorResp"
+
+    put:
+      tags:
+        - "thread"
+      summary: "修改子区名称"
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      parameters:
+        - $ref: "#/parameters/groupNoPath"
+        - $ref: "#/parameters/shortIdPath"
+        - in: "body"
+          name: "body"
+          required: true
+          schema:
+            type: object
+            required:
+              - name
+            properties:
+              name:
+                type: string
+                maxLength: 100
+                description: "新名称"
+      responses:
+        200:
+          description: "更新成功"
+          schema:
+            $ref: "#/definitions/okResp"
+        400:
+          description: "参数错误或无权限"
+          schema:
+            $ref: "#/definitions/errorResp"
+
+    delete:
+      tags:
+        - "thread"
+      summary: "删除子区"
+      description: "仅创建者/群管理员可删除"
+      produces:
+        - "application/json"
+      parameters:
+        - $ref: "#/parameters/groupNoPath"
+        - $ref: "#/parameters/shortIdPath"
+      responses:
+        200:
+          description: "删除成功"
+          schema:
+            $ref: "#/definitions/okResp"
+        400:
+          description: "无权限或子区不存在"
+          schema:
+            $ref: "#/definitions/errorResp"
+
+  /groups/{group_no}/threads/{short_id}/members:
+    get:
+      tags:
+        - "threadMember"
+      summary: "列出子区成员"
+      produces:
+        - "application/json"
+      parameters:
+        - $ref: "#/parameters/groupNoPath"
+        - $ref: "#/parameters/shortIdPath"
+      responses:
+        200:
+          description: "成员列表"
+          schema:
+            type: array
+            items:
+              $ref: "#/definitions/memberResp"
+        400:
+          description: "参数错误或非群成员"
+          schema:
+            $ref: "#/definitions/errorResp"
+
+  /groups/{group_no}/threads/{short_id}/join:
+    post:
+      tags:
+        - "threadMember"
+      summary: "加入子区"
+      parameters:
+        - $ref: "#/parameters/groupNoPath"
+        - $ref: "#/parameters/shortIdPath"
+      responses:
+        200:
+          description: "加入成功"
+          schema:
+            $ref: "#/definitions/okResp"
+        400:
+          description: "非群成员或子区不存在"
+          schema:
+            $ref: "#/definitions/errorResp"
+
+  /groups/{group_no}/threads/{short_id}/leave:
+    post:
+      tags:
+        - "threadMember"
+      summary: "离开子区"
+      parameters:
+        - $ref: "#/parameters/groupNoPath"
+        - $ref: "#/parameters/shortIdPath"
+      responses:
+        200:
+          description: "离开成功"
+          schema:
+            $ref: "#/definitions/okResp"
+        400:
+          description: "未加入或子区不存在"
+          schema:
+            $ref: "#/definitions/errorResp"
+
+  /groups/{group_no}/threads/{short_id}/archive:
+    post:
+      tags:
+        - "thread"
+      summary: "归档子区"
+      parameters:
+        - $ref: "#/parameters/groupNoPath"
+        - $ref: "#/parameters/shortIdPath"
+      responses:
+        200:
+          description: "归档成功"
+          schema:
+            $ref: "#/definitions/okResp"
+        400:
+          description: "无权限或子区不存在"
+          schema:
+            $ref: "#/definitions/errorResp"
+
+  /groups/{group_no}/threads/{short_id}/unarchive:
+    post:
+      tags:
+        - "thread"
+      summary: "取消归档"
+      parameters:
+        - $ref: "#/parameters/groupNoPath"
+        - $ref: "#/parameters/shortIdPath"
+      responses:
+        200:
+          description: "取消成功"
+          schema:
+            $ref: "#/definitions/okResp"
+        400:
+          description: "无权限或子区不存在"
+          schema:
+            $ref: "#/definitions/errorResp"
+
+  /groups/{group_no}/threads/{short_id}/md:
+    get:
+      tags:
+        - "threadMd"
+      summary: "获取子区 GROUP.md"
+      produces:
+        - "application/json"
+      parameters:
+        - $ref: "#/parameters/groupNoPath"
+        - $ref: "#/parameters/shortIdPath"
+      responses:
+        200:
+          description: "内容"
+          schema:
+            $ref: "#/definitions/threadMdResp"
+        400:
+          description: "无权限或子区不存在"
+          schema:
+            $ref: "#/definitions/errorResp"
+
+    put:
+      tags:
+        - "threadMd"
+      summary: "更新子区 GROUP.md"
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      parameters:
+        - $ref: "#/parameters/groupNoPath"
+        - $ref: "#/parameters/shortIdPath"
+        - in: "body"
+          name: "body"
+          required: true
+          schema:
+            type: object
+            required:
+              - content
+            properties:
+              content:
+                type: string
+                description: "新的 Markdown 内容"
+      responses:
+        200:
+          description: "更新成功"
+          schema:
+            type: object
+            properties:
+              version:
+                type: integer
+                format: int64
+                description: "新版本号"
+        400:
+          description: "无权限或内容非法"
+          schema:
+            $ref: "#/definitions/errorResp"
+
+    delete:
+      tags:
+        - "threadMd"
+      summary: "删除子区 GROUP.md"
+      parameters:
+        - $ref: "#/parameters/groupNoPath"
+        - $ref: "#/parameters/shortIdPath"
+      responses:
+        200:
+          description: "删除成功"
+          schema:
+            type: object
+            properties:
+              version:
+                type: integer
+                format: int64
+        400:
+          description: "无权限或不存在"
+          schema:
+            $ref: "#/definitions/errorResp"
+
+  /threads/{short_id}:
+    get:
+      tags:
+        - "thread"
+      summary: "通过 shortID 直接获取子区详情"
+      description: "简化路由，无需提供 group_no"
+      parameters:
+        - $ref: "#/parameters/shortIdPath"
+      responses:
+        200:
+          description: "子区详情"
+          schema:
+            $ref: "#/definitions/threadResp"
+        400:
+          description: "不存在或无权限"
+          schema:
+            $ref: "#/definitions/errorResp"
+
+  /threads/{short_id}/join:
+    post:
+      tags:
+        - "threadMember"
+      summary: "通过 shortID 直接加入子区"
+      parameters:
+        - $ref: "#/parameters/shortIdPath"
+      responses:
+        200:
+          description: "加入成功"
+          schema:
+            $ref: "#/definitions/okResp"
+        400:
+          description: "非群成员或子区不存在"
+          schema:
+            $ref: "#/definitions/errorResp"
+
+  /threads/{short_id}/leave:
+    post:
+      tags:
+        - "threadMember"
+      summary: "通过 shortID 直接离开子区"
+      parameters:
+        - $ref: "#/parameters/shortIdPath"
+      responses:
+        200:
+          description: "离开成功"
+          schema:
+            $ref: "#/definitions/okResp"
+        400:
+          description: "未加入或子区不存在"
+          schema:
+            $ref: "#/definitions/errorResp"
+
+parameters:
+  groupNoPath:
+    in: "path"
+    name: "group_no"
+    type: string
+    required: true
+    description: "群编号"
+  shortIdPath:
+    in: "path"
+    name: "short_id"
+    type: string
+    required: true
+    description: "子区 shortID（15-20 位纯数字 snowflake ID）"
+
+definitions:
+  createThreadReq:
+    type: object
+    required:
+      - name
+    properties:
+      name:
+        type: string
+        maxLength: 100
+        description: "子区名称"
+      source_message_id:
+        type: integer
+        format: int64
+        description: "从某条消息创建时的源消息 ID"
+      source_message_payload:
+        type: object
+        description: "源消息原始 payload，会拷贝到子区。单独传 source_message_id 即可，传此字段时必须同时传 source_message_id。大小 <= 64KB"
+
+  threadResp:
+    type: object
+    properties:
+      short_id:
+        type: string
+        description: "子区 shortID"
+      group_no:
+        type: string
+      group_name:
+        type: string
+      channel_id:
+        type: string
+        description: "拼接后的频道 ID：{group_no}____{short_id}"
+      channel_type:
+        type: integer
+        description: "频道类型，固定为 5 (ChannelTypeCommunityTopic)"
+      name:
+        type: string
+      creator_uid:
+        type: string
+      source_message_id:
+        type: integer
+        format: int64
+      status:
+        type: integer
+        description: "状态：1=活跃，2=已归档，3=已删除"
+      member_count:
+        type: integer
+      message_count:
+        type: integer
+        format: int64
+      last_message_content:
+        type: string
+      last_message_sender_name:
+        type: string
+      last_message_at:
+        type: string
+      has_thread_md:
+        type: boolean
+      thread_md_version:
+        type: integer
+        format: int64
+      thread_md_updated_at:
+        type: string
+      created_at:
+        type: string
+      updated_at:
+        type: string
+
+  memberResp:
+    type: object
+    properties:
+      uid:
+        type: string
+      name:
+        type: string
+      role:
+        type: integer
+        description: "0=普通成员, 1=创建者"
+      created_at:
+        type: string
+
+  threadMdResp:
+    type: object
+    properties:
+      content:
+        type: string
+      version:
+        type: integer
+        format: int64
+      updated_at:
+        type: string
+      updated_by:
+        type: string
+
+  okResp:
+    type: object
+    properties:
+      status:
+        type: integer
+        description: "200"
+
+  errorResp:
+    type: object
+    properties:
+      status:
+        type: integer
+      msg:
+        type: string

@@ -90,15 +90,31 @@ func (d *DB) QueryByGroupNoAndShortID(groupNo, shortID string) (*Model, error) {
 	return model, err
 }
 
-// QueryByGroupNo 查询群下的子区（默认限制 100 条）
-func (d *DB) QueryByGroupNo(groupNo string) ([]*Model, error) {
+// QueryByGroupNo 分页查询群下的活跃子区
+func (d *DB) QueryByGroupNo(groupNo string, offset, limit int64) ([]*Model, error) {
+	if limit <= 0 {
+		return []*Model{}, nil
+	}
+	if offset < 0 {
+		offset = 0
+	}
 	var models []*Model
 	_, err := d.session.Select("*").From("thread").
 		Where("group_no=? AND status=?", groupNo, ThreadStatusActive).
-		OrderDir("created_at", false).
-		Limit(100).
+		OrderBy("created_at DESC, id DESC").
+		Offset(uint64(offset)).
+		Limit(uint64(limit)).
 		Load(&models)
 	return models, err
+}
+
+// CountByGroupNo 统计群下活跃子区总数
+func (d *DB) CountByGroupNo(groupNo string) (int64, error) {
+	var count int64
+	err := d.session.Select("count(*)").From("thread").
+		Where("group_no=? AND status=?", groupNo, ThreadStatusActive).
+		LoadOne(&count)
+	return count, err
 }
 
 // ThreadMetaRow 子区元数据（用于会话列表批量查询）
@@ -156,16 +172,6 @@ func (d *DB) QuerySourceMessageIDsByShortIDs(shortIDs []string) (map[string]*int
 	return result, nil
 }
 
-// QueryByGroupNoWithStatus 查询群下指定状态的子区（默认限制 100 条）
-func (d *DB) QueryByGroupNoWithStatus(groupNo string, status int) ([]*Model, error) {
-	var models []*Model
-	_, err := d.session.Select("*").From("thread").
-		Where("group_no=? AND status=?", groupNo, status).
-		OrderDir("created_at", false).
-		Limit(100).
-		Load(&models)
-	return models, err
-}
 
 // UpdateStatus 更新子区状态
 func (d *DB) UpdateStatus(shortID string, status int, version int64) error {

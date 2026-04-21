@@ -138,6 +138,12 @@ func TestCreateThread_EmptyName(t *testing.T) {
 
 // ==================== 列出子区测试 ====================
 
+// threadListResp 分页列表响应
+type threadListResp struct {
+	Count int64         `json:"count"`
+	List  []*ThreadResp `json:"list"`
+}
+
 func TestListThreads(t *testing.T) {
 	s, ctx := setupTestData(t)
 	groupNo := createTestGroup(t, ctx)
@@ -160,8 +166,116 @@ func TestListThreads(t *testing.T) {
 	s.GetRoute().ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusOK, w.Code)
+
+	var resp threadListResp
+	util.ReadJsonByByte(w.Body.Bytes(), &resp)
+	assert.Equal(t, int64(2), resp.Count)
+	assert.Len(t, resp.List, 2)
 	assert.Contains(t, w.Body.String(), `"话题A"`)
 	assert.Contains(t, w.Body.String(), `"话题B"`)
+}
+
+// TestListThreads_Pagination 验证分页参数 page_index / page_size 正确工作
+func TestListThreads_Pagination(t *testing.T) {
+	s, ctx := setupTestData(t)
+	groupNo := createTestGroup(t, ctx)
+
+	// 创建 25 个子区，数量大于默认 page_size (15)
+	const total = 25
+	for i := 0; i < total; i++ {
+		createThreadViaAPI(t, s, groupNo, fmt.Sprintf("话题%02d", i))
+	}
+
+	// 场景 1：默认分页（不传参），page_size 默认 15
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/groups/"+groupNo+"/threads", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	var page1 threadListResp
+	util.ReadJsonByByte(w.Body.Bytes(), &page1)
+	assert.Equal(t, int64(total), page1.Count, "count 应为全部子区数")
+	assert.Len(t, page1.List, 15, "默认 page_size 应为 15")
+
+	// 场景 2：page_size=10, page_index=1
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest("GET", "/v1/groups/"+groupNo+"/threads?page_index=1&page_size=10", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	var p1 threadListResp
+	util.ReadJsonByByte(w.Body.Bytes(), &p1)
+	assert.Equal(t, int64(total), p1.Count)
+	assert.Len(t, p1.List, 10)
+
+	// 场景 3：page_index=2，返回第二页
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest("GET", "/v1/groups/"+groupNo+"/threads?page_index=2&page_size=10", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	var p2 threadListResp
+	util.ReadJsonByByte(w.Body.Bytes(), &p2)
+	assert.Len(t, p2.List, 10)
+	// 与第一页不应有重叠
+	seen := map[string]bool{}
+	for _, it := range p1.List {
+		seen[it.ShortID] = true
+	}
+	for _, it := range p2.List {
+		assert.False(t, seen[it.ShortID], "第二页与第一页不应重复")
+	}
+
+	// 场景 4：page_index=3，仅剩 5 条
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest("GET", "/v1/groups/"+groupNo+"/threads?page_index=3&page_size=10", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	var p3 threadListResp
+	util.ReadJsonByByte(w.Body.Bytes(), &p3)
+	assert.Len(t, p3.List, 5)
+
+	// 场景 5：page_size 超上限（>100）夹回默认值
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest("GET", "/v1/groups/"+groupNo+"/threads?page_size=9999", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	var pOver threadListResp
+	util.ReadJsonByByte(w.Body.Bytes(), &pOver)
+	assert.Len(t, pOver.List, 15, "page_size>100 应被夹回默认值 15")
+}
+
+// TestListThreads_DBPagination 直接在 DB 层验证 offset/limit 参数
+func TestListThreads_DBPagination(t *testing.T) {
+	_, ctx := setupTestData(t)
+	groupNo := createTestGroup(t, ctx)
+
+	db := NewDB(ctx)
+	for i := 0; i < 5; i++ {
+		m := &Model{
+			ShortID: fmt.Sprintf("148910429168%04d", 1000+i),
+			GroupNo: groupNo,
+			Name:    fmt.Sprintf("t%d", i),
+			Status:  ThreadStatusActive,
+			Version: 1,
+		}
+		err := db.Insert(m)
+		assert.NoError(t, err)
+	}
+
+	// 取前 2 条
+	list, err := db.QueryByGroupNo(groupNo, 0, 2)
+	assert.NoError(t, err)
+	assert.Len(t, list, 2)
+
+	// 跳过 2 条，再取 2 条
+	list2, err := db.QueryByGroupNo(groupNo, 2, 2)
+	assert.NoError(t, err)
+	assert.Len(t, list2, 2)
+	assert.NotEqual(t, list[0].ShortID, list2[0].ShortID)
+
+	// 总数
+	count, err := db.CountByGroupNo(groupNo)
+	assert.NoError(t, err)
+	assert.Equal(t, int64(5), count)
 }
 
 // ==================== 获取子区详情测试 ====================
@@ -671,11 +785,11 @@ func TestListThreads_WithStats(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, w.Code)
 
-	var threads []ThreadResp
-	util.ReadJsonByByte(w.Body.Bytes(), &threads)
-	assert.Len(t, threads, 1)
+	var resp threadListResp
+	util.ReadJsonByByte(w.Body.Bytes(), &resp)
+	assert.Len(t, resp.List, 1)
 
-	thread := threads[0]
+	thread := resp.List[0]
 	assert.Equal(t, int64(1), thread.MessageCount)
 	assert.Equal(t, "你好世界", thread.LastMessageContent)
 	assert.NotEmpty(t, thread.LastMessageSenderName)
@@ -786,8 +900,9 @@ func TestGetThreads_MemberCountBatch(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, w.Code)
 
-	var threads []ThreadResp
-	util.ReadJsonByByte(w.Body.Bytes(), &threads)
+	var resp threadListResp
+	util.ReadJsonByByte(w.Body.Bytes(), &resp)
+	threads := resp.List
 
 	assert.Len(t, threads, 2)
 

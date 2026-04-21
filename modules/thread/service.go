@@ -36,8 +36,8 @@ type IService interface {
 	CreateThread(req *CreateThreadReq) (*ThreadResp, error)
 	// UpdateName 修改子区名称
 	UpdateName(groupNo, shortID, operatorUID, name string) error
-	// GetThreads 获取群下的所有子区
-	GetThreads(groupNo string) ([]*ThreadResp, error)
+	// GetThreads 分页获取群下的子区，同时返回总数
+	GetThreads(groupNo string, pageIndex, pageSize int64) ([]*ThreadResp, int64, error)
 	// GetThread 获取子区详情
 	GetThread(groupNo, shortID string) (*ThreadResp, error)
 	// ArchiveThread 归档子区
@@ -358,15 +358,34 @@ func (s *Service) UpdateName(groupNo, shortID, operatorUID, name string) error {
 	return nil
 }
 
-// GetThreads 获取群下的所有子区
-func (s *Service) GetThreads(groupNo string) ([]*ThreadResp, error) {
-	threads, err := s.db.QueryByGroupNo(groupNo)
+// GetThreads 分页获取群下的子区，同时返回总数
+func (s *Service) GetThreads(groupNo string, pageIndex, pageSize int64) ([]*ThreadResp, int64, error) {
+	if pageIndex < 1 {
+		pageIndex = 1
+	}
+	if pageSize <= 0 {
+		pageSize = DefaultThreadPageSize
+	}
+	if pageSize > MaxThreadPageSize {
+		pageSize = DefaultThreadPageSize
+	}
+
+	total, err := s.db.CountByGroupNo(groupNo)
 	if err != nil {
-		return nil, fmt.Errorf("query threads by group: %w", err)
+		return nil, 0, fmt.Errorf("count threads by group: %w", err)
+	}
+	if total == 0 {
+		return []*ThreadResp{}, 0, nil
+	}
+
+	offset := (pageIndex - 1) * pageSize
+	threads, err := s.db.QueryByGroupNo(groupNo, offset, pageSize)
+	if err != nil {
+		return nil, 0, fmt.Errorf("query threads by group: %w", err)
 	}
 
 	if len(threads) == 0 {
-		return []*ThreadResp{}, nil
+		return []*ThreadResp{}, total, nil
 	}
 
 	// 批量查询成员数量
@@ -427,7 +446,7 @@ func (s *Service) GetThreads(groupNo string) ([]*ThreadResp, error) {
 		}
 		results = append(results, resp)
 	}
-	return results, nil
+	return results, total, nil
 }
 
 // GetThread 获取子区详情
