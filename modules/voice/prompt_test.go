@@ -27,6 +27,7 @@ func TestBuildSystemMessage_ContainsAllRules(t *testing.T) {
 	assert.Contains(t, msg, "编辑指令识别")
 	assert.Contains(t, msg, "追加新内容")
 	assert.Contains(t, msg, "词汇参考表使用规则")
+	assert.Contains(t, msg, "@提及识别")
 	assert.Contains(t, msg, "输出格式")
 }
 
@@ -35,6 +36,59 @@ func TestBuildSystemMessage_ContainsExamples(t *testing.T) {
 	assert.Contains(t, msg, "大背头")
 	assert.Contains(t, msg, "托马斯")
 	assert.Contains(t, msg, "嗯，好的，我知道了")
+}
+
+func TestBuildSystemMessage_ContainsMentionRule(t *testing.T) {
+	msg := buildSystemMessage()
+	assert.Contains(t, msg, "@提及识别")
+	assert.Contains(t, msg, "艾特")
+	assert.Contains(t, msg, "@张三")
+	assert.Contains(t, msg, "@Bob")
+}
+
+func TestBuildSystemMessage_MentionV2Scenarios(t *testing.T) {
+	msg := buildSystemMessage()
+
+	// Positive scenarios present in prompt
+	assert.Contains(t, msg, "让陈皮皮帮忙处理一下")   // intent verb "让"
+	assert.Contains(t, msg, "Boris，明天天气怎么样")  // direct address
+	assert.Contains(t, msg, "跟Bob说明天开会改时间")   // preposition "跟"
+	assert.Contains(t, msg, "这个方案怎么样，Boris")  // trailing address
+
+	// Negative scenarios present in prompt
+	assert.Contains(t, msg, "Boris的代码写得不错")    // possessive, no @
+	assert.Contains(t, msg, "我昨天和张三聊了")      // past event, no @
+	assert.Contains(t, msg, "不用找Boris了")        // negation, no @
+
+	// V2 structural elements
+	assert.Contains(t, msg, "识别为@的场景")
+	assert.Contains(t, msg, "不识别为@的场景")
+	assert.Contains(t, msg, "显式意图词")
+	assert.Contains(t, msg, "直接呼名对话")
+	assert.Contains(t, msg, "介词沟通")
+	assert.Contains(t, msg, "句尾呼名")
+	assert.Contains(t, msg, "叙述/引用")
+	assert.Contains(t, msg, "否定取消")
+	assert.Contains(t, msg, "过去事件")
+}
+
+func TestBuildSystemMessage_MentionRuleOrder(t *testing.T) {
+	msg := buildSystemMessage()
+	vocabIdx := strings.Index(msg, "词汇参考表使用规则")
+	mentionIdx := strings.Index(msg, "@提及识别")
+	outputIdx := strings.Index(msg, "输出格式")
+	assert.True(t, vocabIdx < mentionIdx, "@提及识别 should be after 词汇参考表使用规则")
+	assert.True(t, mentionIdx < outputIdx, "@提及识别 should be before 输出格式")
+}
+
+func TestBuildUserMessage_WithMemberContext_MentionRuleAvailable(t *testing.T) {
+	merged := BuildVocabularyReference("", "张三\n李四\nBob", "")
+	userMsg := buildUserMessage("edit", "", merged)
+	sysMsg := buildSystemMessage()
+
+	assert.Contains(t, sysMsg, "@提及识别")
+	assert.Contains(t, userMsg, "<member_vocabulary>")
+	assert.Contains(t, userMsg, "张三")
 }
 
 // --- buildUserMessage: default/transcribe mode ---
