@@ -26,3 +26,9 @@ const (
 
 // 源消息 payload 最大大小 (64KB)
 const maxSourcePayloadBytes = 64 * 1024
+
+// 子区列表分页默认值
+const (
+	DefaultThreadPageSize int64 = 15
+	MaxThreadPageSize     int64 = 100
+)

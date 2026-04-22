@@ -233,13 +233,17 @@ func (t *Thread) listThreads(c *wkhttp.Context) {
 		return
 	}
 
-	threads, err := t.service.GetThreads(groupNo)
+	pageIndex, pageSize := c.GetPage()
+	threads, total, err := t.service.GetThreads(groupNo, pageIndex, pageSize)
 	if err != nil {
 		t.Error("获取子区列表失败", zap.Error(err), zap.String("groupNo", groupNo))
 		c.ResponseError(err)
 		return
 	}
-	c.Response(threads)
+	c.Response(map[string]interface{}{
+		"count": total,
+		"list":  threads,
+	})
 }
 
 // getThread 获取子区详情
