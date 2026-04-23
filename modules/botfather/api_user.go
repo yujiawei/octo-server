@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
@@ -119,31 +118,13 @@ func (bf *BotFather) createUserBot(c *wkhttp.Context) {
 	}
 
 	// username 已废弃：接受但忽略，始终自动生成 Bot ID（含碰撞重试）
-	const maxRetries = 3
-	var robotID, username string
-	var lastErr error
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		robotID = generateBotID()
-		username = robotID
-		if attempt > 0 {
-			time.Sleep(time.Millisecond)
-		}
-		lastErr = bf.cmdHandler.tryCreateBotCore(uid, name, username, botToken, robotID)
-		if lastErr == nil {
-			break
-		}
-		if strings.Contains(lastErr.Error(), "Duplicate") {
-			bf.Warn("createUserBot: robot_id collision, retrying",
-				zap.String("robotID", robotID), zap.Int("attempt", attempt+1))
-			continue
-		}
-		break
-	}
-	if lastErr != nil {
-		bf.Error("创建Bot失败", zap.Error(lastErr))
+	robotID, createErr := bf.cmdHandler.createBotCoreWithRetry(uid, name, botToken)
+	if createErr != nil {
+		bf.Error("创建Bot失败", zap.Error(createErr))
 		c.ResponseError(errors.New("创建失败"))
 		return
 	}
+	username := robotID
 
 	// description 写入（tryCreateBotCore 不处理 description）
 	if description != "" {

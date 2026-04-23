@@ -855,39 +855,45 @@ func (h *commandHandler) disconnectBot(fromUID string, bot *robotModel) {
 
 // ========== 辅助方法 ==========
 
-func (h *commandHandler) createBot(creatorUID, fromUID, name, username, botToken string) (retErr error) {
-	autoGenerate := username == ""
-	robotID := username
-
+// createBotCoreWithRetry 生成 Bot ID 并创建 App + robot + user，碰撞时自动重试。
+// 返回 (robotID, error)。
+func (h *commandHandler) createBotCoreWithRetry(creatorUID, name, botToken string) (string, error) {
 	const maxRetries = 3
+	var robotID string
 	var lastErr error
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		if autoGenerate {
-			robotID = generateBotID()
-			username = robotID
-			if attempt > 0 {
-				time.Sleep(time.Millisecond)
-			}
+		robotID = generateBotID()
+		if attempt > 0 {
+			time.Sleep(time.Millisecond)
 		}
-
-		lastErr = h.tryCreateBotCore(creatorUID, name, username, botToken, robotID)
+		lastErr = h.tryCreateBotCore(creatorUID, name, robotID, botToken, robotID)
 		if lastErr == nil {
-			break
+			return robotID, nil
 		}
-		// 只有自动生成 ID 且是 robot_id 唯一索引碰撞才重试
-		if autoGenerate && strings.Contains(lastErr.Error(), "Duplicate") {
-			h.Warn("createBot: robot_id collision, retrying",
+		if strings.Contains(lastErr.Error(), "Duplicate") {
+			h.Warn("createBotCoreWithRetry: robot_id collision, retrying",
 				zap.String("robotID", robotID), zap.Int("attempt", attempt+1))
 			continue
 		}
-		return lastErr
+		return "", lastErr
 	}
-	if lastErr != nil {
-		return lastErr
+	return "", lastErr
+}
+
+func (h *commandHandler) createBot(creatorUID, fromUID, name, username, botToken string) (retErr error) {
+	var robotID string
+	var err error
+	if username == "" {
+		robotID, err = h.createBotCoreWithRetry(creatorUID, name, botToken)
+	} else {
+		err = h.tryCreateBotCore(creatorUID, name, username, botToken, username)
+		robotID = username
+	}
+	if err != nil {
+		return err
 	}
 
 	// 后续步骤：加入 Space、好友关系等
-	var err error
 	targetSpaceID := h.resolveSpaceID(fromUID)
 	if targetSpaceID == "" {
 		// 无 Space 信息（legacy），回退到创建者的第一个 Space
@@ -996,9 +1002,11 @@ func (h *commandHandler) sendCreatedPrompt(toUID string, name string, bot *robot
 	h.reply(toUID, msg)
 }
 
-// generateBotID 生成全局唯一的 Bot 标识符，复用用户 short_no（Octo号）的 Base62 生成逻辑
+// generateBotID 生成全局唯一的 Bot 标识符
+// 时间戳 Base62 + 4字节随机 hex，即使并发同纳秒也不会碰撞
 func generateBotID() string {
-	return util.Ten2Hex(time.Now().UnixNano()) + BotUsernameSuffix
+	suffix, _ := randomHex(4)
+	return util.Ten2Hex(time.Now().UnixNano()) + suffix + BotUsernameSuffix
 }
 
 func (h *commandHandler) getBotDisplayName(robotID string) string {
