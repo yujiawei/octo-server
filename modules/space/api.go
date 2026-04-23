@@ -28,7 +28,8 @@ import (
 type Space struct {
 	ctx *config.Context
 	log.Log
-	db *DB
+	db  *DB
+	mdb *managerDB // 用户侧需要复用管理端按 space_id 作用域的邀请码写操作时使用
 }
 
 // New 创建Space实例
@@ -37,6 +38,7 @@ func New(ctx *config.Context) *Space {
 		ctx: ctx,
 		Log: log.NewTLog("Space"),
 		db:  NewDB(ctx),
+		mdb: newManagerDB(ctx.DB()),
 	}
 }
 
@@ -1060,9 +1062,7 @@ func (s *Space) updateInvite(c *wkhttp.Context) {
 	// 复用管理端的 updateInvitationAdmin：
 	//   - WHERE 无 status=1 限制，可对已禁用邀请码重启用（status=1）
 	//   - 按 space_id + invite_code 双匹配，天然防跨空间越权
-	// 注意：managerDB 的方法同包可直接实例化调用，不需要经过 /v1/manager 路由。
-	mdb := newManagerDB(s.ctx.DB())
-	affected, err := mdb.updateInvitationAdmin(spaceId, code, req.MaxUses, expiresAt, req.Status)
+	affected, err := s.mdb.updateInvitationAdmin(spaceId, code, req.MaxUses, expiresAt, req.Status)
 	if err != nil {
 		c.ResponseError(errors.New("更新邀请码失败"))
 		return
@@ -1101,14 +1101,17 @@ func (s *Space) listInvites(c *wkhttp.Context) {
 
 	filter := parseInviteListFilter(c.Query("status"))
 	pageIndex, pageSize := clampPage(c.GetPage())
+	// 一次快照 time.Now()，保证 list 与 count 看到一致的过期边界，防止
+	// 临近过期时二者产生 off-by-one 差异。
+	now := time.Now()
 
-	list, err := s.db.queryInvitesBySpace(spaceId, filter, uint64(pageSize), uint64(pageIndex))
+	list, err := s.db.queryInvitesBySpace(spaceId, filter, now, uint64(pageSize), uint64(pageIndex))
 	if err != nil {
 		s.Error("查询邀请码列表失败", zap.Error(err), zap.String("spaceId", spaceId))
 		c.ResponseError(errors.New("查询邀请码列表失败"))
 		return
 	}
-	count, err := s.db.countInvitesBySpace(spaceId, filter)
+	count, err := s.db.countInvitesBySpace(spaceId, filter, now)
 	if err != nil {
 		s.Error("查询邀请码总数失败", zap.Error(err), zap.String("spaceId", spaceId))
 		c.ResponseError(errors.New("查询邀请码总数失败"))
@@ -1158,8 +1161,7 @@ func (s *Space) deleteInvite(c *wkhttp.Context) {
 		return
 	}
 
-	mdb := newManagerDB(s.ctx.DB())
-	affected, err := mdb.disableInvitation(spaceId, code)
+	affected, err := s.mdb.disableInvitation(spaceId, code)
 	if err != nil {
 		s.Error("禁用邀请码失败", zap.Error(err), zap.String("code", code))
 		c.ResponseError(errors.New("禁用邀请码失败"))
@@ -1172,18 +1174,18 @@ func (s *Space) deleteInvite(c *wkhttp.Context) {
 	c.ResponseOK()
 }
 
-// parseInviteListFilter 把请求参数 status 映射到 InviteListFilter。
+// parseInviteListFilter 把请求参数 status 映射到 inviteListFilter。
 // 未传或传 "1" 视为 active（Discord 式默认），传 "0" 视为 disabled，传 "all" 视为全部。
-func parseInviteListFilter(raw string) InviteListFilter {
+func parseInviteListFilter(raw string) inviteListFilter {
 	switch raw {
 	case "", "1":
-		return InviteListActive
+		return inviteListActive
 	case "0":
-		return InviteListDisabled
+		return inviteListDisabled
 	case "all":
-		return InviteListAll
+		return inviteListAll
 	default:
-		return InviteListActive
+		return inviteListActive
 	}
 }
 
