@@ -320,6 +320,102 @@ func TestUpdateInvite_WithStatusReEnable(t *testing.T) {
 	assert.Equal(t, 1, inv.Status)
 }
 
+// TestUpdateInvite_StatusPayload_MemberForbidden: role=0 成员即使只传 status 也被权限门拒绝。
+// 与现有 TestUpdateInviteNoPermission（测 max_uses 路径）互补，显式覆盖 status 扩展路径。
+func TestUpdateInvite_StatusPayload_MemberForbidden(t *testing.T) {
+	s, _, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-upd-role0"
+	assert.NoError(t, testSpaceDB.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceId, Name: spaceId, Creator: "other", Status: SpaceStatusNormal,
+	}))
+	assert.NoError(t, testSpaceDB.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId, UID: testutil.UID, Role: 0, Status: 1,
+	}))
+	seedInvite(t, spaceId, "role0-status", "other", 1, nil)
+
+	body := `{"status":0}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("PUT", "/v1/space/"+spaceId+"/invite/role0-status", strings.NewReader(body))
+	req.Header.Set("token", testutil.Token)
+	req.Header.Set("Content-Type", "application/json")
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "无权限")
+
+	// 底层未变
+	var status int
+	_, err = testCtx.DB().SelectBySql("SELECT status FROM space_invitation WHERE invite_code=?", "role0-status").Load(&status)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, status)
+}
+
+// TestUpdateInvite_CrossSpaceRejected: 空间 A 的 owner 不能通过指向空间 B 的 URL 改 B 的邀请码，
+// 因为 updateInvitationAdmin 的 WHERE 同时锁 space_id + invite_code。
+func TestUpdateInvite_CrossSpaceRejected(t *testing.T) {
+	s, _, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceA := "sp-cross-a"
+	spaceB := "sp-cross-b"
+	seedSpaceWithMember(t, spaceA, testutil.UID, 2) // 当前用户是 A 的 owner
+	// B 的 owner 是别人，当前用户不是 B 的成员
+	assert.NoError(t, testSpaceDB.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceB, Name: spaceB, Creator: "other-owner", Status: SpaceStatusNormal,
+	}))
+	assert.NoError(t, testSpaceDB.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceB, UID: "other-owner", Role: 2, Status: 1,
+	}))
+	// 邀请码挂在 B 下
+	seedInvite(t, spaceB, "cross-code", "other-owner", 1, nil)
+
+	// 当前用户用 A 的 space_id 去改 B 的邀请码 → 第一步 queryMember 拿不到 A 对 cross-code 的 Member 信息
+	// 不过真正的攻击向量是：传正确的 A space_id 但试图改挂在 B 的 code。
+	// URL /v1/space/spaceA/invite/cross-code → WHERE space_id=A AND invite_code=cross-code → 0 行匹配
+	body := `{"max_uses":999}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("PUT", "/v1/space/"+spaceA+"/invite/cross-code", strings.NewReader(body))
+	req.Header.Set("token", testutil.Token)
+	req.Header.Set("Content-Type", "application/json")
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "邀请码不存在")
+
+	// B 的邀请码未被改动
+	inv, err := testSpaceDB.queryInvitationByCode("cross-code")
+	assert.NoError(t, err)
+	assert.NotNil(t, inv)
+	assert.Equal(t, 10, inv.MaxUses, "seedInvite 默认 max_uses=10，未被跨空间改动")
+}
+
+// TestDeleteInvite_CrossSpaceRejected: 同上，DELETE 也受 space_id 作用域保护。
+func TestDeleteInvite_CrossSpaceRejected(t *testing.T) {
+	s, _, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceA := "sp-cross-del-a"
+	spaceB := "sp-cross-del-b"
+	seedSpaceWithMember(t, spaceA, testutil.UID, 2)
+	assert.NoError(t, testSpaceDB.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceB, Name: spaceB, Creator: "other-owner", Status: SpaceStatusNormal,
+	}))
+	seedInvite(t, spaceB, "cross-del-code", "other-owner", 1, nil)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("DELETE", "/v1/space/"+spaceA+"/invite/cross-del-code", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "邀请码不存在")
+
+	// B 的邀请码仍 status=1
+	inv, err := testSpaceDB.queryInvitationByCode("cross-del-code")
+	assert.NoError(t, err)
+	assert.NotNil(t, inv)
+	assert.Equal(t, 1, inv.Status)
+}
+
 // TestUpdateInvite_InvalidStatus: status 非 0/1 应拒绝。
 func TestUpdateInvite_InvalidStatus(t *testing.T) {
 	s, _, err := setup(t)
