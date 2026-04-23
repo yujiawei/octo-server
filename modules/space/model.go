@@ -164,10 +164,26 @@ type invitePreviewResp struct {
 	Bots        []botResp `json:"bots"`
 }
 
-// updateInviteReq 更新邀请码请求
+// updateInviteReq 更新邀请码请求。Status 为可选字段：
+//   - nil：不改状态
+//   - 0：禁用（等价 DELETE）
+//   - 1：启用（可用于对误禁邀请码恢复）
 type updateInviteReq struct {
 	MaxUses   *int    `json:"max_uses"`
 	ExpiresAt *string `json:"expires_at"`
+	Status    *int    `json:"status"`
+}
+
+// spaceInviteListResp 用户端邀请码列表单条响应
+type spaceInviteListResp struct {
+	InviteCode string `json:"invite_code"`
+	SpaceId    string `json:"space_id"`
+	Creator    string `json:"creator"`
+	MaxUses    int    `json:"max_uses"`
+	UsedCount  int    `json:"used_count"`
+	ExpiresAt  string `json:"expires_at"`
+	Status     int    `json:"status"`
+	CreatedAt  string `json:"created_at"`
 }
 
 // MemberDetailModel 带用户名的成员详情

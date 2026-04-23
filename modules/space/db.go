@@ -330,6 +330,51 @@ func (d *DB) queryInvitationBySpaceAndCode(spaceId string, code string) (*Invita
 	return &m, err
 }
 
+// InviteListFilter 邀请码列表过滤器。
+//
+//	"active"   —— 仅返回业务有效（status=1 且未过期），与 queryInvitationByCode 的视图一致
+//	"disabled" —— 仅返回 status=0 的邀请码（不含"status=1 但已过期"，过期是一种不同的失效）
+//	"all"      —— 不过滤，返回空间下全部邀请码
+type InviteListFilter string
+
+const (
+	InviteListActive   InviteListFilter = "active"
+	InviteListDisabled InviteListFilter = "disabled"
+	InviteListAll      InviteListFilter = "all"
+)
+
+// applyInviteListFilter 把过滤器转成 dbr.Where 片段，复用给 list 和 count。
+func applyInviteListFilter(b *dbr.SelectBuilder, filter InviteListFilter) *dbr.SelectBuilder {
+	switch filter {
+	case InviteListActive:
+		return b.Where("status=1 AND (expires_at IS NULL OR expires_at > ?)", time.Now())
+	case InviteListDisabled:
+		return b.Where("status=0")
+	default:
+		return b
+	}
+}
+
+// queryInvitesBySpace 用户端分页查询空间邀请码。按 created_at 倒序。
+func (d *DB) queryInvitesBySpace(spaceId string, filter InviteListFilter, pageSize, pageIndex uint64) ([]*InvitationModel, error) {
+	b := d.session.Select("*").From("space_invitation").Where("space_id=?", spaceId)
+	b = applyInviteListFilter(b, filter)
+	var list []*InvitationModel
+	_, err := b.OrderDir("created_at", false).
+		Limit(pageSize).Offset((pageIndex - 1) * pageSize).
+		Load(&list)
+	return list, err
+}
+
+// countInvitesBySpace 用户端邀请码计数，过滤器语义与 queryInvitesBySpace 一致。
+func (d *DB) countInvitesBySpace(spaceId string, filter InviteListFilter) (int64, error) {
+	b := d.session.Select("COUNT(*)").From("space_invitation").Where("space_id=?", spaceId)
+	b = applyInviteListFilter(b, filter)
+	var count int64
+	_, err := b.Load(&count)
+	return count, err
+}
+
 // GetUserDefaultSpaceID 获取用户最早加入的 Space（默认 Space）
 func GetUserDefaultSpaceID(ctx *config.Context, uid string) string {
 	var spaceID string

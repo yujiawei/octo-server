@@ -77,6 +77,8 @@ func (s *Space) Route(r *wkhttp.WKHttp) {
 
 		auth.POST("/:space_id/invite", s.createInvite)
 		auth.PUT("/:space_id/invite/:code", s.updateInvite)
+		auth.DELETE("/:space_id/invite/:code", s.deleteInvite)
+		auth.GET("/:space_id/invites", s.listInvites)
 
 		auth.GET("/:space_id/join-applies", s.joinApplies)
 		auth.POST("/:space_id/join-applies/:id/approve", s.approveJoinApply)
@@ -1008,7 +1010,8 @@ func (s *Space) getInvitePreview(c *wkhttp.Context) {
 	})
 }
 
-// updateInvite 更新邀请码设置
+// updateInvite 更新邀请码设置。支持 max_uses / expires_at / status。
+// status 字段允许空间 owner/admin 自助禁用或重启用邀请码，语义与管理端 PUT 一致。
 func (s *Space) updateInvite(c *wkhttp.Context) {
 	loginUID := c.GetLoginUID()
 	spaceId := c.Param("space_id")
@@ -1029,28 +1032,21 @@ func (s *Space) updateInvite(c *wkhttp.Context) {
 		return
 	}
 
-	// 检查邀请码是否存在且属于该 Space
-	invitation, err := s.db.queryInvitationBySpaceAndCode(spaceId, code)
-	if err != nil {
-		c.ResponseError(errors.New("查询邀请码失败"))
-		return
-	}
-	if invitation == nil {
-		c.ResponseError(errors.New("邀请码不存在"))
-		return
-	}
-
 	var req updateInviteReq
 	if err := c.BindJSON(&req); err != nil {
 		c.ResponseError(errors.New("请求参数错误"))
 		return
 	}
-	if req.MaxUses == nil && req.ExpiresAt == nil {
-		c.ResponseError(errors.New("至少需要提供 max_uses 或 expires_at 之一"))
+	if req.MaxUses == nil && req.ExpiresAt == nil && req.Status == nil {
+		c.ResponseError(errors.New("至少需要提供 max_uses / expires_at / status 之一"))
 		return
 	}
 	if req.MaxUses != nil && *req.MaxUses < 0 {
 		c.ResponseError(errors.New("max_uses 不能为负"))
+		return
+	}
+	if req.Status != nil && *req.Status != 0 && *req.Status != 1 {
+		c.ResponseError(errors.New("status 仅支持 0(禁用) 或 1(启用)"))
 		return
 	}
 
@@ -1061,13 +1057,134 @@ func (s *Space) updateInvite(c *wkhttp.Context) {
 		return
 	}
 
-	err = s.db.updateInvitation(code, req.MaxUses, expiresAt)
+	// 复用管理端的 updateInvitationAdmin：
+	//   - WHERE 无 status=1 限制，可对已禁用邀请码重启用（status=1）
+	//   - 按 space_id + invite_code 双匹配，天然防跨空间越权
+	// 注意：managerDB 的方法同包可直接实例化调用，不需要经过 /v1/manager 路由。
+	mdb := newManagerDB(s.ctx.DB())
+	affected, err := mdb.updateInvitationAdmin(spaceId, code, req.MaxUses, expiresAt, req.Status)
 	if err != nil {
 		c.ResponseError(errors.New("更新邀请码失败"))
 		return
 	}
+	if affected == 0 {
+		c.ResponseError(errors.New("邀请码不存在"))
+		return
+	}
 
 	c.ResponseOK()
+}
+
+// listInvites 空间 owner/admin 查看本空间邀请码列表。
+// 查询参数：
+//   - status=1 / status=（默认）: 仅有效（status=1 且未过期）
+//   - status=0: 仅禁用
+//   - status=all: 全部（包含禁用与过期）
+//   - page_index / page_size: 分页，上限 managerMaxPageSize
+func (s *Space) listInvites(c *wkhttp.Context) {
+	loginUID := c.GetLoginUID()
+	spaceId := c.Param("space_id")
+
+	if s.checkSpaceActive(c, spaceId) {
+		return
+	}
+
+	member, err := s.db.queryMember(spaceId, loginUID)
+	if err != nil {
+		c.ResponseError(errors.New("查询成员信息失败"))
+		return
+	}
+	if member == nil || member.Role < 1 {
+		c.ResponseError(errors.New("无权限查看邀请码列表"))
+		return
+	}
+
+	filter := parseInviteListFilter(c.Query("status"))
+	pageIndex, pageSize := clampPage(c.GetPage())
+
+	list, err := s.db.queryInvitesBySpace(spaceId, filter, uint64(pageSize), uint64(pageIndex))
+	if err != nil {
+		s.Error("查询邀请码列表失败", zap.Error(err), zap.String("spaceId", spaceId))
+		c.ResponseError(errors.New("查询邀请码列表失败"))
+		return
+	}
+	count, err := s.db.countInvitesBySpace(spaceId, filter)
+	if err != nil {
+		s.Error("查询邀请码总数失败", zap.Error(err), zap.String("spaceId", spaceId))
+		c.ResponseError(errors.New("查询邀请码总数失败"))
+		return
+	}
+
+	resp := make([]*spaceInviteListResp, 0, len(list))
+	for _, inv := range list {
+		expiresAt := ""
+		if inv.ExpiresAt != nil {
+			expiresAt = time.Time(*inv.ExpiresAt).Format(inviteTimeLayout)
+		}
+		resp = append(resp, &spaceInviteListResp{
+			InviteCode: inv.InviteCode,
+			SpaceId:    inv.SpaceId,
+			Creator:    inv.Creator,
+			MaxUses:    inv.MaxUses,
+			UsedCount:  inv.UsedCount,
+			ExpiresAt:  expiresAt,
+			Status:     inv.Status,
+			CreatedAt:  time.Time(inv.CreatedAt).Format(inviteTimeLayout),
+		})
+	}
+	c.Response(map[string]interface{}{
+		"count": count,
+		"list":  resp,
+	})
+}
+
+// deleteInvite 空间 owner/admin 软禁用本空间邀请码（语义等价 PUT status=0）。
+func (s *Space) deleteInvite(c *wkhttp.Context) {
+	loginUID := c.GetLoginUID()
+	spaceId := c.Param("space_id")
+	code := c.Param("code")
+
+	if s.checkSpaceActive(c, spaceId) {
+		return
+	}
+
+	member, err := s.db.queryMember(spaceId, loginUID)
+	if err != nil {
+		c.ResponseError(errors.New("查询成员信息失败"))
+		return
+	}
+	if member == nil || member.Role < 1 {
+		c.ResponseError(errors.New("无权限禁用邀请码"))
+		return
+	}
+
+	mdb := newManagerDB(s.ctx.DB())
+	affected, err := mdb.disableInvitation(spaceId, code)
+	if err != nil {
+		s.Error("禁用邀请码失败", zap.Error(err), zap.String("code", code))
+		c.ResponseError(errors.New("禁用邀请码失败"))
+		return
+	}
+	if affected == 0 {
+		c.ResponseError(errors.New("邀请码不存在"))
+		return
+	}
+	c.ResponseOK()
+}
+
+// parseInviteListFilter 把请求参数 status 映射到 InviteListFilter。
+// 未传或传 "1" 视为 active（Discord 式默认），传 "0" 视为 disabled，传 "all" 视为全部。
+func parseInviteListFilter(raw string) InviteListFilter {
+	switch raw {
+	case "", "1":
+		return InviteListActive
+	case "0":
+		return InviteListDisabled
+	case "all":
+		return InviteListAll
+	default:
+		return InviteListActive
+	}
 }
 
 // joinApplies 管理员查看待审批的加入申请列表
