@@ -368,3 +368,50 @@ func TestGroupInvitePage_ContainsJoinButton(t *testing.T) {
 	assert.True(t, strings.Contains(body, "/v1/group/invite/authorize"))
 	assert.True(t, strings.Contains(body, "/scanjoin"))
 }
+
+// authorize 必须挂 per-UID 限流（SharedUIDRateLimiter）：每次调用会往 Redis 写
+// TTL=30min 的 auth_code，登录用户可能高频批量调用灌满 Redis。契约测试只断言
+// 中间件已挂载（X-RateLimit-Scope: uid），不验证具体 rps/burst 数值——
+// 那是 pkg/wkhttp/ratelimit_test.go 的职责，此处避开依赖 SharedUIDRateLimiter
+// 的进程级单例 + 环境变量带来的耦合。
+func TestGroupInviteAuthorize_HasUIDRateLimit(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	groupNo := "g-invite-auth-ratelimit"
+	err = f.db.Insert(&Model{
+		GroupNo:       groupNo,
+		Name:          "限流测试群",
+		Creator:       "10001",
+		Status:        1,
+		Invite:        0,
+		AllowExternal: 1,
+	})
+	assert.NoError(t, err)
+
+	code := "test-auth-ratelimit-code"
+	err = ctx.GetRedisConn().SetAndExpire(
+		fmt.Sprintf("%s%s", common.QRCodeCachePrefix, code),
+		util.ToJson(common.NewQRCodeModel(common.QRCodeTypeGroup, map[string]interface{}{
+			"group_no":  groupNo,
+			"generator": "10001",
+		})),
+		time.Hour,
+	)
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/group/invite/authorize?code="+code, nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	// 证明路由组挂上了 UIDRateLimitMiddleware；X-RateLimit-Scope 由
+	// setRateLimitHeaders 在每次放行时写入，属于稳定对外契约。
+	assert.Equal(t, "uid", w.Header().Get("X-RateLimit-Scope"))
+	assert.NotEmpty(t, w.Header().Get("X-RateLimit-Limit"))
+	assert.NotEmpty(t, w.Header().Get("X-RateLimit-Remaining"))
+}

@@ -118,7 +118,12 @@ func (g *Group) Route(r *wkhttp.WKHttp) {
 	}
 	// H5 公开落地页配套的认证接口：把公开 code（二维码 UUID）换成当前登录用户的 auth_code。
 	// 之后前端直接调用 /v1/groups/:group_no/scanjoin?auth_code=xxx 完成入群。
-	authInviteGroup := r.Group("/v1/group", g.ctx.AuthMiddleware(r))
+	//
+	// 挂载 SharedUIDRateLimiter：authorize 每次调用都会往 Redis 写一条 TTL=30min 的 auth_code
+	// 记录。虽然有 AuthMiddleware，但登录用户仍可高频批量调用灌满 Redis。进程级共享的 per-UID
+	// 令牌桶（默认 2 rps, burst 60）把 UID 粒度的配额统一封顶，同时与 /v1/message、/v1/conversation
+	// 等认证路由保持一致的“按登录用户公平”语义，避免 NAT 场景下误伤同办公室合法用户。
+	authInviteGroup := r.Group("/v1/group", g.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(g.ctx))
 	{
 		authInviteGroup.POST("/invite/authorize", g.groupInviteAuthorize)
 	}
