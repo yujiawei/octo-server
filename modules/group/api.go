@@ -127,15 +127,29 @@ func (g *Group) Route(r *wkhttp.WKHttp) {
 	{
 		authInviteGroup.POST("/invite/authorize", g.groupInviteAuthorize)
 	}
-	// 公开邀请落地页（无需认证）严格 per-IP 限流：防枚举 + 暴破。
-	// 与 space 模块一致：10 req/min, burst 5；preview/detail 共享同一 limiter。
+	// 公开邀请落地页（无需认证）per-IP 限流：防枚举 + 暴破。
+	// preview/detail 共享同一 limiter。
+	//
+	// 默认值（YUJ-43 决策，2026-04-25）：60 rps / burst 200 ≈ 3600 req/min，
+	// 实质上不限流。理由：
+	//   - 外部群功能刚上线，真人访问量很小，短期没 DDoS 风险
+	//   - TestBot E2E 真人模拟（10 次刷新同一 URL）之前撞 10 req/min 阻塞测试
+	//   - 测试服务器临时改 env 不便，选择代码默认放开、生产需要时再通过 env 收紧
+	// 后续由 #1179 最终调优策略定夺严格默认值（原 space 模块默认 10 req/min, burst 5）。
+	//
+	// 支持通过环境变量覆盖：
+	//   - DM_API_GROUP_INVITE_RPS   每秒填充速率（float，缺省 60.0）
+	//   - DM_API_GROUP_INVITE_BURST 桶容量（int，缺省 200）
+	// 生产环境如需收紧，在部署时设置 env（如 RPS=0.1667 / BURST=5 恢复到 10 req/min）。
 	rlRedis := redis.NewClient(&redis.Options{
 		Addr:       g.ctx.GetConfig().DB.RedisAddr,
 		Password:   g.ctx.GetConfig().DB.RedisPass,
 		MaxRetries: 1,
 		PoolSize:   10,
 	})
-	groupInviteLimit := appwkhttp.StrictIPRateLimitMiddleware(context.Background(), rlRedis, "group_invite", 10.0/60, 5)
+	inviteRPS := appwkhttp.ParseRPSFromEnv("DM_API_GROUP_INVITE_RPS", 60.0) // 默认 60 rps ≈ 3600 req/min
+	inviteBurst := appwkhttp.ParseBurstFromEnv("DM_API_GROUP_INVITE_BURST", 200)
+	groupInviteLimit := appwkhttp.StrictIPRateLimitMiddleware(context.Background(), rlRedis, "group_invite", inviteRPS, inviteBurst)
 
 	openGroup := r.Group("/v1/group")
 	{
