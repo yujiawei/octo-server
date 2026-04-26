@@ -1864,6 +1864,9 @@ func (g *Group) groupScanJoin(c *wkhttp.Context) {
 		Status:        int(common.GroupMemberStatusNormal),
 		InviteUID:     generator,
 		Vercode:       fmt.Sprintf("%s@%d", util.GenerUUID(), common.GroupMember),
+		// 保留 scaner 的 robot 标记，与其它入群路径保持一致，
+		// 让 DELETE 路径的 QueryExternalMemberCountTx(robot=0) 能正确排除 bot。
+		Robot:         scanerInfo.Robot,
 		IsExternal:    isExternal,
 		SourceSpaceID: sourceSpaceID,
 	}
@@ -1956,9 +1959,13 @@ func (g *Group) groupScanJoin(c *wkhttp.Context) {
 		return
 	}
 
-	// 首个外部成员加入时在同一事务内将群标记为外部群，确保成员/群标记一致提交
+	// 首个外部成员加入时在同一事务内将群标记为外部群，确保成员/群标记一致提交。
+	// is_external_group 语义只反映人类外部成员：bot 扫码入群（即便 is_external=1）
+	// 不应 flip 群成外部群，保持与 DELETE 路径 QueryExternalMemberCountTx(robot=0)
+	// 以及批量 ADD 路径 (service.go) 的语义对称。
+	// 详见 YUJ-48 / Mininglamp-OSS/octo-server#1184。
 	markedExternal := false
-	if isExternal == 1 && group.IsExternalGroup == 0 {
+	if isExternal == 1 && scanerInfo.Robot == 0 && group.IsExternalGroup == 0 {
 		if updateErr := g.db.UpdateIsExternalGroupTx(groupNo, 1, tx); updateErr != nil {
 			tx.Rollback()
 			g.Error("更新 is_external_group 失败", zap.Error(updateErr), zap.String("group_no", groupNo))

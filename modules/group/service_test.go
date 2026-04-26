@@ -373,3 +373,73 @@ func TestAddGroupMembers_DefaultAllowsExternal(t *testing.T) {
 	assert.NotNil(t, m2)
 	assert.Equal(t, 1, m2.IsExternal)
 }
+
+// TestAddMembers_BotOnly_DoesNotFlipIsExternalGroup 对称验证 ADD 路径：
+// 当只有一个跨-Space bot（is_external=1, robot=1）加入空群时，
+// is_external_group 不应被 flip 为 1。与 DELETE 路径（PR #1185 首轮）保持语义对称：
+// is_external_group 只反映人类外部成员的存在。
+// 追加回归：再邀请一个人类外部成员，is_external_group 应 flip 为 1，证明修复未误杀正路径。
+// 详见 YUJ-48 / Mininglamp-OSS/octo-server#1184。
+func TestAddMembers_BotOnly_DoesNotFlipIsExternalGroup(t *testing.T) {
+	svc, userDB, ctx := setupServiceTestWithCtx(t)
+	insertTestUsers(t, userDB, testutil.UID, "m1")
+	// bot-x：机器人用户，不在任何 space 里 → 对群来说是跨 Space 外部
+	err := userDB.Insert(&user.Model{
+		UID:     "bot-x",
+		Name:    "bot_x",
+		ShortNo: "sn_botx",
+		Robot:   1,
+	})
+	assert.NoError(t, err)
+
+	spaceA := "space-botonly-a"
+	seedSpaceWithMembers(t, ctx, spaceA, testutil.UID, "m1")
+
+	createResp, err := svc.CreateGroup(&CreateGroupServiceReq{
+		Creator: testutil.UID,
+		Members: []string{"m1"},
+		Name:    "bot-only-flip-check",
+		SpaceID: spaceA,
+	})
+	assert.NoError(t, err)
+
+	s := svc.(*Service)
+
+	// Step 1: 群主邀请 bot-x 入群（allow_external 默认=1）
+	addResp, err := svc.AddGroupMembers(&AddGroupMembersServiceReq{
+		GroupNo:      createResp.GroupNo,
+		Members:      []string{"bot-x"},
+		OperatorUID:  testutil.UID,
+		OperatorName: "creator",
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, 1, addResp.Added)
+
+	// bot 确实以 external + robot=1 落库
+	botMember, err := s.db.QueryMemberWithUID("bot-x", createResp.GroupNo)
+	assert.NoError(t, err)
+	assert.NotNil(t, botMember)
+	assert.Equal(t, 1, botMember.IsExternal)
+	assert.Equal(t, 1, botMember.Robot)
+
+	// 关键断言：bot-only 场景下群仍是普通群
+	gAfterBot, err := s.db.QueryWithGroupNo(createResp.GroupNo)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, gAfterBot.IsExternalGroup,
+		"cross-space bot must NOT flip is_external_group (must be symmetric with DELETE path)")
+
+	// Step 2: 再邀请一个人类外部 m2（不在 spaceA）→ 此时应当 flip 到 1
+	insertTestUsers(t, userDB, "human-ext-m2")
+	_, err = svc.AddGroupMembers(&AddGroupMembersServiceReq{
+		GroupNo:      createResp.GroupNo,
+		Members:      []string{"human-ext-m2"},
+		OperatorUID:  testutil.UID,
+		OperatorName: "creator",
+	})
+	assert.NoError(t, err)
+
+	gAfterHuman, err := s.db.QueryWithGroupNo(createResp.GroupNo)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, gAfterHuman.IsExternalGroup,
+		"human external member must flip is_external_group (正路径未被误杀)")
+}

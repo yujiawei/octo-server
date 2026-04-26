@@ -1213,7 +1213,11 @@ func (s *Service) AddGroupMembers(req *AddGroupMembersServiceReq) (*AddGroupMemb
 		}
 		addedUIDs = append(addedUIDs, memberUser.UID)
 		addedVos = append(addedVos, &config.UserBaseVo{UID: memberUser.UID, Name: memberUser.Name})
-		if isExt == 1 {
+		// is_external_group 语义只反映人类外部成员：bot 即便 is_external=1
+		// （从其它 Space 带来的 source_space_id 仅用于能力路由），也不应
+		// 把群 flip 成外部群。与 DELETE 路径 QueryExternalMemberCountTx
+		// 的 robot=0 过滤保持对称。详见 YUJ-48 / Mininglamp-OSS/octo-server#1184。
+		if isExt == 1 && memberUser.Robot == 0 {
 			hasNewExternal = true
 		}
 	}

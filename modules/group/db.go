@@ -680,11 +680,14 @@ func (d *DB) QueryBotMemberUIDs(groupNo string) ([]string, error) {
 	return uids, err
 }
 
-// QueryExternalMemberCountTx 事务内查询群内外部成员数量（FOR UPDATE 行锁防并发）
+// QueryExternalMemberCountTx 事务内查询群内「人类」外部成员数量（FOR UPDATE 行锁防并发）。
+// 排除 robot=1 的 bot 成员：is_external_group 的语义只反映人类外部成员是否存在，
+// bot 的 is_external + source_space_id 字段仅用于能力路由，不影响群的外部属性。
+// 详见 YUJ-48 / Mininglamp-OSS/octo-server#1184。
 func (d *DB) QueryExternalMemberCountTx(groupNo string, tx *dbr.Tx) (int64, error) {
 	var count int64
 	_, err := tx.SelectBySql(
-		"SELECT COUNT(*) FROM group_member WHERE group_no=? AND is_external=1 AND is_deleted=0 FOR UPDATE",
+		"SELECT COUNT(*) FROM group_member WHERE group_no=? AND is_external=1 AND is_deleted=0 AND robot=0 FOR UPDATE",
 		groupNo,
 	).Load(&count)
 	return count, err
