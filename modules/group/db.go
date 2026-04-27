@@ -756,15 +756,19 @@ func (d *DB) UpdateIsExternalGroup(groupNo string, value int) error {
 type memberExternalMarkerRow struct {
 	UID             string `db:"uid"`
 	IsExternal      int    `db:"is_external"`
+	SourceSpaceID   string `db:"source_space_id"`
 	SourceSpaceName string `db:"source_space_name"`
 }
 
-// queryMemberExternalMarkers 一次性拉取群内所有未删除成员的 is_external/source_space_name，
+// queryMemberExternalMarkers 一次性拉取群内所有未删除成员的 is_external/source_space_id/source_space_name，
 // 供消息同步热路径 O(1) lookup。使用 LEFT JOIN space 以便即使来源 Space 不存在也不漏成员。
+// source_space_id 透传给上层，用于计算 home_space_id（YUJ-63 / #1208）。
 func (d *DB) queryMemberExternalMarkers(groupNo string) ([]*memberExternalMarkerRow, error) {
 	var rows []*memberExternalMarkerRow
 	_, err := d.session.SelectBySql(
-		"SELECT gm.uid AS uid, gm.is_external AS is_external, IFNULL(s.name,'') AS source_space_name "+
+		"SELECT gm.uid AS uid, gm.is_external AS is_external, "+
+			"IFNULL(gm.source_space_id,'') AS source_space_id, "+
+			"IFNULL(s.name,'') AS source_space_name "+
 			"FROM group_member gm LEFT JOIN space s ON s.space_id = gm.source_space_id "+
 			"WHERE gm.group_no = ? AND gm.is_deleted = 0",
 		groupNo,

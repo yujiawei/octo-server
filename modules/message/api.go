@@ -871,8 +871,9 @@ func (m *Message) syncChannelMessage(c *wkhttp.Context) {
 	// 群消息中的 ThreadCreated 消息：用实时数据覆盖 payload 中的快照字段
 	if req.ChannelType == common.ChannelTypeGroup.Uint8() {
 		m.enrichThreadCreatedMessages(syncResp.Messages)
-		// 外部来源标识透传：填充顶层 from_is_external / from_source_space_name，
-		// 以及 mergeforward content.users 每个元素的 is_external / source_space_name。
+		// 外部来源标识透传：填充顶层 from_is_external / from_source_space_name /
+		// from_home_space_id / from_home_space_name (YUJ-63 / #1208)，以及 mergeforward
+		// content.users 每个元素的 is_external / source_space_name / home_space_*。
 		// 详见 Mininglamp-OSS/octo-server#1188。
 		m.enrichExternalMarkers(req.ChannelID, syncResp.Messages)
 	}
@@ -2408,6 +2409,12 @@ type MsgSyncResp struct {
 	// 详见 Mininglamp-OSS/octo-server#1188。
 	FromIsExternal      int    `json:"from_is_external"`                // 发送者是否为外部成员 0.否 1.是
 	FromSourceSpaceName string `json:"from_source_space_name,omitempty"` // 发送者来源 Space 名称（为空则前端不渲染）
+	// 归属 Space（YUJ-63 / #1208）：外部/内部语义由前端"相对当前查看 Space"判断。
+	// 外部成员：from_home_space_id = 发送者来源 space_id；
+	// 内部成员：from_home_space_id = 群自身 space_id。
+	// 后端 from_is_external / from_source_space_name 原语义保留。
+	FromHomeSpaceID   string `json:"from_home_space_id,omitempty"`   // 发送者归属 Space ID
+	FromHomeSpaceName string `json:"from_home_space_name,omitempty"` // 发送者归属 Space 名称
 	ToUID         string                 `json:"to_uid,omitempty"`          // 接受者uid
 	ChannelID     string                 `json:"channel_id"`                // 频道ID
 	ChannelType   uint8                  `json:"channel_type"`              // 频道类型
@@ -2726,8 +2733,8 @@ func (m *Message) enrichThreadCreatedMessages(messages []*MsgSyncResp) {
 }
 
 // applyExternalMarkerToUserItem 给 mergeforward content.users 中的单个 element 写入
-// is_external / source_space_name 字段。elem 为 map[string]interface{} 才会生效；
-// 其他类型（含旧数据缺 uid 的元素）直接跳过，保证向后兼容。
+// is_external / source_space_name / home_space_id / home_space_name 字段。
+// elem 为 map[string]interface{} 才会生效；其他类型（含旧数据缺 uid 的元素）直接跳过，保证向后兼容。
 func applyExternalMarkerToUserItem(elem interface{}, markers map[string]group.MemberExternalMarker) {
 	userMap, ok := elem.(map[string]interface{})
 	if !ok {
@@ -2740,6 +2747,8 @@ func applyExternalMarkerToUserItem(elem interface{}, markers map[string]group.Me
 		if _, exists := userMap["source_space_name"]; !exists {
 			userMap["source_space_name"] = ""
 		}
+		userMap["home_space_id"] = ""
+		userMap["home_space_name"] = ""
 		return
 	}
 	marker, ok := markers[uid]
@@ -2747,15 +2756,21 @@ func applyExternalMarkerToUserItem(elem interface{}, markers map[string]group.Me
 		// 出现在 mergeforward 但已不在当前群的用户：标记为非外部，空 source_space_name。
 		userMap["is_external"] = 0
 		userMap["source_space_name"] = ""
+		userMap["home_space_id"] = ""
+		userMap["home_space_name"] = ""
 		return
 	}
 	userMap["is_external"] = marker.IsExternal
 	userMap["source_space_name"] = marker.SourceSpaceName
+	userMap["home_space_id"] = marker.HomeSpaceID
+	userMap["home_space_name"] = marker.HomeSpaceName
 }
 
 // enrichExternalMarkers 为群聊 /message/channel/sync 返回的每条消息注入外部来源标识。
 //  1. 顶层 from_is_external / from_source_space_name（发送者视角）
-//  2. mergeforward (content type 11) payload.users 每个 element 的 is_external / source_space_name
+//  2. from_home_space_id / from_home_space_name（YUJ-63 / #1208，前端相对当前 Space 渲染）
+//  3. mergeforward (content type 11) payload.users 每个 element 的 is_external /
+//     source_space_name / home_space_id / home_space_name
 //
 // 只做 O(N) 遍历 + O(1) 查找，整体至多一条 SQL，避免 N+1 JOIN。详见 Mininglamp-OSS/octo-server#1188。
 func (m *Message) enrichExternalMarkers(groupNo string, messages []*MsgSyncResp) {
@@ -2773,6 +2788,8 @@ func (m *Message) enrichExternalMarkers(groupNo string, messages []*MsgSyncResp)
 // applyExternalMarkers 把批量查询好的 uid -> MemberExternalMarker 应用到消息数组上。
 // 纯函数，不做 IO，便于单测。内部成员（marker.IsExternal == 0）不写 source_space_name，
 // 避免无意义字段污染 payload。非群成员的 FromUID / users 元素一律写入安全默认值 0 / ""。
+// 同时同步 from_home_space_id / from_home_space_name（YUJ-63 / #1208）：
+// 不论内部外部成员，都按 marker.HomeSpaceID / HomeSpaceName 填充，让前端用一致字段做相对渲染。
 func applyExternalMarkers(messages []*MsgSyncResp, markers map[string]group.MemberExternalMarker) {
 	if len(messages) == 0 {
 		return
@@ -2786,6 +2803,8 @@ func applyExternalMarkers(messages []*MsgSyncResp, markers map[string]group.Memb
 			if marker.IsExternal == 1 {
 				msg.FromSourceSpaceName = marker.SourceSpaceName
 			}
+			msg.FromHomeSpaceID = marker.HomeSpaceID
+			msg.FromHomeSpaceName = marker.HomeSpaceName
 		}
 		if msg.Payload == nil {
 			continue
