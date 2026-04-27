@@ -38,6 +38,62 @@ import (
 	"go.uber.org/zap"
 )
 
+// IService 为其他模块提供的窄接口，避免持有完整 *Robot 以及由此产生的循环依赖。
+// YUJ-60: 允许 bot 创建者撤回自己 bot 发的消息时，由 message 模块注入并调用。
+type IService interface {
+	// GetCreatorUID 带缓存地查询机器人的创建者 UID。
+	// 机器人不存在或无 creator_uid 时返回空字符串及 nil error；
+	// 仅在底层查询异常时才返回 error。
+	GetCreatorUID(robotID string) (string, error)
+}
+
+// Service robot 模块对外暴露的只读服务实现，供其它模块注入使用。
+// 与 *Robot 共享底层表结构，但不承担消息/事件监听等副作用，
+// 因此可以被重复 New 出来而不会导致重复注册 listener。
+type Service struct {
+	db           *robotDB
+	creatorCache sync.Map // robotID -> creatorUID
+}
+
+// NewService 构造一个只读 robot 服务，满足 IService 接口。
+func NewService(ctx *config.Context) IService {
+	return &Service{
+		db: newBotDB(ctx),
+	}
+}
+
+// GetCreatorUID 查询机器人的创建者 UID，带 sync.Map 缓存。
+// 未命中（bot 不存在）时返回空串 + nil，调用方据此判定为“非 bot / 无 owner”。
+func (s *Service) GetCreatorUID(robotID string) (string, error) {
+	if v, ok := s.creatorCache.Load(robotID); ok {
+		return v.(string), nil
+	}
+	uid, err := s.db.queryCreatorUID(robotID)
+	if err != nil {
+		// 未查到记录 → 视为“不是有效 bot”，缓存空串避免反复 DB 查询。
+		if errors.Is(err, dbr.ErrNotFound) {
+			s.creatorCache.Store(robotID, "")
+			return "", nil
+		}
+		return "", err
+	}
+	s.creatorCache.Store(robotID, uid)
+	return uid, nil
+}
+
+// GetCreatorUID 让 *Robot 同时实现 IService，便于已有 Robot 实例的场景直接复用。
+// 内部委托给已有的 getCreatorUID（含 sync.Map 缓存）。
+func (rb *Robot) GetCreatorUID(robotID string) (string, error) {
+	uid, err := rb.getCreatorUID(robotID)
+	if err != nil {
+		if errors.Is(err, dbr.ErrNotFound) {
+			return "", nil
+		}
+		return "", err
+	}
+	return uid, nil
+}
+
 type Robot struct {
 	ctx *config.Context
 	log.Log
