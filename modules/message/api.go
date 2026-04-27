@@ -19,6 +19,7 @@ import (
 	commonapi "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/modules/file"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/robot"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	"github.com/Mininglamp-OSS/octo-server/modules/user"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
@@ -170,6 +171,8 @@ type Message struct {
 	pinnedDB            *pinnedDB
 	userService         user.IService
 	groupService        group.IService
+	// robotService 仅用于 GetCreatorUID (YUJ-60 允许 bot 创建者撤回自己 bot 发的消息)。
+	robotService        robot.IService
 	commonService       commonapi.IService
 	fileService         file.IService
 	channelService      chservice.IService
@@ -198,6 +201,8 @@ func New(ctx *config.Context) *Message {
 		remindersDB:         newRemindersDB(ctx),
 		pinnedDB:            newPinnedDB(ctx),
 		userService:         user.NewService(ctx),
+		// robotService: 只读 robot 服务，用于 hasRevokePermission 判断 bot 所有者。
+		robotService:        robot.NewService(ctx),
 		commonService:       commonapi.NewService(ctx),
 		fileService:         file.NewService(ctx),
 		channelService:      channel.NewService(ctx),
@@ -1779,6 +1784,19 @@ func (m *Message) hasRevokePermission(messageM *messageModel, loginUID string) (
 	}
 	if messageM.FromUID == loginUID { // 自己发的消息允许被撤回
 		return true, nil
+	}
+	// YUJ-60: 允许 bot 创建者撤回自己创建的 bot 发的消息（DM / 群都适用）。
+	// 放在 FromUID==loginUID 之后，避免非 bot 场景的多余查询；
+	// 放在群管理员分支之前，确保 DM 场景也生效。
+	if m.robotService != nil {
+		creatorUID, err := m.robotService.GetCreatorUID(messageM.FromUID)
+		if err != nil {
+			// 查询失败不应阻断原有流程，降级继续走后续群管理员分支。
+			m.Warn("查询 Bot 创建者失败，跳过 bot-owner 分支",
+				zap.Error(err), zap.String("fromUID", messageM.FromUID))
+		} else if creatorUID != "" && creatorUID == loginUID {
+			return true, nil
+		}
 	}
 	if messageM.ChannelType == common.ChannelTypeGroup.Uint8() { // 管理者或创建者可以撤回其他成员的消息
 		loginMember, err := m.groupService.GetMember(messageM.ChannelID, loginUID)
