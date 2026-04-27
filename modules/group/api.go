@@ -288,7 +288,9 @@ func (g *Group) membersGet(c *wkhttp.Context) {
 			resps = append(resps, resp.from(memberModel))
 		}
 	}
-	g.fillSourceSpaceNames(resps)
+	// membersGet 路径未提前查过 group 表，传空 groupSpaceID 让 fillSpaceRelatedFields
+	// 内部按需兜底（仅在存在内部成员时才多做一次 group 查询）。
+	g.fillSpaceRelatedFields(groupNo, "", resps)
 
 	c.Response(resps)
 }
@@ -475,7 +477,9 @@ func (g *Group) syncMembers(c *wkhttp.Context) {
 		resp := memberDetailResp{}
 		resps = append(resps, resp.from(memberModel))
 	}
-	g.fillSourceSpaceNames(resps)
+	// syncMembers 在 L446 已经 QueryWithGroupNo 过一次，把 group.SpaceID 透传进去
+	// 可避免 fillSpaceRelatedFields 再做一次群查询（Jerry-Xin review 优化建议）。
+	g.fillSpaceRelatedFields(groupNo, group.SpaceID, resps)
 	c.Response(resps)
 }
 
@@ -3563,6 +3567,14 @@ type memberDetailResp struct {
 	IsExternal         int    `json:"is_external"`          // 是否外部成员
 	SourceSpaceID      string `json:"source_space_id"`      // 来源 Space ID
 	SourceSpaceName    string `json:"source_space_name"`    // 来源 Space 名称
+	// HomeSpaceID / HomeSpaceName 是对齐企微"相对当前 Space 外部"语义的视图字段（YUJ-63 / #1208）。
+	// 后端保持 IsExternal / SourceSpaceID / SourceSpaceName 的绝对语义不变，仅用于后端逻辑；
+	// 前端在渲染"外部"徽标时应改为比较 home_space_id 与当前查看 Space。
+	// 规则：
+	//   外部成员 (is_external == 1) → home_space_id = source_space_id
+	//   内部成员                     → home_space_id = group.space_id
+	HomeSpaceID        string `json:"home_space_id"`        // 成员归属 Space ID（供前端相对视角渲染）
+	HomeSpaceName      string `json:"home_space_name"`      // 成员归属 Space 名称
 	CreatedAt          string `json:"created_at"`
 	UpdatedAt          string `json:"updated_at"`
 }
@@ -3590,20 +3602,72 @@ func (r memberDetailResp) from(model *MemberDetailModel) memberDetailResp {
 	}
 }
 
-// fillSourceSpaceNames 批量查询外部成员的来源 Space 名称，避免 N+1。
-func (g *Group) fillSourceSpaceNames(resps []memberDetailResp) {
+// fillSpaceRelatedFields 在一次 space 批量查询中同时填充：
+//   - source_space_name （原语义：外部成员的来源 Space 名称）
+//   - home_space_id / home_space_name （YUJ-63 / #1208：相对当前 Space 视图字段）
+//
+// 计算规则（保留原语义，前端在渲染"外部"徽标时改为比较 home_space_id）：
+//
+//	if member.IsExternal == 1 {
+//	    home_space_id   = member.SourceSpaceID
+//	    home_space_name = lookup(SourceSpaceID)
+//	} else {
+//	    home_space_id   = group.SpaceID
+//	    home_space_name = lookup(group.SpaceID)
+//	}
+//
+// groupSpaceID 由调用方预先传入可避免重复的 group 表查询（Jerry-Xin review #1209 优化建议）。
+// 如果传空串且存在内部成员，函数会用 groupNo 兜底查一次 group 表；
+// 调用方若已经查过 group（如 syncMembers），应把 group.SpaceID 显式透传以省掉这次查询。
+//
+// SQL 开销上限：
+//  1. 最多 1 次 group 表查询（仅在 groupSpaceID=="" 且存在内部成员时的兜底）
+//  2. 最多 1 次 space 表 WHERE IN 批量查询（合并所有 source_space_id ∪ group_space_id）
+//
+// 这个上限与 resps 长度无关，保持原先 fillSourceSpaceNames 的无 N+1 属性。
+// 函数不会改写 is_external / source_space_id 字段。
+func (g *Group) fillSpaceRelatedFields(groupNo, groupSpaceID string, resps []memberDetailResp) {
 	if len(resps) == 0 {
 		return
 	}
+	// 只在存在内部成员时才需要群自身 space_id，纯外部群直接走来源 Space 快径。
+	hasInternal := false
+	for _, r := range resps {
+		if r.IsExternal != 1 {
+			hasInternal = true
+			break
+		}
+	}
+	// 兜底：调用方未传 groupSpaceID 时才落一次 group 表查询。
+	if hasInternal && groupSpaceID == "" && groupNo != "" {
+		grp, err := g.db.QueryWithGroupNo(groupNo)
+		if err != nil {
+			g.Warn("查询群 Space 失败", zap.Error(err), zap.String("group_no", groupNo))
+		} else if grp != nil {
+			groupSpaceID = grp.SpaceID
+		}
+	}
+
+	// 第 1 步：先定好每个 resp 的 home_space_id，并把所有需要反查名称的 space_id 收入集合。
 	idSet := make(map[string]struct{})
-	for _, m := range resps {
-		if m.IsExternal == 1 && m.SourceSpaceID != "" {
-			idSet[m.SourceSpaceID] = struct{}{}
+	for i := range resps {
+		if resps[i].IsExternal == 1 {
+			if resps[i].SourceSpaceID != "" {
+				resps[i].HomeSpaceID = resps[i].SourceSpaceID
+				idSet[resps[i].SourceSpaceID] = struct{}{}
+			}
+			continue
+		}
+		if groupSpaceID != "" {
+			resps[i].HomeSpaceID = groupSpaceID
+			idSet[groupSpaceID] = struct{}{}
 		}
 	}
 	if len(idSet) == 0 {
 		return
 	}
+
+	// 第 2 步：一次 space 表 WHERE IN 批量查询，拿到所有 id→name 的映射。
 	ids := make([]string, 0, len(idSet))
 	for id := range idSet {
 		ids = append(ids, id)
@@ -3615,16 +3679,21 @@ func (g *Group) fillSourceSpaceNames(resps []memberDetailResp) {
 	_, err := g.ctx.DB().Select("space_id", "name").From("space").
 		Where("space_id IN ?", ids).Load(&rows)
 	if err != nil {
-		g.Warn("查询来源 Space 名称失败", zap.Error(err))
+		g.Warn("查询 Space 名称失败", zap.Error(err))
 		return
 	}
 	nameMap := make(map[string]string, len(rows))
 	for _, r := range rows {
 		nameMap[r.SpaceID] = r.Name
 	}
+
+	// 第 3 步：同一张映射同时回填 source_space_name（原语义）和 home_space_name（新视图字段）。
 	for i := range resps {
-		if resps[i].IsExternal == 1 {
+		if resps[i].IsExternal == 1 && resps[i].SourceSpaceID != "" {
 			resps[i].SourceSpaceName = nameMap[resps[i].SourceSpaceID]
+		}
+		if resps[i].HomeSpaceID != "" {
+			resps[i].HomeSpaceName = nameMap[resps[i].HomeSpaceID]
 		}
 	}
 }

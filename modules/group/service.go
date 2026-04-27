@@ -344,10 +344,16 @@ func (s *Service) GetMembers(groupNo string) ([]*MemberResp, error) {
 type MemberExternalMarker struct {
 	IsExternal      int    // 1 = 外部成员
 	SourceSpaceName string // 来源 Space 名称；非外部成员或无来源时为空
+	// HomeSpaceID / HomeSpaceName 是为了前端"相对当前查看 Space"渲染外部徽标
+	// 而新增的视图字段（YUJ-63 / #1208）。后端 IsExternal / SourceSpace* 语义不变。
+	// 规则：外部成员 → home = source space；内部成员 → home = 群自身 space。
+	HomeSpaceID   string
+	HomeSpaceName string
 }
 
 // GetMemberExternalMarkers 返回群内所有未删除成员的外部来源标识映射 uid -> MemberExternalMarker。
 // 实现上用一条 LEFT JOIN 语句同时取出 is_external / source_space_id / space.name，
+// 再（仅当群本身存在 space_id 时）一次性取出群归属 Space 的名称，
 // 调用方在遍历消息时即可 O(1) lookup，避免每条消息再去 JOIN group_member。
 // groupNo 为空直接返回空 map，方便调用方统一处理 DM 场景。
 func (s *Service) GetMemberExternalMarkers(groupNo string) (map[string]MemberExternalMarker, error) {
@@ -359,12 +365,51 @@ func (s *Service) GetMemberExternalMarkers(groupNo string) (map[string]MemberExt
 	if err != nil {
 		return result, err
 	}
+	// 计算内部成员的 home 时需要群自身 space_id + name。
+	// 仅在存在内部成员时查询，避免外部纯外部群的多余 SQL 成本。
+	var groupSpaceID, groupSpaceName string
+	hasInternal := false
+	for _, r := range rows {
+		if r.IsExternal != 1 {
+			hasInternal = true
+			break
+		}
+	}
+	if hasInternal {
+		grp, gerr := s.db.QueryWithGroupNo(groupNo)
+		if gerr != nil {
+			s.Warn("查询群资料失败（home space）", zap.Error(gerr), zap.String("group_no", groupNo))
+		} else if grp != nil {
+			groupSpaceID = grp.SpaceID
+		}
+		if groupSpaceID != "" {
+			// 与 api 层 fillSpaceRelatedFields 的 WHERE IN 批量查询策略保持一致
+			// （Jerry-Xin review #1209 优化建议）：虽然这里只查一个 id，
+			// 统一用 IN 写法更便于未来扩展到一次查多个 space（例如同时取群 + 来源 Space 名称）。
+			var rows []struct {
+				SpaceID string `db:"space_id"`
+				Name    string `db:"name"`
+			}
+			_, nerr := s.ctx.DB().Select("space_id", "name").From("space").
+				Where("space_id IN ?", []string{groupSpaceID}).Load(&rows)
+			if nerr != nil {
+				s.Warn("查询群归属 Space 名称失败", zap.Error(nerr), zap.String("space_id", groupSpaceID))
+			} else if len(rows) > 0 {
+				groupSpaceName = rows[0].Name
+			}
+		}
+	}
 	for _, r := range rows {
 		marker := MemberExternalMarker{
 			IsExternal: r.IsExternal,
 		}
 		if r.IsExternal == 1 {
 			marker.SourceSpaceName = r.SourceSpaceName
+			marker.HomeSpaceID = r.SourceSpaceID
+			marker.HomeSpaceName = r.SourceSpaceName
+		} else {
+			marker.HomeSpaceID = groupSpaceID
+			marker.HomeSpaceName = groupSpaceName
 		}
 		result[r.UID] = marker
 	}
