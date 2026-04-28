@@ -291,7 +291,7 @@ function onJoinClick() {
 // redirectHome 把 Web 落地页跳回 dmwork-web 首页（保留 sid）；失败时兜底到 "/"。
 function redirectHome(sid) {
     try {
-        var basePath = window.location.pathname.replace(/\/+$/, '').replace(/\/v1\/group\/invite$/, '');
+        var basePath = window.location.pathname.replace(/\/+$/, '').replace(/\/v1\/group\/invite$/, '').replace(/^\/api(?:\/v\d+)?(?=\/|$)/, '');
         var target = window.location.origin + (basePath || "/") + (sid ? "?sid=" + encodeURIComponent(sid) : "");
         window.location.href = target;
     } catch (e) {
