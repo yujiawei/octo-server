@@ -165,14 +165,17 @@ func (w *SyncWorker) RunOnce(ctx context.Context) error {
 	if w.lock != nil {
 		token, err := NewRandomString(16)
 		if err != nil {
+			metricSyncTickTotal.WithLabelValues("lock_err").Inc()
 			return fmt.Errorf("oidc sync: gen lock token: %w", err)
 		}
 		got, err := w.lock.Acquire(ctx, w.cfg.LockKey, token, w.cfg.LockTTL)
 		if err != nil {
 			// Redis 故障:降级到"无锁"路径而非阻塞。打 warn 让运维注意,
 			// rowsAffected 竞态检测在 DB 层兜底,不会出假阳性踢线。
+			metricSyncTickTotal.WithLabelValues("lock_err").Inc()
 			w.Warn("OIDC sync lock 故障,降级单 tick 无锁运行", zap.Error(err))
 		} else if !got {
+			metricSyncTickTotal.WithLabelValues("lock_held").Inc()
 			w.Debug("OIDC sync lock 被另一实例持有,本 tick 跳过",
 				zap.String("key", w.cfg.LockKey))
 			return nil
@@ -191,6 +194,7 @@ func (w *SyncWorker) RunOnce(ctx context.Context) error {
 			}()
 		}
 	}
+	metricSyncTickTotal.WithLabelValues("ran").Inc()
 	due, err := w.store.DueRefreshes(w.cfg.BatchSize)
 	if err != nil {
 		return fmt.Errorf("oidc sync: query due: %w", err)
@@ -215,6 +219,7 @@ func (w *SyncWorker) RunOnce(ctx context.Context) error {
 			// 让其他 RT 正常处理完;锁也能正常 defer release 不卡死下个 tick。
 			defer func() {
 				if r := recover(); r != nil {
+					metricSyncProcessedTotal.WithLabelValues("panic").Inc()
 					w.Error("OIDC sync processOne panic recovered",
 						zap.Any("panic", r), zap.Int64("rt_id", rec.ID))
 					w.writeAudit(rec.UID, EventRefreshFail, fmt.Sprintf("panic: %v", r))
@@ -279,9 +284,11 @@ func (w *SyncWorker) processOne(ctx context.Context, d *DueRefresh) {
 			if e := w.killer.Kick(ctx, d.UID); e != nil {
 				w.Error("OIDC 吊销后踢线失败", zap.Error(e), zap.String("uid", d.UID))
 			}
+			metricSyncProcessedTotal.WithLabelValues("invalid_grant").Inc()
 			w.writeAudit(d.UID, EventRefreshFail, "invalid_grant")
 			return
 		}
+		metricSyncProcessedTotal.WithLabelValues("transient").Inc()
 		w.Warn("OIDC refresh 暂时性失败,下轮重试",
 			zap.Error(err), zap.String("uid", d.UID), zap.Int64("rt_id", d.ID))
 		w.writeAudit(d.UID, EventRefreshFail, "transient: "+err.Error())
@@ -300,14 +307,16 @@ func (w *SyncWorker) processOne(ctx context.Context, d *DueRefresh) {
 		ExpiresAt:       res.ExpiresAt,
 	}
 	if err := w.store.RotateRefresh(d.ID, newRT); err != nil {
-		// ErrAlreadyRevoked 是另一 worker 抢先轮换,正常竞态,不必告警
+		// ErrAlreadyRevoked 是另一 worker 抢先轮换,正常竞态,不必告警 / 不计 transient
 		if errors.Is(err, ErrAlreadyRevoked) {
 			return
 		}
+		metricSyncProcessedTotal.WithLabelValues("transient").Inc()
 		w.Warn("RotateRefresh 失败", zap.Error(err), zap.Int64("rt_id", d.ID))
 		w.writeAudit(d.UID, EventRefreshFail, "rotate: "+err.Error())
 		return
 	}
+	metricSyncProcessedTotal.WithLabelValues("ok").Inc()
 	w.writeAudit(d.UID, EventRefreshOK, "")
 }
 

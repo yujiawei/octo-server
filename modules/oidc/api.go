@@ -25,8 +25,15 @@ import (
 const ThirdAuthcodeRedisPrefix = "thirdlogin:authcode:"
 
 const (
-	stateTTL         = 10 * time.Minute
-	thirdAuthcodeTTL = 1 * time.Minute
+	// stateTTL OIDC authorize → callback 之间 state 的有效期;
+	// 覆盖 IdP 同意页 + 网络往返,同时压缩 state 复用攻击窗口。
+	stateTTL = 5 * time.Minute
+	// thirdAuthcodeTTL 前端短码轮询拿 LoginRespJSON 的窗口。
+	// 登录响应仅在 callback 成功时落 Redis,容量影响可忽略。
+	thirdAuthcodeTTL = 5 * time.Minute
+	// maxAuditDetail audit 表 reason 列写入的最大长度,防止 IdP 返回的
+	// 任意字段(如 ?error=...)灌爆审计字段或污染下游 dashboard。
+	maxAuditDetail    = 256
 	defaultDeviceFlag = uint8(0) // APP
 	maxAuditUID       = 64
 )
@@ -73,6 +80,7 @@ type OIDC struct {
 	revoker    rtRevoker
 	worker     *SyncWorker
 	tickLock   *RedisTickLock
+	cbGuard    *CallbackGuard
 }
 
 // New 构造 OIDC 模块(生产路径)。
@@ -101,6 +109,11 @@ func New(ctx *config.Context) *OIDC {
 	o.audit = db
 	o.revoker = db
 	o.killer = ctxKiller{ctx: ctx}
+	o.cbGuard = NewCallbackGuard(
+		ctx.GetRedisConn(),
+		callbackGuardThresholdFromEnv(),
+		callbackGuardWindowFromEnv(),
+	)
 
 	cctx, cancel := context.WithTimeout(context.Background(), cfg.Aegis.HTTPTimeout)
 	defer cancel()
@@ -194,6 +207,7 @@ func (o *OIDC) disabled(c *wkhttp.Context) {
 //   - return_to (可选): 登录后跳转地址,host 必须命中白名单或为相对路径
 //   - flag     (可选): 设备标志,默认 0=APP
 func (o *OIDC) authorize(c *wkhttp.Context) {
+	metricAuthorizeTotal.Inc()
 	if o.client == nil {
 		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("oidc client not initialized"))
 		return
@@ -261,37 +275,72 @@ func (o *OIDC) authorize(c *wkhttp.Context) {
 // 任何步骤失败都把"0"写到 Redis key,前端按 GitHub 模式拿到 "0" 即视为登录失败,
 // 与 api_github.go:161 保持一致,前端无需新代码。
 func (o *OIDC) callback(c *wkhttp.Context) {
+	traceID := newTraceID()
+	clientIP := util.GetClientPublicIP(c.Request)
+	start := time.Now()
+
+	// result 在每个分支显式置位,defer 集中上报 callback 计数 + duration。
+	// 默认 "other_fail",任何意外路径(panic 之外)都被归入此桶,触发告警时
+	// 优先排查未在 callbackResultLabels() 枚举的新分支。
+	result := "other_fail"
+	defer func() {
+		metricCallbackTotal.WithLabelValues(result).Inc()
+		metricCallbackDuration.Observe(time.Since(start).Seconds())
+	}()
+
 	if o.client == nil {
+		// result 默认即 "other_fail",此分支无需显式置位
 		c.AbortWithStatusJSON(http.StatusInternalServerError, errMsg("oidc client not initialized"))
 		return
 	}
+
+	// IP 限流前置:同一 IP 短时间内累计失败过多,直接 429 拒绝,
+	// 不再消费 state、不再调 IdP,失败计数不再 +1(否则锁定窗口被自身续期成永久锁)。
+	if o.cbGuard != nil {
+		if cerr := o.cbGuard.Check(clientIP); cerr != nil {
+			result = "rate_limited"
+			o.Warn("OIDC callback 触达 IP 失败阈值,拒绝",
+				zap.String("trace_id", traceID),
+				zap.String("ip", clientIP))
+			c.AbortWithStatusJSON(http.StatusTooManyRequests, errMsg("too many failed callbacks, retry later"))
+			return
+		}
+	}
+
 	state := c.Query("state")
 	if state == "" {
+		result = "state_invalid"
+		metricStateConsumeTotal.WithLabelValues("miss").Inc()
+		o.cbGuard.RecordFailureLogged(clientIP)
 		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg("state required"))
 		return
 	}
-	statePreview := state
-	if len(state) > 8 {
-		statePreview = state[:8] + "..."
-	}
-	o.Debug("OIDC callback 开始", zap.String("state", statePreview))
 
 	sd, err := o.stateStore.Consume(c.Request.Context(), state)
 	if err != nil {
-		o.Debug("OIDC callback state 无效", zap.Error(err))
-		o.Warn("OIDC state 校验失败", zap.Error(err))
+		result = "state_invalid"
+		metricStateConsumeTotal.WithLabelValues("miss").Inc()
+		o.cbGuard.RecordFailureLogged(clientIP)
+		o.Warn("OIDC state 校验失败",
+			zap.String("trace_id", traceID),
+			zap.String("ip", clientIP),
+			zap.Error(err))
 		c.AbortWithStatusJSON(http.StatusBadRequest, errMsg("state invalid"))
 		return
 	}
-	authcodePreview := sd.ClientAuthcode
-	if len(authcodePreview) > 8 {
-		authcodePreview = authcodePreview[:8] + "..."
-	}
-	o.Debug("OIDC callback state 消费成功", zap.String("authcode", authcodePreview))
+	metricStateConsumeTotal.WithLabelValues("ok").Inc()
 
-	// IdP 自身报错(用户拒绝授权 / 配置错误)
+	// IdP 自身报错(用户拒绝授权 / 配置错误)。
+	// 不计 IP 失败:用户在 IdP 端点了"拒绝"不是攻击;state 已消费,replay 不可能。
+	// oerr 是 IdP 返回的任意字符串,截断到 maxAuditDetail 防灌爆。
 	if oerr := c.Query("error"); oerr != "" {
-		o.Debug("OIDC callback IdP 报错", zap.String("error", oerr))
+		result = "idp_error"
+		if len(oerr) > maxAuditDetail {
+			oerr = oerr[:maxAuditDetail]
+		}
+		o.Warn("OIDC callback IdP 报错",
+			zap.String("trace_id", traceID),
+			zap.String("idp_error", oerr))
 		o.failWithAuthcode(c.Request.Context(), sd, nil, fmt.Errorf("idp error: %s", oerr))
 		o.redirectAfterCallback(c, sd, true)
 		return
@@ -299,53 +348,62 @@ func (o *OIDC) callback(c *wkhttp.Context) {
 
 	code := c.Query("code")
 	if code == "" {
-		o.Debug("OIDC callback 缺 code")
+		result = "missing_code"
+		o.cbGuard.RecordFailureLogged(clientIP)
 		o.failWithAuthcode(c.Request.Context(), sd, nil, errors.New("missing code"))
 		o.redirectAfterCallback(c, sd, true)
 		return
 	}
-	o.Debug("OIDC callback 开始 Exchange")
 
 	tok, err := o.client.Exchange(c.Request.Context(), code, sd.CodeVerifier)
 	if err != nil {
-		o.Debug("OIDC callback Exchange 失败", zap.Error(err))
+		// 不计 IP 失败:state 已消费,replay 同一对 (state, code) 行不通;
+		// Exchange 故障多半是 IdP 抖动 / 网络问题,不是 IP 行为可控的攻击信号。
+		result = "exchange_fail"
+		o.Warn("OIDC callback Exchange 失败",
+			zap.String("trace_id", traceID),
+			zap.Error(err))
 		o.failWithAuthcode(c.Request.Context(), sd, nil, err)
 		o.redirectAfterCallback(c, sd, true)
 		return
 	}
-	o.Debug("OIDC callback Exchange 成功")
 
 	rawID, _ := tok.Extra("id_token").(string)
 	if rawID == "" {
-		o.Debug("OIDC callback id_token 缺失")
+		result = "verify_fail"
+		o.cbGuard.RecordFailureLogged(clientIP)
 		o.failWithAuthcode(c.Request.Context(), sd, nil, errors.New("id_token missing from token response"))
 		o.redirectAfterCallback(c, sd, true)
 		return
 	}
-	o.Debug("OIDC callback 开始 VerifyIDToken")
 
 	claims, err := o.client.VerifyIDToken(c.Request.Context(), rawID)
 	if err != nil {
-		o.Debug("OIDC callback VerifyIDToken 失败", zap.Error(err))
+		result = "verify_fail"
+		o.cbGuard.RecordFailureLogged(clientIP)
+		o.Warn("OIDC callback VerifyIDToken 失败",
+			zap.String("trace_id", traceID),
+			zap.Error(err))
 		o.failWithAuthcode(c.Request.Context(), sd, nil, err)
 		o.redirectAfterCallback(c, sd, true)
 		return
 	}
-	// TODO(an9xyz): remove after OIDC callback issue is resolved
-	o.Debug("OIDC callback VerifyIDToken 成功",
-		zap.String("sub", claims.Subject),
+	o.Info("OIDC callback id_token verified",
+		zap.String("trace_id", traceID),
+		zap.String("sub_hash", subHash(claims.Subject)),
 		zap.String("email", maskEmail(claims.Email)),
 		zap.Bool("email_verified", claims.EmailVerified))
 
 	if claims.Nonce != sd.Nonce {
-		o.Debug("OIDC callback nonce 不匹配",
-			zap.String("claims_nonce", claims.Nonce),
-			zap.String("state_nonce", sd.Nonce))
+		result = "nonce_mismatch"
+		o.cbGuard.RecordFailureLogged(clientIP)
+		o.Warn("OIDC callback nonce 不匹配",
+			zap.String("trace_id", traceID),
+			zap.String("sub_hash", subHash(claims.Subject)))
 		o.failWithAuthcode(c.Request.Context(), sd, claims, errors.New("nonce mismatch"))
 		o.redirectAfterCallback(c, sd, true)
 		return
 	}
-	o.Debug("OIDC callback nonce 匹配")
 
 	// 部分 IdP(如 Aegis)只在 /userinfo 暴露 email/phone,ID Token 仅含 sub。
 	// 自动绑定历史账号必须依赖 email/phone,所以缺啥就拉一次 /userinfo 补啥。
@@ -353,18 +411,19 @@ func (o *OIDC) callback(c *wkhttp.Context) {
 	if claims.Email == "" || claims.PhoneNumber == "" {
 		ui, uerr := o.client.UserInfo(c.Request.Context(), tok)
 		if uerr != nil {
-			o.Warn("OIDC callback userinfo 拉取失败,跳过补全", zap.Error(uerr))
+			o.Warn("OIDC callback userinfo 拉取失败,跳过补全",
+				zap.String("trace_id", traceID),
+				zap.Error(uerr))
 		} else if ui.Subject != claims.Subject {
 			// 安全检查:userinfo sub 必须等于 ID Token sub,否则视为账号串台,直接拒绝
+			result = "verify_fail"
+			o.cbGuard.RecordFailureLogged(clientIP)
 			o.failWithAuthcode(c.Request.Context(), sd, claims,
-				fmt.Errorf("userinfo sub mismatch: idtoken=%s userinfo=%s", claims.Subject, ui.Subject))
+				fmt.Errorf("userinfo sub mismatch: idtoken=%s userinfo=%s",
+					subHash(claims.Subject), subHash(ui.Subject)))
 			o.redirectAfterCallback(c, sd, true)
 			return
 		} else {
-			o.Debug("OIDC callback userinfo 成功",
-				zap.String("ui_email", maskEmail(ui.Email)),
-				zap.Bool("ui_email_verified", ui.EmailVerified),
-				zap.Bool("has_phone", ui.PhoneNumber != ""))
 			if claims.Email == "" {
 				claims.Email = ui.Email
 				claims.EmailVerified = ui.EmailVerified
@@ -375,10 +434,10 @@ func (o *OIDC) callback(c *wkhttp.Context) {
 			}
 		}
 	}
-	o.Debug("OIDC callback 开始 ResolveOrLink")
 
 	res, err := o.service.ResolveOrLink(c.Request.Context(), claims)
 	if err != nil {
+		result = "resolve_fail"
 		o.failWithAuthcode(c.Request.Context(), sd, claims, err)
 		o.redirectAfterCallback(c, sd, true)
 		return
@@ -404,6 +463,7 @@ func (o *OIDC) callback(c *wkhttp.Context) {
 	}
 	sessResp, err := o.service.IssueSession(c.Request.Context(), issueReq)
 	if err != nil {
+		result = "issue_fail"
 		o.failWithAuthcode(c.Request.Context(), sd, claims, err)
 		o.redirectAfterCallback(c, sd, true)
 		return
@@ -429,16 +489,23 @@ func (o *OIDC) callback(c *wkhttp.Context) {
 			if isDuplicateKeyError(err) {
 				recovered := o.recoverFromIdentityRace(c.Request.Context(), claims, sd, sessResp, issueReq, err)
 				if recovered == nil {
+					result = "identity_insert_fail"
 					// 竞态恢复失败:writeAudit 已在 recover 内部记录,这里只补 ThirdAuthcode "0"
 					if e := o.authcode.SetAuthcode(c.Request.Context(), sd.ClientAuthcode, "0", thirdAuthcodeTTL); e != nil {
-						o.Error("写 ThirdAuthcode 失败(race-recover fail path)", zap.Error(e))
+						o.Error("写 ThirdAuthcode 失败(race-recover fail path)",
+							zap.String("trace_id", traceID), zap.Error(e))
 					}
 					o.redirectAfterCallback(c, sd, true)
 					return
 				}
+				result = "race_recovered"
 				sessResp = recovered
 			} else {
-				o.Error("写 identity 绑定失败(非竞态)", zap.Error(err))
+				result = "identity_insert_fail"
+				o.Error("写 identity 绑定失败(非竞态)",
+					zap.String("trace_id", traceID),
+					zap.String("sub_hash", subHash(claims.Subject)),
+					zap.Error(err))
 				o.failWithAuthcode(c.Request.Context(), sd, claims, fmt.Errorf("bind identity: %w", err))
 				o.redirectAfterCallback(c, sd, true)
 				return
@@ -459,16 +526,22 @@ func (o *OIDC) callback(c *wkhttp.Context) {
 	}
 
 	if err := o.authcode.SetAuthcode(c.Request.Context(), sd.ClientAuthcode, sessResp.LoginRespJSON, thirdAuthcodeTTL); err != nil {
-		// 写 LoginRespJSON 失败,前端轮询永远拿不到 token,会傻等 1 分钟超时。
+		result = "set_authcode_fail"
+		// 写 LoginRespJSON 失败,前端轮询永远拿不到 token,会傻等到 TTL 超时。
 		// 立刻补 "0" 让前端尽早感知,并在 redirect URL 拼 ?oidc_error=1。
-		o.Error("写 ThirdAuthcode 失败", zap.Error(err))
+		o.Error("写 ThirdAuthcode 失败",
+			zap.String("trace_id", traceID), zap.Error(err))
 		if e := o.authcode.SetAuthcode(c.Request.Context(), sd.ClientAuthcode, "0", thirdAuthcodeTTL); e != nil {
-			o.Error("回写 ThirdAuthcode \"0\" 也失败,前端将等到 TTL 超时", zap.Error(e))
+			o.Error("回写 ThirdAuthcode \"0\" 也失败,前端将等到 TTL 超时",
+				zap.String("trace_id", traceID), zap.Error(e))
 		}
 		o.writeAudit(sessResp.UID, EventCallbackFail, sd, "set authcode failed: "+err.Error())
 		o.redirectAfterCallback(c, sd, true)
 		return
 	}
+	result = "ok"
+	// 成功路径清场:防止 IP 长尾累积导致历史失败 + 偶发 state 过期把用户误锁。
+	o.cbGuard.ResetLogged(clientIP)
 	o.writeAudit(sessResp.UID, EventCallbackOK, sd, "")
 	o.redirectAfterCallback(c, sd, false)
 }
@@ -513,16 +586,42 @@ func (o *OIDC) logout(c *wkhttp.Context) {
 		c.AbortWithStatusJSON(http.StatusUnauthorized, errMsg("login required"))
 		return
 	}
+	traceID := newTraceID()
 	ctx := c.Request.Context()
+
+	// kickFailed/revokeFailed 单独记账:logout 整体最终都返 200(best-effort 语义),
+	// 但指标要区分"成功 / 踢线失败 / 吊销失败",方便定位 IM 或 DB 链路问题。
+	kickFailed := false
+	revokeFailed := false
 	if o.killer != nil {
 		if err := o.killer.Kick(ctx, uid); err != nil {
-			o.Error("OIDC logout 踢线失败", zap.Error(err), zap.String("uid", uid))
+			kickFailed = true
+			o.Error("OIDC logout 踢线失败",
+				zap.String("trace_id", traceID),
+				zap.Error(err), zap.String("uid", uid))
 		}
 	}
 	if o.revoker != nil {
 		if _, err := o.revoker.RevokeRefreshByUID(uid); err != nil {
-			o.Error("OIDC logout 吊销 RT 失败", zap.Error(err), zap.String("uid", uid))
+			revokeFailed = true
+			o.Error("OIDC logout 吊销 RT 失败",
+				zap.String("trace_id", traceID),
+				zap.Error(err), zap.String("uid", uid))
 		}
+	}
+	// 两个失败标签独立计数 —— 同一次 logout 可能 kick 和 revoke 都失败,
+	// 早期 switch/case 写法会把 revoke_fail 吃掉。Counter sum 仍可能 > 总请求数,
+	// 但每个失败维度的趋势准确,运维查"哪条链路在抖"时不会漏报。
+	switch {
+	case kickFailed && revokeFailed:
+		metricLogoutTotal.WithLabelValues("kick_fail").Inc()
+		metricLogoutTotal.WithLabelValues("revoke_fail").Inc()
+	case kickFailed:
+		metricLogoutTotal.WithLabelValues("kick_fail").Inc()
+	case revokeFailed:
+		metricLogoutTotal.WithLabelValues("revoke_fail").Inc()
+	default:
+		metricLogoutTotal.WithLabelValues("ok").Inc()
 	}
 	o.writeAudit(uid, EventLogout, &StateData{
 		IP:        util.GetClientPublicIP(c.Request),
@@ -532,14 +631,17 @@ func (o *OIDC) logout(c *wkhttp.Context) {
 }
 
 func (o *OIDC) failWithAuthcode(ctx context.Context, sd *StateData, claims *IDTokenClaims, err error) {
-	o.Warn("OIDC callback 失败", zap.Error(err))
 	uid := ""
 	if claims != nil {
-		uid = "sub:" + claims.Subject
+		// 审计 uid 列存 SHA-256 短哈希前缀,既能事后关联同一 IdP 用户,
+		// 又避免明文 sub 泄漏到审计表。前缀固定 "sub:" 与历史落库格式兼容(老行
+		// 是明文截断,新行是哈希),排查时按 prefix 过滤即可。
+		uid = "sub:" + subHash(claims.Subject)
 		if len(uid) > maxAuditUID {
 			uid = uid[:maxAuditUID]
 		}
 	}
+	o.Warn("OIDC callback 失败", zap.String("audit_uid", uid), zap.Error(err))
 	o.writeAudit(uid, EventCallbackFail, sd, err.Error())
 	if sd == nil || sd.ClientAuthcode == "" {
 		return
@@ -597,7 +699,7 @@ func (o *OIDC) recoverFromIdentityRace(
 		zap.String("ghost_uid", original.UID),
 		zap.String("winner_uid", existing.UID),
 		zap.String("issuer", claims.Issuer),
-		zap.String("sub", claims.Subject))
+		zap.String("sub_hash", subHash(claims.Subject)))
 	o.writeAudit(original.UID, EventCallbackFail, sd,
 		"identity race ghost="+original.UID+" winner="+existing.UID)
 	return winnerSess

@@ -403,6 +403,38 @@ func TestAPI_Callback_BadState(t *testing.T) {
 	}
 }
 
+// IP 失败计数已达阈值时,/callback 应直接 429 不消费 state、不调 IdP。
+//
+// 测试要点:
+//   - 失败计数不再 +1(阈值已锁,再 +1 等于自我续期成永久锁)。
+//   - state 还在 store 里没被消费,可被合法用户复用 → 间接验证未走 Consume。
+func TestAPI_Callback_RateLimited(t *testing.T) {
+	mp := NewMockProvider(t)
+	o := newTestOIDC(t, mp, &fakeUserLookup{}, newFakeIdentityStore())
+	o.cbGuard = NewCallbackGuard(newCallbackGuardRedis(t), 3, 5*time.Minute)
+
+	// 直接把计数顶到阈值。GetClientPublicIP 在无 X-Forwarded-For 时
+	// 会返回 RemoteAddr 的 IP,httptest 默认 192.0.2.1。
+	const testIP = "192.0.2.1"
+	o.cbGuard.Reset(testIP)
+	t.Cleanup(func() { o.cbGuard.Reset(testIP) })
+	for i := 0; i < 3; i++ {
+		if err := o.cbGuard.RecordFailure(testIP); err != nil {
+			t.Fatalf("priming counter: %v", err)
+		}
+	}
+
+	r := newTestRouter(o)
+	req := httptest.NewRequest("GET",
+		"/v1/auth/oidc/aegis/callback?state=any&code=x", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429; body=%s", w.Code, w.Body.String())
+	}
+}
+
 // 成功 callback 应落 EventCallbackOK 审计;IdP 错误应落 EventCallbackFail。
 func TestAPI_Callback_AuditTrail(t *testing.T) {
 	mp := NewMockProvider(t)
