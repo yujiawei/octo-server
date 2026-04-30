@@ -112,7 +112,14 @@ func ParsePushInfo(msgResp msgOfflineNotify, ctx *config.Context, toUser *user.R
 			return nil, err
 		}
 		payloadInfo.Title = threadTitle
-		content = fmt.Sprintf("%s：%s", fromName, content)
+		// 子区消息的外部发件人同样需要 @SpaceName 外部标识
+		// （YUJ-172 / octo-server#1251）。子区所在群号从 ChannelID 前缀解析，
+		// 解析失败直接降级为不加后缀。
+		var threadGroupNo string
+		if groupNo, _, ok := parseThreadChannelID(msgResp.ChannelID); ok {
+			threadGroupNo = groupNo
+		}
+		content = formatGroupPushBody(ctx, threadGroupNo, msgResp.FromUID, fromName, content)
 	} else {
 		var groupName string
 		groupName, err = getAndCacheGroupName(msgResp, ctx)
@@ -121,7 +128,7 @@ func ParsePushInfo(msgResp msgOfflineNotify, ctx *config.Context, toUser *user.R
 			return nil, err
 		}
 		payloadInfo.Title = groupName
-		content = fmt.Sprintf("%s：%s", fromName, content)
+		content = formatGroupPushBody(ctx, msgResp.ChannelID, msgResp.FromUID, fromName, content)
 	}
 	payloadInfo.Content = content
 	payloadInfo.SpaceID = msgResp.SpaceID
@@ -364,4 +371,17 @@ func getUserBadge(uid string, ctx *config.Context) (int, error) {
 		return 0, err
 	}
 	return int(badge), nil
+}
+
+// formatGroupPushBody 组装群/子区推送 body：
+//   - 同 Space 发件人：`<发件人>：<content>` （与历史行为一致，无回归）
+//   - 跨 Space 发件人：`<发件人> @<space_name>：<content>` （YUJ-172 / octo-server#1251）
+//
+// 任何数据缺失/依赖错误都降级为同 Space 路径，永不阻塞推送。
+func formatGroupPushBody(ctx *config.Context, groupNo, fromUID, fromName, content string) string {
+	suffix := resolveSenderSpaceLabel(getExternalMarkerCache(ctx), groupNo, fromUID)
+	if suffix == "" {
+		return fmt.Sprintf("%s：%s", fromName, content)
+	}
+	return fmt.Sprintf("%s @%s：%s", fromName, suffix, content)
 }
