@@ -270,8 +270,8 @@ func (u *User) Route(r *wkhttp.WKHttp) {
 	}
 
 	// OCTO 实名认证链路（YUJ-354 / GH#1300）——
-	// /internal/verification/complete 由 verify-service 回调，HMAC 鉴权；
-	// /internal/verify-token 由 OCTO 前端调用，需登录态。
+	// /v1/internal/verification/complete 由 verify-service 回调，HMAC 鉴权；
+	// /v1/internal/verify-token 由 OCTO 前端调用，需登录态。
 	u.routeVerification(r)
 
 	u.ctx.AddOnlineStatusListener(u.onlineService.listenOnlineStatus) // 监听在线状态

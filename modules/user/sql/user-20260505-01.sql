@@ -2,7 +2,7 @@
 
 -- 用户实名认证记录表（OCTO 实名认证链路 - 与 dmwork-verify-service 对接）
 -- verify-service (accounts.example.com) 通过 CAS/企微/飞书 完成实名后，
--- 经 /internal/verification/complete 回调 upsert 到本表。
+-- 经 /v1/internal/verification/complete 回调 upsert 到本表。
 -- 详见 GH#1300 / YUJ-354。
 CREATE TABLE IF NOT EXISTS user_verification (
     user_id       VARCHAR(40)  NOT NULL COMMENT 'OCTO 用户 UID',

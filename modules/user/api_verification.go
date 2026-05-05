@@ -24,11 +24,11 @@ import (
 // OCTO 实名认证链路接口（YUJ-354 / GH#1300）
 //
 // 两个接口：
-//   1. POST /internal/verification/complete
+//   1. POST /v1/internal/verification/complete
 //      由 dmwork-verify-service（accounts.example.com）在用户实名完成后回调，
 //      以 HMAC-SHA256 签名体认证，upsert 到 user_verification。
 //
-//   2. POST /internal/verify-token
+//   2. POST /v1/internal/verify-token
 //      由 OCTO 前端调用，基于当前登录会话签发 5 分钟短时 HS256 JWT，
 //      返回 token 与跳转 verify-service 的 URL。
 //
@@ -49,7 +49,7 @@ const (
 	octoVerifyJWTTTL = 5 * time.Minute
 	// verify-service 默认跳转地址。env 覆盖：OCTO_VERIFY_URL_BASE。
 	octoVerifyURLBaseDefault = "https://accounts.example.com/verify"
-	// /internal/verification/complete body 上限 —— verify-service 实际 payload ~500B，
+	// /v1/internal/verification/complete body 上限 —— verify-service 实际 payload ~500B，
 	// 1 MB 非常宽松，但能挡住攻击者用 multi-GB body 在 HMAC 验签前吃满内存的 DoS。
 	octoCompleteMaxBody = 1 << 20 // 1 MiB
 )
@@ -62,7 +62,7 @@ var octoSourceAllowlist = map[string]struct{}{
 	"feishu": {},
 }
 
-// octoReturnToAllowedSchemes 列出 /internal/verify-token 允许回跳的 scheme 前缀。
+// octoReturnToAllowedSchemes 列出 /v1/internal/verify-token 允许回跳的 scheme 前缀。
 // 其他 scheme（javascript:/data:/file: 等）一律忽略，让 verify-service 走默认 return_to，
 // 避免把 open-redirect / XSS 向量透传到前端。
 var octoReturnToAllowedSchemes = []string{
@@ -104,20 +104,23 @@ type octoVerifyJWTClaims struct {
 
 // routeVerification 注册 OCTO 实名认证链路两个接口。
 //
-// 路径刻意不带 /v1 前缀：
-//   - /internal/verification/complete 是 verify-service 已经上线的硬编码调用，不能改；
-//   - /internal/verify-token 与之保持一致，减少前端/运维对"OCTO 内部"路由习惯切换的心智负担。
+// 路径遵循项目既定约定 `/v1/internal/*`（与 modules/notify/api.go 对齐）：
+//   - /v1/internal/verification/complete 由 verify-service 回调；
+//   - /v1/internal/verify-token 由 OCTO 前端调用。
+//
+// nginx / 网关仅反代 /v1/* 前缀，因此所有内网路径必须挂在 /v1/internal 下；
+// PR#1301 误用 `/internal/*` 会被 nginx 直接返回 405（参见 GH#1302）。
 //
 // 网络侧隔离：两条路径均应在 nginx / 网关上限定为内网可达（运维 Runbook 说明），
 // 应用层的 HMAC / 登录态鉴权是防御纵深第二层。
 func (u *User) routeVerification(r *wkhttp.WKHttp) {
-	internal := r.Group("/internal")
+	internal := r.Group("/v1/internal")
 	{
 		// HMAC 认证：由 verify-service → OCTO；不要套 AuthMiddleware，verify-service 没有 OCTO session。
 		internal.POST("/verification/complete", u.verificationComplete)
 	}
-	// verify-token 必须已登录，用 OCTO session 绑 sub；挂在 /internal 下 + AuthMiddleware 即可。
-	authInternal := r.Group("/internal", u.ctx.AuthMiddleware(r))
+	// verify-token 必须已登录，用 OCTO session 绑 sub；挂在 /v1/internal 下 + AuthMiddleware 即可。
+	authInternal := r.Group("/v1/internal", u.ctx.AuthMiddleware(r))
 	{
 		authInternal.POST("/verify-token", u.issueVerifyToken)
 	}
@@ -142,7 +145,7 @@ func (u *User) verificationComplete(c *wkhttp.Context) {
 	secret := strings.TrimSpace(os.Getenv("OCTO_INTERNAL_HMAC_SECRET"))
 	if secret == "" {
 		// fail-closed：secret 未配时直接拒绝，避免"配置漏掉但接口开放"的安全坑。
-		u.Warn("OCTO_INTERNAL_HMAC_SECRET 未配置，拒绝 /internal/verification/complete 请求")
+		u.Warn("OCTO_INTERNAL_HMAC_SECRET 未配置，拒绝 /v1/internal/verification/complete 请求")
 		c.AbortWithStatusJSON(http.StatusUnauthorized, gin401Body("internal auth not configured"))
 		return
 	}
@@ -254,7 +257,7 @@ func (u *User) verificationComplete(c *wkhttp.Context) {
 //
 // verify-service 侧约定：
 //   - 收到 token → 校 HS256 + OCTO_JWT_SECRET，校 purpose=verify，校 exp，取 sub=octo_user_id。
-//   - 完成后走 /internal/verification/complete 回调 OCTO（已由接口 1 处理）。
+//   - 完成后走 /v1/internal/verification/complete 回调 OCTO（已由接口 1 处理）。
 func (u *User) issueVerifyToken(c *wkhttp.Context) {
 	secret := strings.TrimSpace(os.Getenv("OCTO_JWT_SECRET"))
 	if secret == "" {

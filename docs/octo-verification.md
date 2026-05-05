@@ -17,7 +17,7 @@ OCTO 前端                OCTO 后端                       verify-service (CAS
    │───────────────────────────────────────────────────────────▶│
    │                                                            │ 走 CAS 实名
    │                        │                                  │
-   │                        │ POST /internal/verification/     │
+   │                        │ POST /v1/internal/verification/  │
    │                        │ complete (HMAC-SHA256 签名)       │
    │                        │◀─────────────────────────────────│
    │                        │ 200 {ok:true}                    │
@@ -32,7 +32,7 @@ OCTO 前端                OCTO 后端                       verify-service (CAS
 
 ## 接口
 
-### 1. POST `/internal/verification/complete`
+### 1. POST `/v1/internal/verification/complete`
 
 由 verify-service 调用。**无 OCTO session，走 HMAC 签名鉴权。**
 
@@ -83,7 +83,7 @@ Body：
 
 幂等性：表以 `user_id` 为主键，重复回调按最新值覆盖。
 
-### 2. POST `/internal/verify-token`
+### 2. POST `/v1/internal/verify-token`
 
 由 OCTO 前端调用。**需 OCTO session**（走 AuthMiddleware），签发 5 分钟短时 JWT。
 
@@ -148,8 +148,8 @@ JWT claims：
 
 | Env | 必填 | 默认 | 说明 |
 | --- | --- | --- | --- |
-| `OCTO_INTERNAL_HMAC_SECRET` | Y（启用本链路时） | — | 与 verify-service 共享的 HMAC 密钥。未配时 `/internal/verification/complete` 恒回 401（fail-closed）。 |
-| `OCTO_JWT_SECRET` | Y（启用本链路时） | — | 与 verify-service 共享的 HS256 JWT 密钥。未配时 `/internal/verify-token` 恒回 503。 |
+| `OCTO_INTERNAL_HMAC_SECRET` | Y（启用本链路时） | — | 与 verify-service 共享的 HMAC 密钥。未配时 `/v1/internal/verification/complete` 恒回 401（fail-closed）。 |
+| `OCTO_JWT_SECRET` | Y（启用本链路时） | — | 与 verify-service 共享的 HS256 JWT 密钥。未配时 `/v1/internal/verify-token` 恒回 503。 |
 | `OCTO_VERIFY_URL_BASE` | N | `https://accounts.example.com/verify` | verify-service 跳转基址。 |
 | `OCTO_VERIFY_RETURN_TO_DEFAULT` | N | 空 | 客户端未传 `return_to` 时的默认值；为空则不挂参数。 |
 
@@ -163,21 +163,21 @@ BODY='{"octo_user_id":"u_abc","real_name":"张三","cas_user_id":"31","verified_
 SIG="sha256=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$OCTO_INTERNAL_HMAC_SECRET" -hex | awk '{print $NF}')"
 
 # 2) 成功 case
-curl -i -X POST https://api.example.com/internal/verification/complete \
+curl -i -X POST https://api.example.com/v1/internal/verification/complete \
   -H "Content-Type: application/json" \
   -H "X-OCTO-Signature: $SIG" \
   -d "$BODY"
 # 期望: 200 {"ok":true}
 
 # 3) 错误 HMAC
-curl -i -X POST https://api.example.com/internal/verification/complete \
+curl -i -X POST https://api.example.com/v1/internal/verification/complete \
   -H "Content-Type: application/json" \
   -H "X-OCTO-Signature: sha256=deadbeef" \
   -d "$BODY"
 # 期望: 401
 
 # 4) OCTO 前端签发 token（需登录）
-curl -X POST https://api.example.com/internal/verify-token \
+curl -X POST https://api.example.com/v1/internal/verify-token \
   -H "Authorization: <OCTO session token>" \
   -H "Content-Type: application/json" \
   -d '{"return_to":"https://api.example.com/me"}'
