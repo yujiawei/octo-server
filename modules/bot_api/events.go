@@ -70,15 +70,24 @@ func (ba *BotAPI) getEvents(c *wkhttp.Context) {
 	// - App Bot cannot join groups (all group/thread ops are denied)
 	// - Event push upstream only routes DM events to App Bot queues
 	// This filter is purely defensive — if triggered, it indicates an infrastructure bug.
-	// Post-filter design: events are loaded from Redis then filtered in memory.
-	// Filtered events are still ACK'd by the client via normal eventAck flow.
+	// Filtered events are auto-ACK'd (ZREM) to prevent unbounded queue growth.
 	if botKind == BotKindApp && len(results) > 0 {
 		filtered := make([]*eventResp, 0, len(results))
+		var filteredIDs []string
 		for _, r := range results {
 			if r.Message != nil && r.Message.ChannelType != 0 && r.Message.ChannelType != common.ChannelTypePerson.Uint8() {
-				continue // skip non-DM message events
+				filteredIDs = append(filteredIDs, fmt.Sprintf("%d", r.EventID))
+				continue
 			}
 			filtered = append(filtered, r)
+		}
+		if len(filteredIDs) > 0 {
+			key := fmt.Sprintf("%s%s", robotEventPrefix, robotID)
+			for _, id := range filteredIDs {
+				if err := ba.ctx.GetRedisConn().ZRemRangeByScore(key, id, id); err != nil {
+					ba.Warn("auto-ACK filtered event failed", zap.String("eventID", id), zap.Error(err))
+				}
+			}
 		}
 		results = filtered
 	}

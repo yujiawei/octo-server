@@ -293,9 +293,13 @@ func (ba *BotAPI) botSpaceMembers(c *wkhttp.Context) {
 		spaceID = spaceIDs[0]
 	} else {
 		var count int
-		ba.ctx.DB().SelectBySql(
+		if spErr := ba.ctx.DB().SelectBySql(
 			"SELECT COUNT(*) FROM space_member WHERE space_id=? AND uid=? AND status=1", spaceID, robotID,
-		).LoadOne(&count)
+		).LoadOne(&count); spErr != nil {
+			ba.Error("query space membership failed", zap.Error(spErr))
+			c.ResponseError(errors.New("查询空间成员失败"))
+			return
+		}
 		if count == 0 {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "bot is not a member of this space"})
 			return
@@ -361,9 +365,12 @@ func (ba *BotAPI) botGroupCreate(c *wkhttp.Context) {
 
 	if req.SpaceID == "" {
 		var spaceIDs []string
-		ba.ctx.DB().SelectBySql(
+		_, spErr := ba.ctx.DB().SelectBySql(
 			"SELECT space_id FROM space_member WHERE uid=? AND status=1 LIMIT 1", robotID,
 		).Load(&spaceIDs)
+		if spErr != nil {
+			ba.Error("query bot space failed", zap.Error(spErr))
+		}
 		if len(spaceIDs) > 0 {
 			req.SpaceID = spaceIDs[0]
 		}

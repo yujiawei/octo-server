@@ -921,12 +921,19 @@ func (ab *AppBot) applyBot(c *wkhttp.Context) {
 	}
 
 	// Rate limit: 10 apply requests per minute per user
-	// Note: Redis error → count=0 → rate limit bypassed (intentional fail-open for availability).
 	rateLimitKey := fmt.Sprintf("app_bot_apply_rate:%s", loginUID)
-	count, _ := ab.ctx.GetRedisConn().Incr(rateLimitKey)
+	count, redisErr := ab.ctx.GetRedisConn().Incr(rateLimitKey)
+	if redisErr != nil {
+		ab.Error("rate limit Redis error, denying request", zap.Error(redisErr))
+		c.ResponseError(errors.New("服务繁忙，请稍后再试"))
+		return
+	}
 	if count == 1 {
-		// First request in this window — set TTL. Only on first creation to avoid
-		// TTL refresh on every request (which would create a sliding window instead of fixed window).
+		// First request in this window — set TTL (fixed window, not sliding).
+		// TODO: If SetExpire fails here (Redis partial failure after successful INCR),
+		// the key persists without TTL and user is permanently rate-limited.
+		// Mitigation: key will be cleaned up on Redis restart. For a Lua-atomic
+		// solution, the redis client wrapper needs an Eval method.
 		ab.ctx.GetRedisConn().SetExpire(rateLimitKey, time.Minute)
 	}
 	if count > 10 {
@@ -992,7 +999,10 @@ func (ab *AppBot) applyBot(c *wkhttp.Context) {
 	if err != nil {
 		ab.Error("add friend (bot->user) failed", zap.Error(err))
 		// Rollback: remove the first direction to avoid half-state
-		_, _ = ab.ctx.DB().DeleteFrom("friend").Where("uid=? AND to_uid=?", loginUID, req.RobotUID).Exec()
+		if _, rbErr := ab.ctx.DB().DeleteFrom("friend").Where("uid=? AND to_uid=?", loginUID, req.RobotUID).Exec(); rbErr != nil {
+			ab.Error("friend rollback failed — one-directional friend record may remain",
+				zap.String("uid", loginUID), zap.String("toUID", req.RobotUID), zap.Error(rbErr))
+		}
 		c.ResponseError(errors.New("\u521b\u5efa\u597d\u53cb\u5173\u7cfb\u5931\u8d25"))
 		return
 	}
