@@ -26,6 +26,24 @@ func NewDB(ctx *config.Context) *DB {
 	}
 }
 
+// queryMessageByID 按 (channelID, channelType, messageID) 在分表里查单条消息正文。
+// 返回 nil 表示未命中（消息不存在或软删除）；err 仅用于真正的 DB 错误。
+//
+// messageID 必须以字符串形式传入：底层 message[N] 表的 message_id 列是
+// VARCHAR(20) 且 UNIQUE 索引建在该列上。MySQL 在字符串列与数值参数比较时会做
+// 隐式类型转换，导致索引无法使用，EXPLAIN 退化成 type=ALL 全表扫。
+// 调用方在解析 path 后用 strconv.FormatInt 转一道。
+func (d *DB) queryMessageByID(channelID string, channelType uint8, messageID string) (*messageModel, error) {
+	var model *messageModel
+	_, err := d.session.Select("*").From(d.getTable(channelID)).
+		Where("channel_id=? AND channel_type=? AND message_id=? AND is_deleted=0", channelID, channelType, messageID).
+		Load(&model)
+	if err != nil {
+		return nil, err
+	}
+	return model, nil
+}
+
 func (d *DB) queryMaxMessageSeq(channelID string, channelType uint8) (uint32, error) {
 	var maxMessageSeq uint32
 	err := d.session.Select("IFNULL(max(message_seq),0)").From(d.getTable(channelID)).Where("channel_id=? and channel_type=?", channelID, channelType).LoadOne(&maxMessageSeq)

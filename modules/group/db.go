@@ -170,6 +170,19 @@ func (d *DB) ExistMember(uid string, groupNo string) (bool, error) {
 	return count > 0, err
 }
 
+// ExistMemberActive 群成员是否在群内且处于正常状态（白名单语义，fail closed）。
+// 与 ExistMember 的差别：额外要求 status=GroupMemberStatusNormal，明确排除
+// Blacklist 以及未来可能新增的非正常状态。
+// 用于绕过 IM 层（直接读本地分表）的接口，避免被拉黑用户通过本地直查
+// 拿到本应被 IM datasource 拦截的消息。
+func (d *DB) ExistMemberActive(uid string, groupNo string) (bool, error) {
+	var count int64
+	_, err := d.session.Select("count(*)").From("group_member").
+		Where("group_no=? and uid=? and is_deleted=0 and status=?",
+			groupNo, uid, common.GroupMemberStatusNormal).Load(&count)
+	return count > 0, err
+}
+
 func (d *DB) existMembers(groupNos []string, uid string) ([]string, error) {
 	var results []string
 	_, err := d.session.Select("group_no").From("group_member").Where("group_no in ? and uid=? and is_deleted=0", groupNos, uid).Load(&results)

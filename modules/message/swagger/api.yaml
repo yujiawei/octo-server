@@ -1270,6 +1270,90 @@ paths:
             $ref: "#/definitions/response"
       security:
         - token: []
+  /groups/{group_no}/messages/{message_id}:
+    get:
+      tags:
+        - "message"
+      summary: "查询群单条消息"
+      description: |
+        按 (group_no, message_id) 查群内单条消息，类似 Discord
+        GET /channels/{channel.id}/messages/{message.id}。
+        数据源为本地 message 分表，调用方必须是该群成员。
+        以下任一情况返回 404：消息不存在、撤回、双向删除、本人删除、
+        频道清除偏移截断、消息过期、payload.visibles 白名单未命中。
+      operationId: "get group message"
+      produces:
+        - "application/json"
+      parameters:
+        - in: "path"
+          name: "group_no"
+          type: string
+          description: "群编号（32 位 hex）"
+          required: true
+        - in: "path"
+          name: "message_id"
+          type: string
+          description: "消息 ID（int64，雪花算法生成的全局唯一 ID）"
+          required: true
+      responses:
+        200:
+          description: "返回"
+          schema:
+            $ref: "#/definitions/syncMessage"
+        400:
+          description: "参数错误（group_no / message_id 格式非法）"
+          schema:
+            $ref: "#/definitions/response"
+        404:
+          description: "消息不存在 / 对当前用户不可见 / 非群成员或被拉黑 / 群非正常状态（解散/禁用）"
+          schema:
+            $ref: "#/definitions/response"
+      security:
+        - token: []
+  /groups/{group_no}/threads/{short_id}/messages/{message_id}:
+    get:
+      tags:
+        - "message"
+      summary: "查询子区单条消息"
+      description: |
+        按 (group_no, short_id, message_id) 查子区内单条消息。
+        鉴权要求：调用方必须是父群正常成员（非黑名单），且子区存在且未被删除。
+        归档子区的历史消息仍可读取（与批量同步路径行为一致）。
+        404 条件同群单条消息接口；额外：子区不存在或已删除也返回 404。
+      operationId: "get thread message"
+      produces:
+        - "application/json"
+      parameters:
+        - in: "path"
+          name: "group_no"
+          type: string
+          description: "父群编号（32 位 hex）"
+          required: true
+        - in: "path"
+          name: "short_id"
+          type: string
+          description: "子区 short_id（15-20 位数字）"
+          required: true
+        - in: "path"
+          name: "message_id"
+          type: string
+          description: "消息 ID（int64）"
+          required: true
+      responses:
+        200:
+          description: "返回"
+          schema:
+            $ref: "#/definitions/syncMessage"
+        400:
+          description: "参数错误（group_no / short_id / message_id 格式非法）"
+          schema:
+            $ref: "#/definitions/response"
+        404:
+          description: "子区已删除 / 消息不存在 / 对当前用户不可见 / 非群成员或被拉黑 / 群非正常状态（解散/禁用）"
+          schema:
+            $ref: "#/definitions/response"
+      security:
+        - token: []
   /reactions:
     post:
       tags:

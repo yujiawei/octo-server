@@ -218,6 +218,9 @@ type Message struct {
 	fileService    file.IService
 	channelService chservice.IService
 	threadDB       *thread.DB
+	// groupDB: 直查 group 表，区分"群不存在"和"群已解散"两种 404 情况，
+	// groupService.GetGroupWithGroupNo 把 nil 也包成 error 不便分辨。
+	groupDB *group.DB
 	mutex          sync.Mutex
 	stopChan       chan struct{}
 }
@@ -248,6 +251,7 @@ func New(ctx *config.Context) *Message {
 		fileService:    file.NewService(ctx),
 		channelService: channel.NewService(ctx),
 		threadDB:       thread.NewDB(ctx),
+		groupDB:        group.NewDB(ctx),
 		stopChan:       make(chan struct{}),
 	}
 	m.ctx.AddEventListener(event.GroupMemberAdd, m.handleGroupMemberAddEvent)
@@ -306,6 +310,17 @@ func (m *Message) Route(r *wkhttp.WKHttp) {
 	msg := r.Group("/v1/message", m.ctx.AuthMiddleware(r), uidLimit, spacepkg.SpaceMiddleware(m.ctx))
 	{
 		msg.POST("/send", m.sendMsg) // 代发消息
+	}
+	// 单条消息查询（Discord-style）
+	groups := r.Group("/v1/groups", m.ctx.AuthMiddleware(r), uidLimit)
+	{
+		groups.GET("/:group_no/messages/:message_id", m.getGroupMessage)
+		// thread 路由与 modules/thread/1module.go 同一 feature flag 对齐：
+		// DM_THREAD_ON 关闭时 thread 模块不注册、thread 表迁移不跑，
+		// 此时若仍注册 GET 路由会让请求落到不存在的 thread 表上。
+		if threadFeatureEnabled() {
+			groups.GET("/:group_no/threads/:short_id/messages/:message_id", m.getThreadMessage)
+		}
 	}
 	m.ctx.AddMessagesListener(m.listenerMessages) // 监听消息
 	m.syncMessageReadedCount()
