@@ -532,7 +532,7 @@ func (u *User) uploadAvatar(c *wkhttp.Context) {
 				SpaceID string `db:"space_id"`
 			}
 			cnt, appErr := u.ctx.DB().SelectBySql(
-				"SELECT scope, IFNULL(space_id,'') as space_id FROM app_bot WHERE uid=? LIMIT 1", targetUID,
+				"SELECT scope, IFNULL(space_id,'') as space_id FROM app_bot WHERE uid=? AND status=1 LIMIT 1", targetUID,
 			).Load(&appBot)
 			if appErr != nil || cnt == 0 {
 				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "无权限修改该用户头像", "status": 403})
@@ -620,15 +620,6 @@ func (u *User) uploadAvatar(c *wkhttp.Context) {
 		u.Error("修改用户是否修改头像错误！", zap.Error(err))
 		c.ResponseError(errors.New("修改用户是否修改头像错误！"))
 		return
-	}
-	// Sync avatar path to app_bot record (best-effort, non-blocking).
-	// After upload, app_bot.avatar should reflect the upload endpoint path
-	// so that App Bot API responses return the correct avatar URL.
-	if _, syncErr := u.ctx.DB().UpdateBySql(
-		"UPDATE app_bot SET avatar=? WHERE uid=?",
-		u.ctx.GetConfig().GetAvatarPath(targetUID), targetUID,
-	).Exec(); syncErr != nil {
-		u.Warn("sync avatar to app_bot failed (non-fatal)", zap.Error(syncErr), zap.String("uid", targetUID))
 	}
 	c.ResponseOK()
 }

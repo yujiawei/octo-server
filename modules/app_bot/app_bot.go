@@ -302,7 +302,6 @@ func (ab *AppBot) createBot(c *wkhttp.Context, scope, spaceID string) {
 		ID          string `json:"id" binding:"required"`
 		DisplayName string `json:"display_name" binding:"required"`
 		Description string `json:"description"`
-		Avatar      string `json:"avatar"`
 		WelcomeMsg  string `json:"welcome_msg"`
 	}
 	if err := c.BindJSON(&req); err != nil {
@@ -339,7 +338,6 @@ func (ab *AppBot) createBot(c *wkhttp.Context, scope, spaceID string) {
 		UID:         uid,
 		DisplayName: req.DisplayName,
 		Description: req.Description,
-		Avatar:      req.Avatar,
 		Scope:       scope,
 		SpaceID:     spaceID,
 		Status:      StatusDraft,
@@ -385,17 +383,21 @@ func (ab *AppBot) createBot(c *wkhttp.Context, scope, spaceID string) {
 		Robot:    1,
 	}); err != nil {
 		// Rollback: remove app_bot record and invalidate IM token
-		ab.db.deleteAppBot(req.ID)
+		if delErr := ab.db.deleteAppBot(req.ID); delErr != nil {
+			ab.Warn("rollback deleteAppBot failed", zap.Error(delErr), zap.String("id", req.ID))
+		}
 		revokeToken, tokenErr := generateAppBotToken()
 		if tokenErr != nil {
 			revokeToken = fmt.Sprintf("REVOKED-%s-%d", uid, time.Now().UnixNano())
 		}
-		ab.ctx.UpdateIMToken(config.UpdateIMTokenReq{
+		if _, imErr := ab.ctx.UpdateIMToken(config.UpdateIMTokenReq{
 			UID:         uid,
 			Token:       revokeToken,
 			DeviceFlag:  config.APP,
 			DeviceLevel: config.DeviceLevelMaster,
-		})
+		}); imErr != nil {
+			ab.Warn("rollback UpdateIMToken failed", zap.Error(imErr), zap.String("uid", uid))
+		}
 		ab.Error("create user record for app bot failed, rolled back", zap.Error(err), zap.String("uid", uid))
 		c.ResponseError(errors.New("create app bot failed: user record creation failed"))
 		return
@@ -531,7 +533,6 @@ func (ab *AppBot) updateBot(c *wkhttp.Context) {
 	var req struct {
 		DisplayName *string `json:"display_name"`
 		Description *string `json:"description"`
-		Avatar      *string `json:"avatar"`
 		WelcomeMsg  *string `json:"welcome_msg"`
 	}
 	if err := c.BindJSON(&req); err != nil {
@@ -557,9 +558,6 @@ func (ab *AppBot) updateBot(c *wkhttp.Context) {
 	}
 	if req.Description != nil {
 		updates["description"] = *req.Description
-	}
-	if req.Avatar != nil {
-		updates["avatar"] = *req.Avatar
 	}
 	if req.WelcomeMsg != nil {
 		updates["welcome_msg"] = *req.WelcomeMsg
