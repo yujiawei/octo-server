@@ -1,102 +1,70 @@
-# Contributing to DMWork IM
+# Contributing to OCTO
 
-Thank you for your interest in contributing! Please follow these guidelines.
+Thanks for your interest in contributing to OCTO! 🐙 We welcome contributions of all sizes.
 
-## Before You Start
+## Getting Started
 
-### Claim the Issue First
+1. **Fork** the repo and create your branch from `main`.
+2. **Install dependencies** — see the project's README for setup instructions.
+3. **Make your changes** — follow existing code style.
+4. **Add tests** — if you're fixing a bug or adding a feature, please add tests.
+5. **Update docs** — if behavior changes, update the README/docs accordingly.
+6. **Open a Pull Request** — fill in the PR template.
 
-**Before writing any code, you must:**
+## Development Workflow
 
-1. **Comment on the issue** to claim it — say you're working on it
-2. **Describe your fix/approach** in the same comment
-3. **Wait for acknowledgment** if the issue has active discussion
+- All changes go through a Pull Request.
+- PRs must pass CI before merging.
+- PRs require at least one approving review from a maintainer.
+- We use squash-merge to keep history clean.
 
-This prevents duplicate work. If someone else has already claimed an issue, coordinate with them or pick a different one.
+## Commit Messages
 
-Example comment:
+Follow [Conventional Commits](https://www.conventionalcommits.org/):
+
 ```
-I'll take this one.
-
-**Approach:** Replace `ioutil.ReadAll` with `io.ReadAll` across all files.
-Will also update imports to remove `io/ioutil`.
-```
-
-### Check for Existing PRs
-
-Before starting work on an issue, check if there's already an open PR for it.
-
-## Fork Workflow
-
-**Do NOT clone the main repository directly. Use the fork workflow:**
-
-```bash
-# 1. Fork the repository on GitHub (click "Fork" button)
-
-# 2. Clone YOUR fork
-git clone git@github.com:YOUR_USERNAME/dmworkim.git
-cd dmworkim
-
-# 3. Add upstream remote
-git remote add upstream https://github.com/Mininglamp-OSS/octo-server.git
-
-# 4. Create a feature branch from upstream/main
-git fetch upstream
-git checkout -b fix/issue-XX upstream/main
-
-# 5. Make your changes, commit, and push to YOUR fork
-git push origin fix/issue-XX
-
-# 6. Open a PR from your fork to Mininglamp-OSS/octo-server main branch
-gh pr create --repo Mininglamp-OSS/octo-server
+feat: add user presence API
+fix: resolve message ordering race condition
+docs: update README install steps
+chore: bump dependency versions
 ```
 
-### Keeping Your Fork Updated
+## Pull Request Description
 
-```bash
-git fetch upstream
-git checkout main
-git merge upstream/main
-git push origin main
-```
-
-## Branch Naming
-
-- Bug fixes: `fix/issue-XX-short-description`
-- Features: `feat/short-description`
-- Chores: `chore/short-description`
-
-## Pull Requests
-
-### Requirements
-
-- **One PR, one concern** — don't mix unrelated changes
-- **Reference the issue** — use `Closes #XX` in the PR description
-- **Test your changes** — build and verify locally
-- **Describe what and why** — not just what you changed, but why
-
-### PR Template
-
-The repository provides a PR template. Please fill it out completely.
-
-### AI-Assisted Contributions
-
-If you used AI tools:
-- Note it in the PR description
-- Indicate testing level (untested / lightly tested / fully tested)
-- Confirm you understand the code changes
-
-## Bug Reports vs Feature Requests
-
-- **Bugs** → Fix directly via PR (after claiming the issue)
-- **Features / Architecture changes** → Open a Discussion first, get agreement, then implement
+- Describe **what** you changed and **why**.
+- Reference any related issues (e.g. `Fixes #123`).
+- Include screenshots for UI changes.
+- **Write PR descriptions in English** to keep the history accessible to the global community.
 
 ## Code Style
 
-- Go code follows standard `gofmt` formatting
-- Keep changes minimal and focused
-- Don't introduce new dependencies without discussion
+- **Go**: `gofmt` + `golangci-lint`
+- **TypeScript/JavaScript**: Prettier + ESLint (config in repo)
+- **Swift**: SwiftFormat
+- **Kotlin**: ktlint / Android Studio default
 
-## Security
+## Reporting Bugs
 
-For security vulnerabilities, **do not open a public issue**. See [SECURITY.md](SECURITY.md).
+Open a GitHub issue using the **Bug Report** template. Include:
+
+- Expected vs actual behavior
+- Steps to reproduce
+- Environment (OS, version, etc.)
+- Logs/screenshots if relevant
+
+## Suggesting Features
+
+Open a GitHub issue using the **Feature Request** template. Explain the
+use case and why existing features don't solve it.
+
+## License
+
+By contributing, you agree that your contributions will be licensed under the
+project's [Apache License 2.0](LICENSE).
+
+## Questions?
+
+- Open a [GitHub Discussion](https://github.com/orgs/Mininglamp-OSS/discussions)
+- Read the [docs](https://docs.octo.chat) _(coming soon)_
+
+Thanks for helping make OCTO better! 🚀

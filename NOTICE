@@ -1,0 +1,57 @@
+OCTO Server
+Copyright 2026 MININGLAMP Technology and the OCTO contributors
+
+This product includes software developed by the following projects:
+
+* TangSengDaoDaoServer
+  https://github.com/TangSengDaoDao/TangSengDaoDaoServer
+  Copyright TangSengDaoDao contributors
+  Licensed under the Apache License, Version 2.0
+  OCTO Server is a derivative work with significant modifications.
+
+* WuKongIM
+  https://github.com/WuKongIM/WuKongIM
+  Copyright WuKongIM contributors
+  Licensed under the Apache License, Version 2.0
+  Used as the underlying real-time messaging core.
+
+See LICENSE for full license text.
+
+--------------------------------------------------------------------
+Third-party Go module dependencies requiring attribution
+--------------------------------------------------------------------
+
+The following direct dependencies are licensed under Apache 2.0:
+  - firebase.google.com/go (Google)
+  - github.com/prometheus/client_golang
+  - github.com/coreos/go-oidc
+  - github.com/minio/minio-go
+  - google.golang.org/grpc, protobuf, api
+  - go.opencensus.io
+
+The following direct dependencies are licensed under MPL-2.0:
+  - github.com/hashicorp/errwrap
+  - github.com/hashicorp/go-multierror
+  - github.com/hashicorp/hcl
+
+Other direct dependencies use permissive licenses (MIT / BSD-2 / BSD-3 / ISC):
+  - github.com/gin-gonic/gin, spf13/viper, spf13/cast
+  - github.com/go-redis/redis, go-sql-driver/mysql, gocraft/dbr
+  - github.com/rubenv/sql-migrate, mattn/go-sqlite3
+  - github.com/sideshow/apns2, sendgrid/rest
+  - github.com/tencentyun/qcloud-cos-sts-sdk, aliyun/aliyun-oss-go-sdk
+  - github.com/qiniu/go-sdk, alibabacloud-go/*
+  - github.com/olivere/elastic, disintegration/imaging
+  - github.com/sourcegraph/syntaxhighlight, gomarkdown/markdown
+  - github.com/btcsuite/btcd/btcec (ISC) — secp256k1 signature verification
+  - github.com/ethereum/go-ethereum was previously used but has been
+    removed (originally LGPL-3.0) in favor of btcec/v2.
+  - go.uber.org/zap, opentracing-go
+  - golang.org/x/crypto, golang.org/x/oauth2, golang.org/x/sync, etc.
+
+For the exhaustive module-by-module license inventory, run
+`go-licenses csv ./...` or inspect each upstream's LICENSE file
+via `go.sum`.
+
+Frontend clients (octo-web) bundle
+additional UI and platform SDKs; see each client repository's NOTICE.

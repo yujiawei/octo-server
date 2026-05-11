@@ -1,0 +1,59 @@
+# -----------------------------------------------------------------------------
+# OCTO Server runtime config — minimal single-host deployment.
+# -----------------------------------------------------------------------------
+# This file is mounted over the legacy default path inside the container
+# (/home/configs/tsdd.yaml) so the Go binary picks it up without CLI flags.
+#
+# Values shared with MySQL / Redis / MinIO / WuKongIM match the service
+# names (not ports) on the `octo-net` bridge network declared in
+# docker-compose.yaml. Do not change those strings unless you also rename
+# the corresponding compose services.
+# -----------------------------------------------------------------------------
+
+# Runtime mode: debug | release
+# `release` turns off smsCode and tightens several safety checks.
+mode: "debug"
+
+# External HTTP base URL used when generating absolute links (QR codes,
+# email payloads, etc). Match your nginx-exposed hostname.
+external:
+  ip: "127.0.0.1"
+  baseURL: "http://octo.local:28080"
+  # web login URL (optional). Uncomment + set once you integrate octo-web.
+  # webLoginURL: "http://octo.local:28080/"
+
+# Test-only SMS verification code — any inbound SMS request will accept
+# this string. Leave empty or remove entirely before switching to release
+# mode; production smsProvider wiring lives further down this file.
+smsCode: "123456"
+
+# ---------- Database ---------------------------------------------------------
+db:
+  mysqlAddr: "root:CHANGE_ME_MYSQL_PASSWORD@tcp(mysql:3306)/octo?charset=utf8mb4&parseTime=true&loc=Local"
+  redisAddr: "redis:6379"
+  redisPass: ""
+
+# ---------- WuKongIM ---------------------------------------------------------
+wukongIM:
+  apiURL: "http://wukongim:5001"
+  # Populate if you have enabled `tokenAuthOn` on WuKongIM. See configs/wk.yaml.
+  managerToken: ""
+
+# ---------- Object storage (MinIO, S3-compatible) ----------------------------
+fileService: "minio"
+minio:
+  url: "http://minio:9000"
+  accessKeyID: "octoadmin"
+  secretAccessKey: "CHANGE_ME_MINIO_PASSWORD"
+
+# ---------- Logging ----------------------------------------------------------
+logger:
+  level: 2          # 1=debug 2=info 3=warn 4=error
+  dir: "./logs"
+  lineNum: false
+
+# ---------- Registration -----------------------------------------------------
+# Disable open registration in production or restrict to your mobile region.
+register:
+  off: false
+  onlyChina: false

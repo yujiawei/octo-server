@@ -3,7 +3,7 @@
 > **⚠️ 2026-05-10 起废弃（YUJ-382 / Aegis OIDC Phase 1）。**
 >
 > 本文档描述的 HMAC 回调链路（`/v1/internal/verification/complete`）和
-> 短时 JWT 签发（`/v1/internal/verify-token`）已随 dmwork-verify-service
+> 短时 JWT 签发（`/v1/internal/verify-token`）已随 octo-verify-service
 > 整体下线。新链路:Aegis IdP 在 ID Token / userinfo 里直接下发
 > `identity_verification` scope claims(`is_verified` / `verified_at` /
 > `verified_provider` / `legal_name` / `legal_email`),OIDC callback
@@ -118,7 +118,7 @@ Body（可选）：
 ```json
 {
   "token": "<HS256 JWT>",
-  "verify_url": "https://accounts.example.com/verify?token=<JWT>&return_to=<return_to>",
+  "verify_url": "https://accounts.xming.ai/verify?token=<JWT>&return_to=<return_to>",
   "expires_at": 1735862349
 }
 ```
@@ -186,7 +186,7 @@ JWT claims：
 | --- | --- | --- | --- |
 | `OCTO_INTERNAL_HMAC_SECRET` | Y（启用本链路时） | — | 与 verify-service 共享的 HMAC 密钥。未配时 `/v1/internal/verification/complete` 恒回 401（fail-closed）。 |
 | `OCTO_JWT_SECRET` | Y（启用本链路时） | — | 与 verify-service 共享的 HS256 JWT 密钥。未配时 `/v1/internal/verify-token` 恒回 503。 |
-| `OCTO_VERIFY_URL_BASE` | N | `https://accounts.example.com/verify` | verify-service 跳转基址。 |
+| `OCTO_VERIFY_URL_BASE` | N | `https://accounts.xming.ai/verify` | verify-service 跳转基址。 |
 | `OCTO_VERIFY_RETURN_TO_DEFAULT` | N | 空 | 客户端未传 `return_to` 时的默认值；为空则不挂参数。 |
 
 运维操作：从 verify-service 的 `.env` 拷贝 `OCTO_INTERNAL_HMAC_SECRET` 与 `OCTO_JWT_SECRET` 到 `dmworkim` 启动环境（k8s Secret / systemd EnvironmentFile / docker-compose `.env`）。
@@ -217,7 +217,7 @@ curl -X POST https://api.example.com/v1/internal/verify-token \
   -H "Authorization: <OCTO session token>" \
   -H "Content-Type: application/json" \
   -d '{"return_to":"https://api.example.com/me"}'
-# 期望: {"token":"...","verify_url":"https://accounts.example.com/verify?token=...&return_to=...","expires_at":...}
+# 期望: {"token":"...","verify_url":"https://accounts.xming.ai/verify?token=...&return_to=...","expires_at":...}
 ```
 
 ## 安全要点
@@ -230,6 +230,5 @@ curl -X POST https://api.example.com/v1/internal/verify-token \
 
 ## 相关
 
-- verify-service repo：`Mininglamp-OSS/octo-verify-service`（内部）
 - GH Issue：Mininglamp-OSS/octo-server#1300
 - Multica Issue：YUJ-354

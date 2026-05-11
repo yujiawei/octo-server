@@ -1,0 +1,31 @@
+# -----------------------------------------------------------------------------
+# WuKongIM configuration for the OCTO dev stack.
+# Mounted at /root/wukongim/wk.yaml inside the octo-wukongim container.
+# -----------------------------------------------------------------------------
+
+# debug | release | bench
+mode: "debug"
+
+# Require clients to present a token when connecting. Set to false for
+# purely local experimentation, but keep true for any shared environment.
+tokenAuthOn: true
+
+# External addresses that WuKongIM advertises. Override OCTO_EXTERNAL_IP in
+# the .env file to point at your LAN IP or public hostname. The values are
+# substituted at container start via the WK_EXTERNAL_IP env var above.
+external:
+  ip: "127.0.0.1"
+  wssAddr: ""
+
+# Monitor / Prometheus scraping (optional).
+monitor:
+  on: true
+  addr: "0.0.0.0:5300"
+
+# OCTO Server consumes WuKongIM events over gRPC.
+webhook:
+  grpcAddr: "octo-server:6979"
+
+# Keep the conversation module on so recent-conversation queries work.
+conversation:
+  on: true

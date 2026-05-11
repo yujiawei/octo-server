@@ -1,0 +1,217 @@
+# -----------------------------------------------------------------------------
+# OCTO Server · one-shot deployment stack (OSS)
+# -----------------------------------------------------------------------------
+# Brings up OCTO Server + all required dependencies behind an nginx reverse
+# proxy that serves a user-chosen domain (default: octo.local). Everything is
+# scoped under a dedicated Docker bridge so it does not collide with other
+# stacks on the host.
+#
+# Quick start (from the repository root):
+#
+#     cp docker/octo/.env.example docker/octo/.env
+#     # edit docker/octo/.env — at minimum change passwords + OCTO_MASTER_KEY
+#     cd docker/octo
+#     docker compose up -d
+#     # when healthy, visit http://${OCTO_DOMAIN}:${OCTO_HTTP_PORT}/api/v1/health
+#
+# Tear-down (removes volumes too):
+#
+#     docker compose down -v
+#
+# See docker/octo/README.md for the full walkthrough.
+# -----------------------------------------------------------------------------
+
+name: octo
+
+networks:
+  octo-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${OCTO_NETWORK_SUBNET:-172.28.0.0/16}
+
+volumes:
+  mysql-data:
+  redis-data:
+  minio-data:
+  wukongim-data:
+  server-logs:
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: octo-mysql
+    restart: unless-stopped
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_general_ci
+    environment:
+      TZ: ${TZ:-UTC}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-octo}
+    ports:
+      - "${OCTO_MYSQL_PORT:-23306}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - octo-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: octo-redis
+    restart: unless-stopped
+    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+    ports:
+      - "${OCTO_REDIS_PORT:-26379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - octo-net
+
+  minio:
+    image: minio/minio:latest
+    container_name: octo-minio
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-octoadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_SERVER_URL: ${MINIO_SERVER_URL:-http://localhost:29000}
+      MINIO_BROWSER_REDIRECT_URL: ${MINIO_BROWSER_REDIRECT_URL:-http://localhost:29001}
+    ports:
+      - "${OCTO_MINIO_API_PORT:-29000}:9000"
+      - "${OCTO_MINIO_CONSOLE_PORT:-29001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    networks:
+      - octo-net
+
+  wukongim:
+    # Dedicated WuKongIM instance for this OCTO stack. Do NOT reuse any
+    # pre-existing WuKongIM on the host — this one is pinned to an isolated
+    # network + port range.
+    image: wukongim/wukongim:latest
+    container_name: octo-wukongim
+    restart: unless-stopped
+    environment:
+      WK_MODE: ${WK_MODE:-debug}
+      WK_EXTERNAL_IP: ${OCTO_EXTERNAL_IP:-127.0.0.1}
+    ports:
+      - "${OCTO_WK_API_PORT:-25001}:5001"       # HTTP API
+      - "${OCTO_WK_TCP_PORT:-25100}:5100"       # TCP long-connection
+      - "${OCTO_WK_WS_PORT:-25200}:5200"        # WebSocket
+      - "${OCTO_WK_MONITOR_PORT:-25300}:5300"   # Monitor
+    volumes:
+      - wukongim-data:/root/wukongim
+      - ./configs/wk.yaml:/root/wukongim/wk.yaml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:5001/health >/dev/null 2>&1 || wget -q -O - http://localhost:5001/varz >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    networks:
+      - octo-net
+
+  octo-server:
+    # Build from the repository root. The resulting binary is statically linked
+    # (see ../../Dockerfile) and bundles assets/ + configs/ into /home.
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: octo-server:local
+    container_name: octo-server
+    restart: unless-stopped
+    command: ["api"]
+    environment:
+      TZ: ${TZ:-UTC}
+      # Required for credential encryption. Must be exactly 32 bytes.
+      # Generate with:  openssl rand -hex 16  (produces 32 ASCII chars).
+      OCTO_MASTER_KEY: ${OCTO_MASTER_KEY}
+      # YUJ-440: dmworkim code reads `DMWORK_MASTER_KEY` (modules/common/
+      # key_encryption.go) — legacy constant name predating OCTO rebrand.
+      # Alias OCTO_MASTER_KEY into DMWORK_MASTER_KEY so a single user-facing
+      # knob drives both. Future dmworkim PR should rename the constant or
+      # add an OCTO_MASTER_KEY fallback in-code, then this line can drop.
+      DMWORK_MASTER_KEY: ${OCTO_MASTER_KEY}
+      # --- optional overrides read by Viper (prefix TS_) --------------------
+      TS_WEBHOOK_SECRET_KEY: ${OCTO_WEBHOOK_SECRET_KEY:-}
+      # --- YUJ-440 (2026-05-11) P0-2 Docker deploy fix ---
+      # configs/octo-server.yaml ships with CHANGE_ME_* placeholders; the
+      # real credentials live in the .env file. Viper's AutomaticEnv with
+      # SetEnvPrefix("TS") promotes these TS_* vars to authoritative
+      # overrides over the yaml file, so OSS users only edit .env.
+      TS_DB_MYSQLADDR: "root:${MYSQL_ROOT_PASSWORD}@tcp(mysql:3306)/${MYSQL_DATABASE:-octo}?charset=utf8mb4&parseTime=true&loc=Local"
+      TS_DB_REDISADDR: "redis:6379"
+      TS_MINIO_ACCESSKEYID: "${MINIO_ROOT_USER:-octoadmin}"
+      TS_MINIO_SECRETACCESSKEY: "${MINIO_ROOT_PASSWORD}"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      wukongim:
+        condition: service_started
+      minio:
+        condition: service_healthy
+    ports:
+      - "${OCTO_SERVER_PORT:-28081}:8090"
+    volumes:
+      # The binary loads configs/tsdd.yaml by default (hard-coded in main.go).
+      # Until the source-side rename lands, mount our OSS config over that path.
+      - ./configs/octo-server.yaml:/home/configs/tsdd.yaml:ro
+      - server-logs:/home/logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:8090/v1/ping >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    networks:
+      - octo-net
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: octo-nginx
+    restart: unless-stopped
+    depends_on:
+      - octo-server
+    environment:
+      OCTO_DOMAIN: ${OCTO_DOMAIN:-octo.local}
+    ports:
+      - "${OCTO_HTTP_PORT:-28080}:80"
+      # Uncomment the next line + the ssl block in nginx/conf.d/octo.conf
+      # to serve HTTPS. You are responsible for supplying certificates.
+      # - "${OCTO_HTTPS_PORT:-28443}:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/templates:ro
+      # Optional: drop TLS certs here and reference them from octo.conf.
+      # - ./nginx/certs:/etc/nginx/certs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost/_nginx_up >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks:
+      - octo-net

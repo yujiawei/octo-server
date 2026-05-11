@@ -1,3 +1,12 @@
+# .gitmodules — YUJ-435 P0-1 overlay (2026-05-11, Yu decision)
+#
+# Internal source has `.gitmodules` pointing at `yujiawei/dmwork-adapters.git`
+# (Yu's personal PRIVATE fork). Publishing that would leak the private URL
+# + author handle and break `git clone --recursive` for every OSS user.
+#
+# This overlay file replaces the internal `.gitmodules` in the published tree.
+# The submodule path (`adapters/openclaw-channel-dmwork`) is unchanged so the
+# existing subtree stays valid; only the URL is rewritten to the OSS target.
 [submodule "adapters/openclaw-channel-dmwork"]
-	path = adapters/openclaw-channel-dmwork
-	url = https://github.com/Mininglamp-OSS/octo-adapters.git
+    path = adapters/openclaw-channel-dmwork
+    url = https://github.com/Mininglamp-OSS/octo-adapters.git

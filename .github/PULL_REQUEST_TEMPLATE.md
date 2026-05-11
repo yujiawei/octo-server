@@ -1,19 +1,29 @@
-## What
-<!-- Briefly describe what this PR does -->
+## Summary
 
-## Why
-<!-- Why is this change needed? Related issue: Closes #xx -->
+<!-- What does this PR do? -->
 
-## How
-<!-- Brief technical approach (if not obvious from the diff) -->
+## Related Issue
+
+<!-- Link the issue this PR addresses, e.g. Fixes #123 -->
+
+## Changes
+
+<!-- Bullet list of concrete changes -->
+
+-
+-
 
 ## Testing
-- [ ] Local build passes
-- [ ] Related tests pass
-- [ ] No security risks
-- [ ] Verified in test environment (if applicable)
 
-## AI Assistance (if applicable)
-<!-- What AI tools were used? Testing level? Do you understand the code? -->
+<!-- How was this tested? Include commands, screenshots, or test output. -->
 
-## Screenshots (if UI changes)
+- [ ] Unit tests added/updated
+- [ ] Manually verified
+
+## Checklist
+
+- [ ] I have read [CONTRIBUTING.md](../CONTRIBUTING.md)
+- [ ] PR description is in English
+- [ ] Added tests for my changes
+- [ ] Updated documentation
+- [ ] Followed commit message conventions (Conventional Commits)
