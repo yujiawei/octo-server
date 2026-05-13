@@ -24,10 +24,10 @@ func TestBuildSystemMessage_ContainsAllRules(t *testing.T) {
 	msg := buildSystemMessage(true)
 	assert.Contains(t, msg, "无语音判定")
 	assert.Contains(t, msg, "禁止猜测")
+	assert.Contains(t, msg, "编辑指令识别")
+	assert.Contains(t, msg, "最小改写原则")
 	assert.Contains(t, msg, "语言润色")
 	assert.Contains(t, msg, "数据标签说明")
-	assert.Contains(t, msg, "编辑指令识别")
-	assert.Contains(t, msg, "追加新内容")
 	assert.Contains(t, msg, "词汇参考表使用规则")
 	assert.Contains(t, msg, "@提及识别")
 	assert.Contains(t, msg, "输出格式")
@@ -35,8 +35,8 @@ func TestBuildSystemMessage_ContainsAllRules(t *testing.T) {
 
 func TestBuildSystemMessage_ContainsExamples(t *testing.T) {
 	msg := buildSystemMessage(true)
-	assert.Contains(t, msg, "大背头")
-	assert.Contains(t, msg, "托马斯")
+	assert.Contains(t, msg, "甲某")
+	assert.Contains(t, msg, "乙某")
 	assert.Contains(t, msg, "嗯，好的，我知道了")
 }
 
@@ -45,24 +45,23 @@ func TestBuildSystemMessage_ContainsMentionRule(t *testing.T) {
 	assert.Contains(t, msg, "@提及识别")
 	assert.Contains(t, msg, "艾特")
 	assert.Contains(t, msg, "@Pythagoras")
-	assert.Contains(t, msg, "@Bob")
+	assert.Contains(t, msg, "@Boris")
 }
 
 func TestBuildSystemMessage_MentionV2Scenarios(t *testing.T) {
 	msg := buildSystemMessage(true)
 
 	// Positive scenarios present in prompt
-	assert.Contains(t, msg, "让皮皮处理")            // intent verb "让"
-	assert.Contains(t, msg, "Boris，方案怎么样")      // direct address
-	assert.Contains(t, msg, "跟Bob说明天开会改时间")   // preposition "跟"
-	assert.Contains(t, msg, "这个方案怎么样，Boris")  // trailing address
-	assert.Contains(t, msg, "让Boris不要动那个代码")  // stop action (still @)
-	assert.Contains(t, msg, "跟宜林说一下")          // partial name
+	assert.Contains(t, msg, "Boris，方案怎么样")       // direct address
+	assert.Contains(t, msg, "跟Bob说明天开会改时间")    // preposition "跟"
+	assert.Contains(t, msg, "这个方案怎么样，Boris")   // trailing address
+	assert.Contains(t, msg, "让Boris不要动那个代码")   // stop action (still @)
+	assert.Contains(t, msg, "跟宜林说一下")           // partial name
 
 	// Negative scenarios present in prompt
-	assert.Contains(t, msg, "Boris的代码写得不错")    // possessive, no @
+	assert.Contains(t, msg, "Boris的代码写得不错")     // possessive, no @
 	assert.Contains(t, msg, "告诉我Boris昨天说了什么") // asking third party, no @
-	assert.Contains(t, msg, "Boris那边先不急")        // delay intent, no @
+	assert.Contains(t, msg, "Boris那边先不急")         // delay intent, no @
 
 	// Structural elements
 	assert.Contains(t, msg, "通用判断原则")
@@ -255,7 +254,6 @@ func TestBuildUserMessage_Append_WithBothContexts(t *testing.T) {
 
 func TestBuildUserMessage_Append_DoesNotContainEditInstructions(t *testing.T) {
 	msg := buildUserMessage("append", "some text", "")
-	assert.NotContains(t, msg, "编辑指令")
 	assert.NotContains(t, msg, "删掉")
 	assert.NotContains(t, msg, "改成")
 }
@@ -397,7 +395,7 @@ func TestBuildSystemMessage_EmotionEmojiEnabled(t *testing.T) {
 func TestBuildSystemMessage_EmotionEmojiDisabled(t *testing.T) {
 	msg := buildSystemMessage(false)
 	assert.NotContains(t, msg, "5.3 情绪标注")
-	assert.NotContains(t, msg, "情绪/态度标注映射表")
+	assert.NotContains(t, msg, "忽略情绪标注视为转写失败")
 	// Other rules should still be present
 	assert.Contains(t, msg, "5.1 标点必须匹配语音语气")
 	assert.Contains(t, msg, "5.2 句尾语气助词保留")
@@ -420,9 +418,20 @@ func TestBuildSystemMessage_EmotionDisabled_CustomPrompt(t *testing.T) {
 
 	msg := buildSystemMessage(false)
 	assert.NotContains(t, msg, "5.3 情绪标注")
-	assert.NotContains(t, msg, "情绪/态度标注映射表")
+	assert.NotContains(t, msg, "忽略情绪标注视为转写失败")
 	assert.Contains(t, msg, "Custom prefix.")
 	assert.Contains(t, msg, "Custom suffix.")
+}
+
+func TestBuildSystemMessage_EmotionDisabled_NoEmotionSelfCheck(t *testing.T) {
+	msg := buildSystemMessage(false)
+	assert.NotContains(t, msg, "情绪检查")
+	assert.NotContains(t, msg, "情绪标注自查")
+	assert.NotContains(t, msg, "音频是否有明显情绪")
+	// Non-emotion self-check items must still be present
+	assert.Contains(t, msg, "书面化检查")
+	assert.Contains(t, msg, "逐字忠实检查")
+	assert.Contains(t, msg, "模式检查")
 }
 
 // --- New rule 5 / examples tests ---
@@ -447,7 +456,9 @@ func TestBuildSystemMessage_ContainsNewExamples(t *testing.T) {
 func TestBuildSystemMessage_OutputSelfCheck(t *testing.T) {
 	msg := buildSystemMessage(true)
 	assert.Contains(t, msg, "书面化检查")
-	assert.Contains(t, msg, "语气保真检查")
+	assert.Contains(t, msg, "逐字忠实检查")
+	assert.Contains(t, msg, "模式检查")
+	assert.Contains(t, msg, "情绪标注自查")
 }
 
 func TestTaskEdit_ContainsEmotionReference(t *testing.T) {
@@ -458,7 +469,7 @@ func TestTaskEditOnly_ContainsEmotionReference(t *testing.T) {
 	assert.Contains(t, taskEditOnly, "包括语气保真与情绪标注")
 }
 
-// --- Issue #1327: Space preservation in names with parentheses ---
+// --- Space preservation in @mention ---
 
 func TestBuildSystemMessage_SpacePreservationRule(t *testing.T) {
 	msg := buildSystemMessage(true)
@@ -467,13 +478,9 @@ func TestBuildSystemMessage_SpacePreservationRule(t *testing.T) {
 	assert.Contains(t, msg, "空格保真铁律")
 	assert.Contains(t, msg, "有空格就保留空格，没有空格绝对不能添加空格")
 
-	// Positive examples: both with-space and without-space cases
-	assert.Contains(t, msg, `成员列表写 "王磊(Rock)"（无空格）→ 输出 @王磊(Rock)`)
-	assert.Contains(t, msg, `成员列表写 "Li.Wei (李伟)"（有空格）→ 输出 @Li.Wei (李伟)`)
-
-	// Negative examples (forbidden patterns)
-	assert.Contains(t, msg, `禁止：将 "王磊(Rock)" 输出为 "王磊 (Rock)"`)
-	assert.Contains(t, msg, `禁止：将 "Li.Wei (李伟)" 输出为 "Li.Wei(李伟)"`)
+	// EXAMPLE demonstrates both with-space and without-space cases
+	assert.Contains(t, msg, "tomas.fu (托马斯.福)")
+	assert.Contains(t, msg, "王磊(Rock)")
 }
 
 func TestBuildSystemMessage_MentionExampleWithParenNoSpace(t *testing.T) {
@@ -504,9 +511,155 @@ func TestBuildUserMessage_ParenNameInMemberVocabulary(t *testing.T) {
 	assert.Contains(t, sysMsg, "原样输出")
 }
 
-func TestBuildSystemMessage_PartialNameRuleStrength(t *testing.T) {
+func TestBuildSystemMessage_PartialNameRule(t *testing.T) {
 	msg := buildSystemMessage(true)
 
-	// Rule 3 (partial match) must also emphasize verbatim copy
-	assert.Contains(t, msg, "不可自行格式化或调整空格")
+	// Rule 3 (partial match) must emphasize verbatim copy from member list
+	assert.Contains(t, msg, "原样输出该成员在列表中的完整条目")
+}
+
+// --- v5 + example data isolation tests ---
+
+func TestSystemPromptContainsExampleIsolationDeclaration(t *testing.T) {
+	msg := buildSystemMessage(true)
+	assert.Contains(t, msg, "⚠️ 重要声明（最高优先级）")
+	assert.Contains(t, msg, "<EXAMPLE>")
+	assert.Contains(t, msg, "绝对禁止将 <EXAMPLE> 内的任何人名、映射关系应用到实际转写输出中")
+}
+
+func TestSystemPromptExampleSectionsAreWrapped(t *testing.T) {
+	msg := buildSystemMessage(true)
+
+	// Count structural EXAMPLE tags (on their own line) vs inline mentions
+	openCount := strings.Count(msg, "\n<EXAMPLE>\n")
+	closeCount := strings.Count(msg, "\n</EXAMPLE>\n")
+	// Handle potential tag at end of string without trailing newline
+	if strings.HasSuffix(msg, "\n</EXAMPLE>") {
+		closeCount++
+	}
+	assert.GreaterOrEqual(t, openCount, 4, "at least 4 EXAMPLE sections expected")
+	assert.Equal(t, openCount, closeCount, "EXAMPLE open/close tags must be balanced")
+
+	// Verify tags alternate correctly: every <EXAMPLE> is closed before the next opens
+	remaining := msg
+	for i := 0; i < openCount; i++ {
+		openIdx := strings.Index(remaining, "\n<EXAMPLE>\n")
+		assert.True(t, openIdx >= 0, "expected <EXAMPLE> tag #%d", i+1)
+		remaining = remaining[openIdx+len("\n<EXAMPLE>\n"):]
+		closeIdx := strings.Index(remaining, "\n</EXAMPLE>")
+		nextOpen := strings.Index(remaining, "\n<EXAMPLE>\n")
+		assert.True(t, closeIdx >= 0, "expected </EXAMPLE> for tag #%d", i+1)
+		if nextOpen >= 0 {
+			assert.True(t, closeIdx < nextOpen,
+				"</EXAMPLE> must come before next <EXAMPLE> (tag #%d)", i+1)
+		}
+		remaining = remaining[closeIdx+len("\n</EXAMPLE>"):]
+	}
+
+	// Verify key example content is inside <EXAMPLE>...</EXAMPLE> blocks
+	exampleContents := []string{
+		"请把销售额从120",
+		"嗯甲某",
+		"甲某负责前端",
+		"@Pythagoras 看一下",
+	}
+	for _, content := range exampleContents {
+		idx := strings.Index(msg, content)
+		assert.True(t, idx >= 0, "content %q must exist in prompt", content)
+		before := msg[:idx]
+		after := msg[idx:]
+		lastOpen := strings.LastIndex(before, "\n<EXAMPLE>\n")
+		lastClose := strings.LastIndex(before, "\n</EXAMPLE>")
+		nextClose := strings.Index(after, "\n</EXAMPLE>")
+		assert.True(t, lastOpen > lastClose,
+			"content %q must be after an unclosed <EXAMPLE>", content)
+		assert.True(t, nextClose >= 0,
+			"content %q must have a closing </EXAMPLE> after it", content)
+	}
+
+	// Verify no example-style keywords appear outside <EXAMPLE> blocks
+	exampleKeywords := []string{"示例1", "示例2", "正确输出：", "❌ 错误输出：", "❌ 错误："}
+	outsideText := extractTextOutsideExampleTags(msg)
+	for _, kw := range exampleKeywords {
+		assert.NotContains(t, outsideText, kw,
+			"example keyword %q must not appear outside <EXAMPLE> blocks", kw)
+	}
+}
+
+func extractTextOutsideExampleTags(text string) string {
+	var outside strings.Builder
+	remaining := text
+	for {
+		openIdx := strings.Index(remaining, "\n<EXAMPLE>\n")
+		if openIdx < 0 {
+			outside.WriteString(remaining)
+			break
+		}
+		outside.WriteString(remaining[:openIdx])
+		remaining = remaining[openIdx+len("\n<EXAMPLE>\n"):]
+		closeIdx := strings.Index(remaining, "\n</EXAMPLE>")
+		if closeIdx < 0 {
+			break
+		}
+		remaining = remaining[closeIdx+len("\n</EXAMPLE>"):]
+	}
+	return outside.String()
+}
+
+func TestSystemPromptContainsEditInstructionRecognition(t *testing.T) {
+	msg := buildSystemMessage(true)
+	assert.Contains(t, msg, "编辑指令识别")
+	assert.Contains(t, msg, "追加新内容")
+	assert.Contains(t, msg, "在edit模式下")
+}
+
+func TestAppendMode_NoEditModeTrigger(t *testing.T) {
+	sysMsg := buildSystemMessage(true)
+	assert.NotContains(t, sysMsg, "当用户消息中包含 <input_buffer> 时，你处于")
+	assert.Contains(t, sysMsg, "在 edit 模式下")
+	assert.Contains(t, sysMsg, "在edit模式下")
+}
+
+func TestEditOnlyMode_NoAppendFallback(t *testing.T) {
+	sysMsg := buildSystemMessage(true)
+	assert.NotContains(t, sysMsg, "将语音转写内容追加到 ORIGINAL 末尾")
+	assert.NotContains(t, sysMsg, "你必须输出完整文本，包含 ORIGINAL 部分")
+}
+
+func TestSystemPromptContainsMinimalRewriteRule(t *testing.T) {
+	msg := buildSystemMessage(true)
+	assert.Contains(t, msg, "最小改写原则（逐字忠实）")
+	assert.Contains(t, msg, "严格保持原句序")
+	assert.Contains(t, msg, "不得调换语序")
+}
+
+func TestSystemPromptContainsContentWordProtection(t *testing.T) {
+	msg := buildSystemMessage(true)
+	assert.Contains(t, msg, "请把")
+	assert.Contains(t, msg, "麻烦")
+	assert.Contains(t, msg, "实义词")
+	assert.Contains(t, msg, "礼貌用语是实义内容，不是填充词")
+}
+
+func TestSystemPromptContainsArabicNumeralRule(t *testing.T) {
+	msg := buildSystemMessage(true)
+	assert.Contains(t, msg, "阿拉伯数字")
+	assert.Contains(t, msg, "→ 120")
+	assert.Contains(t, msg, "→ 20%")
+}
+
+func TestSystemPromptContainsEmotionMandatoryDeclaration(t *testing.T) {
+	msg := buildSystemMessage(true)
+	assert.Contains(t, msg, "忽略情绪标注视为转写失败")
+	assert.Contains(t, msg, "必须执行")
+}
+
+func TestSystemPromptFillerWordZeroTolerance(t *testing.T) {
+	msg := buildSystemMessage(true)
+	assert.Contains(t, msg, "零容忍")
+	assert.Contains(t, msg, "必须彻底删除")
+	assert.Contains(t, msg, "句首")
+	assert.Contains(t, msg, "处理规则")
+	assert.Contains(t, msg, "保留（表示肯定）")
+	assert.Contains(t, msg, "保留（表示疑问）")
 }
