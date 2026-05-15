@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -26,11 +27,40 @@ const minioDefaultRegion = "us-east-1"
 // known prefix from `allowedMinioBuckets`.
 const minioDefaultBucket = "file"
 
+// minioBucketAlreadyOwnedByYou is the S3 error code returned when MakeBucket
+// races with another caller that already created the same bucket under the
+// same credentials. Treated as a benign no-op by `ensureBucket`.
+const minioBucketAlreadyOwnedByYou = "BucketAlreadyOwnedByYou"
+
+// readOnlyAnonymousPolicy is the bucket policy applied to every auto-created
+// bucket: anonymous principals can GET objects, but uploads and deletes
+// remain authenticated. Identical to the policy that the legacy `UploadFile`
+// path used to inline.
+const readOnlyAnonymousPolicy = `{
+	"Version": "2012-10-17",
+	"Statement": [{
+		"Effect": "Allow",
+		"Principal": {
+			"AWS": ["*"]
+		},
+		"Action": ["s3:GetObject"],
+		"Resource": ["arn:aws:s3:::%s/*"]
+	}]
+}`
+
 // ServiceMinio 文件上传
 type ServiceMinio struct {
 	log.Log
 	ctx            *config.Context
 	downloadClient *http.Client
+
+	// bucketLocks serializes ensureBucket calls per bucket so concurrent
+	// uploads to a fresh bucket cannot double-create or race the
+	// SetBucketPolicy step. The map is keyed by bucket name; values are
+	// `*sync.Mutex` lazily inserted on first use via LoadOrStore. The map
+	// itself is never deleted from — bucket count is bounded by the
+	// allow-list, so growth is O(allowed buckets).
+	bucketLocks sync.Map
 }
 
 // NewServiceMinio NewServiceMinio
@@ -42,6 +72,50 @@ func NewServiceMinio(ctx *config.Context) *ServiceMinio {
 			Timeout: time.Second * 30,
 		},
 	}
+}
+
+// ensureBucket guarantees that `bucket` exists on the MinIO server and has
+// the read-only anonymous GET policy applied. Safe to call concurrently for
+// the same bucket — a per-bucket mutex serializes the BucketExists / MakeBucket
+// / SetBucketPolicy sequence so two parallel callers never double-create or
+// race the policy update. The `BucketAlreadyOwnedByYou` S3 response is
+// swallowed as a benign no-op for the case where another process (or another
+// node sharing these credentials) won the create race.
+func (sm *ServiceMinio) ensureBucket(ctx context.Context, client *minio.Client, bucket string) error {
+	mtxIface, _ := sm.bucketLocks.LoadOrStore(bucket, &sync.Mutex{})
+	mtx := mtxIface.(*sync.Mutex)
+	mtx.Lock()
+	defer mtx.Unlock()
+
+	exists, err := client.BucketExists(ctx, bucket)
+	if err != nil {
+		sm.Error(fmt.Sprintf("检测 %s目录是否存在错误", bucket), zap.Error(err))
+		return err
+	}
+	if exists {
+		return nil
+	}
+
+	if err := client.MakeBucket(ctx, bucket, minio.MakeBucketOptions{Region: minioDefaultRegion}); err != nil {
+		// Another caller (different process / different node sharing the
+		// same credentials) may have created the bucket between our
+		// BucketExists call and our MakeBucket call. Treat that specific
+		// S3 response as a no-op rather than a hard failure.
+		if minio.ToErrorResponse(err).Code == minioBucketAlreadyOwnedByYou {
+			sm.Info("bucket already owned by us, skipping create", zap.String("bucket", bucket))
+		} else {
+			sm.Error(fmt.Sprintf("创建 %s目录失败", bucket), zap.Error(err))
+			return err
+		}
+	}
+
+	// Read-only public policy: allow anonymous download only. Upload and
+	// delete go through authenticated server-side credentials.
+	if err := client.SetBucketPolicy(ctx, bucket, fmt.Sprintf(readOnlyAnonymousPolicy, bucket)); err != nil {
+		sm.Error("设置minio文件读写权限错误", zap.Error(err))
+		return err
+	}
+	return nil
 }
 
 // UploadFile 上传文件
@@ -61,35 +135,8 @@ func (sm *ServiceMinio) UploadFile(filePath string, contentType string, contentD
 	}
 
 	bucketName, fileName := splitBucketAndObject(filePath, minioDefaultBucket, allowedMinioBuckets)
-	exists, err := minioClient.BucketExists(ctx, bucketName)
-	if err != nil {
-		sm.Error(fmt.Sprintf("检测 %s目录是否存在错误", bucketName))
+	if err := sm.ensureBucket(ctx, minioClient, bucketName); err != nil {
 		return nil, err
-	}
-	if !exists {
-		err = minioClient.MakeBucket(ctx, bucketName, minio.MakeBucketOptions{Region: minioDefaultRegion})
-		if err != nil {
-			sm.Error(fmt.Sprintf("创建 %s目录失败", bucketName))
-			return nil, err
-		}
-		// Read-only public policy: allow anonymous download only.
-		// Upload and delete go through authenticated server-side credentials.
-		policy := `{
-			"Version": "2012-10-17",
-			"Statement": [{
-				"Effect": "Allow",
-				"Principal": {
-					"AWS": ["*"]
-				},
-				"Action": ["s3:GetObject"],
-				"Resource": ["arn:aws:s3:::%s/*"]
-			}]
-		}`
-		err = minioClient.SetBucketPolicy(context.Background(), bucketName, fmt.Sprintf(policy, bucketName))
-		if err != nil {
-			sm.Error("设置minio文件读写权限错误", zap.Error(err))
-			return nil, err
-		}
 	}
 
 	opts := minio.PutObjectOptions{ContentType: contentType, PartSize: 10 * 1024 * 1024}
@@ -179,11 +226,9 @@ func rewriteToPublicHost(u *url.URL, publicBase string) *url.URL {
 
 // PresignedPutURL generates a presigned PUT URL the browser can use to
 // upload directly to MinIO, plus the matching anonymous GET URL for the
-// resulting object. Bucket auto-creation is *not* performed here — the
-// regular UploadFile path is responsible for ensuring the bucket exists
-// before any presigned PUT lands. In a fresh deployment, the first server
-// upload through UploadFile primes the bucket; subsequent presigned PUTs
-// against that bucket succeed.
+// resulting object. The target bucket is bootstrapped on first use via
+// `ensureBucket` so a presigned PUT against a fresh deployment never lands
+// on a NoSuchBucket response.
 func (sm *ServiceMinio) PresignedPutURL(objectPath string, contentType string, contentDisposition string, expires time.Duration) (uploadURL string, downloadURL string, err error) {
 	client, err := sm.newClient()
 	if err != nil {
@@ -197,6 +242,10 @@ func (sm *ServiceMinio) PresignedPutURL(objectPath string, contentType string, c
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+
+	if err := sm.ensureBucket(ctx, client, bucketName); err != nil {
+		return "", "", fmt.Errorf("预签名上传前的目录引导失败: %w", err)
+	}
 
 	var presigned *url.URL
 	if contentDisposition != "" || contentType != "" {
