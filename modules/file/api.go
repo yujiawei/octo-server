@@ -371,7 +371,37 @@ func (f *File) getFile(c *wkhttp.Context) {
 	c.Redirect(http.StatusFound, downloadURL)
 }
 
-// getUploadCredentials 返回预签名 PUT URL，供客户端直接上传文件，无需后端中转
+// getUploadCredentials 返回预签名 PUT URL，供客户端直接上传文件，无需后端中转。
+//
+// SigV4 / OSS signed-header contract — REQUIRED for the client:
+//
+// The returned `contentType` and (when present) `contentDisposition` are
+// included in the signed headers of the presigned PUT URL (see
+// service_minio.go `PresignedPutURL` and service_oss.go `PresignedPutURL`).
+// The browser / client MUST echo them verbatim as PUT request headers:
+//
+//	PUT <uploadUrl>
+//	Content-Type: <contentType from response>
+//	Content-Disposition: <contentDisposition from response, when set>
+//	<file bytes>
+//
+// Any deviation — omission, different value, alternate casing of the
+// value — produces `403 SignatureDoesNotMatch` (S3) or the OSS
+// equivalent at upload time, because those exact bytes are covered by
+// the canonical-headers section of the signature. This is enforced at
+// the storage layer; no amount of server-side retry can rescue a client
+// that does not echo them.
+//
+// Response shape:
+//   - method:             always "PUT"
+//   - uploadUrl:          presigned PUT URL (consume within expiresIn seconds)
+//   - downloadUrl:        anonymous GET URL for the resulting object
+//   - contentType:        REQUIRED echo as PUT `Content-Type` header
+//   - contentDisposition: REQUIRED echo as PUT `Content-Disposition`
+//                         header when present (omitted when empty)
+//   - key:                final S3/OSS object key
+//   - expiresIn:          PUT URL validity in seconds
+//   - expiredTime:        absolute expiry, unix seconds
 func (f *File) getUploadCredentials(c *wkhttp.Context) {
 	fileType := c.Query("type")
 	uploadPath := c.Query("path")
