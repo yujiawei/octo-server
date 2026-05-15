@@ -4,8 +4,9 @@ import "testing"
 
 func TestSplitBucketAndObject(t *testing.T) {
 	allowed := map[string]bool{
-		"chat": true,
-		"file": true,
+		"chat":     true,
+		"file":     true,
+		"download": true,
 	}
 
 	cases := []struct {
@@ -79,6 +80,42 @@ func TestSplitBucketAndObject(t *testing.T) {
 			allowed:        allowed,
 			expectedBucket: "chat",
 			expectedObject: "dir/",
+		},
+		// Boundary regression cases pinned during PR#50 R3 (codex 2.4).
+		// Historical context: an earlier shape of this helper looked at
+		// only the leading character and used a default bucket whenever
+		// the input did not literally start with "<allowed>/". The
+		// current shape tolerates a leading slash and treats single-
+		// segment input as a bare object key against the default
+		// bucket. The cases below pin those two shapes so a future
+		// refactor cannot silently regress either one.
+		{
+			// Leading slash + allow-listed first segment: must split
+			// into the allowed bucket and the rest of the path with
+			// the slash already consumed. Same shape callers get when
+			// they hand us a path sourced from Content-Disposition or
+			// url.URL.Path without first stripping the leading slash.
+			name:           "leading slash + short key resolves to allowed bucket",
+			input:          "/chat/foo.png",
+			defaultBucket:  "file",
+			allowed:        allowed,
+			expectedBucket: "chat",
+			expectedObject: "foo.png",
+		},
+		{
+			// Single-segment input must NOT be reinterpreted as a
+			// bucket name even when the segment happens to match an
+			// allow-list entry. There is no "<bucket>/<object>" split
+			// to make, so the whole input is the object key against
+			// the default bucket. (Without this guard, a request for
+			// `/file/download` would be promoted to bucket=download,
+			// key="" — the very shape commit 5 rejects up front.)
+			name:           "single-segment input falls back to default bucket",
+			input:          "download",
+			defaultBucket:  "file",
+			allowed:        allowed,
+			expectedBucket: "file",
+			expectedObject: "download",
 		},
 	}
 
