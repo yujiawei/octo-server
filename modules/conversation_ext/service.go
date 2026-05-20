@@ -46,13 +46,6 @@ type ThreadAuthChecker interface {
 	AuthorizeThreadFollow(uid, spaceID, groupNo, shortID string) error
 }
 
-// DMCategoryChecker 校验 FollowDM 时传入的 categoryID 是否属于当前 uid 且未删除。
-// 与 ThreadAuthChecker 同样采用依赖倒置，避免 conversation_ext 直接 import category。
-// nil 时 FollowDM 跳过 categoryID 校验（用于测试 / 迁移期）。
-type DMCategoryChecker interface {
-	AuthorizeDMCategory(uid, spaceID, categoryID string) error
-}
-
 // Service encapsulates composite operations on user_conversation_ext that
 // require a single transaction boundary.  It intentionally avoids importing
 // modules/group, modules/user, or modules/thread to prevent circular
@@ -61,15 +54,15 @@ type DMCategoryChecker interface {
 // threadAuth 是 FollowThread 的鉴权钩子，由外部模块（在 1module.go 里把
 // group/thread 组合起来的实现）在启动时通过 SetThreadAuthChecker 注入。
 // 为 nil 时跳过鉴权（仅供测试 / 迁移期使用）。
+//
+// （历史 DMCategoryChecker 注入点 issue #75 / PR #79 fix 之后已移除——FollowDM
+// 鉴权改为事务内 SELECT ... FOR UPDATE，见 authorizeDMCategoryInTx——曾经的
+// `dmCatAuth`/`SetDMCategoryChecker` 接口与对应的 message 模块注入也一起清掉。）
 type Service struct {
 	db          *DB
 	session     *dbr.Session
 	threadAuth  ThreadAuthChecker
 	threadAuthM sync.RWMutex
-	// dmCatAuth 是 FollowDM 的 categoryID 校验钩子（PR #21 Round-6 by Jerry-Xin）。
-	// 与 threadAuth 一样由 message/1module.go 启动时注入；nil 时跳过校验。
-	dmCatAuth  DMCategoryChecker
-	dmCatAuthM sync.RWMutex
 	log.Log
 }
 
@@ -96,22 +89,6 @@ func (s *Service) getThreadAuthChecker() ThreadAuthChecker {
 	s.threadAuthM.RLock()
 	c := s.threadAuth
 	s.threadAuthM.RUnlock()
-	return c
-}
-
-// SetDMCategoryChecker injects the auth checker used by FollowDM categoryID.
-// Safe for concurrent use; intended to be called once at startup from
-// message/1module.go after the category module has initialised.
-func (s *Service) SetDMCategoryChecker(c DMCategoryChecker) {
-	s.dmCatAuthM.Lock()
-	s.dmCatAuth = c
-	s.dmCatAuthM.Unlock()
-}
-
-func (s *Service) getDMCategoryChecker() DMCategoryChecker {
-	s.dmCatAuthM.RLock()
-	c := s.dmCatAuth
-	s.dmCatAuthM.RUnlock()
 	return c
 }
 
@@ -340,7 +317,9 @@ func (s *Service) UnfollowThread(uid, spaceID, threadChannelID string) error {
 // 由原型 image-v1.png 证实。
 // 校验顺序：
 //   - 入参合法（uid/spaceID/peerUID 非空）
-//   - 注入的 DMCategoryChecker 验证 categoryID 属于 uid 且 status != 2
+//   - 事务内 authorizeDMCategoryInTx 校验 categoryID 属于 uid 且 status==1
+//     （issue #75：原 DMCategoryChecker 在事务外校验，存在 TOCTOU 窗口；
+//     现在挪进 withTx 并配 SELECT ... FOR UPDATE）
 //
 // PR review (Round 3) Blocking #1/#2 — bumps follow_version in same tx.
 func (s *Service) FollowDM(uid, spaceID, peerUID string, categoryID *string) error {
@@ -350,15 +329,8 @@ func (s *Service) FollowDM(uid, spaceID, peerUID string, categoryID *string) err
 	if peerUID == "" {
 		return errors.New("peer_uid must not be empty")
 	}
-	if categoryID != nil {
-		if *categoryID == "" {
-			return errors.New("category_id must not be empty string")
-		}
-		if checker := s.getDMCategoryChecker(); checker != nil {
-			if err := checker.AuthorizeDMCategory(uid, spaceID, *categoryID); err != nil {
-				return err
-			}
-		}
+	if categoryID != nil && *categoryID == "" {
+		return errors.New("category_id must not be empty string")
 	}
 	one := int8(1)
 	fields := ConvExtFields{
@@ -367,6 +339,11 @@ func (s *Service) FollowDM(uid, spaceID, peerUID string, categoryID *string) err
 	}
 	// PR #21 review (lml2468 blocker #2)：先 bump 后改 ext，与 UpdateSort 同序拿锁。
 	return s.withTx("FollowDM", func(tx *dbr.Tx) error {
+		if categoryID != nil {
+			if err := authorizeDMCategoryInTx(tx, uid, spaceID, *categoryID); err != nil {
+				return err
+			}
+		}
 		if _, err := BumpFollowVersionTx(tx, uid, spaceID); err != nil {
 			return fmt.Errorf("FollowDM bump version: %w", err)
 		}
@@ -375,6 +352,52 @@ func (s *Service) FollowDM(uid, spaceID, peerUID string, categoryID *string) err
 		}
 		return nil
 	})
+}
+
+// authorizeDMCategoryInTx validates the category for a DM follow operation
+// inside the caller's transaction, holding an X lock on the row in
+// group_category that matches category_id (via the uk_category_id unique
+// index; InnoDB also locks the corresponding clustered-index row, so this
+// serialises against the delete path). Replaces the former
+// AuthorizeDMCategory checker (modules/message/1module.go) which ran
+// outside the tx and let a concurrent delete commit between the SELECT and
+// the upsert.
+//
+// Lock predicate is a `WHERE category_id=?` UNIQUE-index equality — in
+// REPEATABLE READ this takes only a record lock on a hit, avoiding the
+// next-key (gap) lock that a non-unique predicate (e.g. `WHERE status=1`)
+// would acquire. Status / owner / space checks live in Go for the same
+// reason.
+//
+// Returns ErrDMCategoryForbidden for:
+//   - category missing (dbr.ErrNotFound)
+//   - status != 1 (deleted)
+//   - uid mismatch (not the category owner)
+//   - space_id mismatch (category from a different space)
+//
+// DB errors are wrapped with the function name to mirror the
+// `"<op>: %w"` pattern used by FollowChannel / FollowDM bump sites in
+// this file, so call-site logs attribute infra failures correctly.
+func authorizeDMCategoryInTx(tx *dbr.Tx, uid, spaceID, categoryID string) error {
+	var row struct {
+		UID     string `db:"uid"`
+		SpaceID string `db:"space_id"`
+		Status  int    `db:"status"`
+	}
+	err := tx.SelectBySql(
+		"SELECT uid, space_id, status FROM group_category WHERE category_id=? FOR UPDATE",
+		categoryID,
+	).LoadOne(&row)
+	if err != nil {
+		if errors.Is(err, dbr.ErrNotFound) {
+			return ErrDMCategoryForbidden
+		}
+		return fmt.Errorf("authorizeDMCategoryInTx: %w", err)
+	}
+	if row.UID != uid || row.SpaceID != spaceID || row.Status != 1 {
+		return ErrDMCategoryForbidden
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
