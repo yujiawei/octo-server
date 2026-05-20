@@ -49,6 +49,12 @@ type BindInfoResp struct {
 	Name           string       `json:"name,omitempty"`
 	Methods        []BindMethod `json:"methods"`
 	SupportContact string       `json:"support_contact,omitempty"`
+	AllowCreate    bool         `json:"allow_create"`
+	// CreateBlocked 始终序列化(无 omitempty):/bind/info 协议约定该字段恒在,
+	// 前端按字符串值分支("" / "disabled" / "claims_incomplete" /
+	// "manual_conflict" / "consumed");omitempty 会让 "" 路径整字段消失,
+	// 等价于前端要给"字段缺失"和"字段为空字符串"两种状态都写分支。
+	CreateBlocked string `json:"create_blocked"`
 }
 
 // BindService 自助绑定状态机的业务逻辑层。
@@ -75,9 +81,22 @@ func newBindService(cfg BindConfig, store BindStore, auth BindAuthenticator, loc
 // Issue 在 callback ResolveOrLink 失败分支调用:签发 bind_token,持久化
 // claims + state_data 快照,返回 jti 供 handler 拼前端跳转 URL。
 //
+// 等价于 IssueWithReason(ctx, claims, sd, BindReasonUnknownUser) —— 历史调用方
+// (单元测试 + ShouldHandle 早期路径)在没有明确区分原因时保留旧签名,语义即
+// "claims 未命中已有账号"(可走 /bind/create)。生产 callback 路径应该走
+// IssueWithReason 明确传 reason,与 manual_conflict 拒建号路径协同。
+//
 // 不在此处写 audit —— handler 在拿到 jti 后统一写 EventBindIssued
 // (handler 持 HTTP 上下文,IP/UA/trace_id 都齐)。
 func (s *BindService) Issue(ctx context.Context, claims *IDTokenClaims, sd *StateData) (string, error) {
+	return s.IssueWithReason(ctx, claims, sd, BindReasonUnknownUser)
+}
+
+// IssueWithReason 同 Issue,但额外把 reason 固化到 BindSession.IssueReason 字段。
+// callback 按 ResolveOrLink 返回的 err 类型选择 reason:ErrUnknownUser →
+// BindReasonUnknownUser(可建号);ErrConflictNeedManual → BindReasonManualConflict
+// (Create 路径拒绝)。详见 IssueReason godoc。
+func (s *BindService) IssueWithReason(ctx context.Context, claims *IDTokenClaims, sd *StateData, reason IssueReason) (string, error) {
 	if claims == nil || claims.Issuer == "" || claims.Subject == "" {
 		return "", fmt.Errorf("oidc bind Issue: claims iss/sub required")
 	}
@@ -106,6 +125,7 @@ func (s *BindService) Issue(ctx context.Context, claims *IDTokenClaims, sd *Stat
 		OriginIP:       sd.IP,
 		OriginUA:       sd.UserAgent,
 		CreatedAt:      nowUnix(),
+		IssueReason:    reason,
 	}
 	if err := s.store.Save(ctx, sess, s.cfg.TokenTTL); err != nil {
 		return "", fmt.Errorf("oidc bind Issue: save: %w", err)
@@ -113,8 +133,8 @@ func (s *BindService) Issue(ctx context.Context, claims *IDTokenClaims, sd *Stat
 	return jti, nil
 }
 
-// Info 返回脱敏 claims + 可用方法。可用方法 = 配置 Methods ∩ 当前 claims 支持
-// 的手段(claims 无 verified phone → 屏蔽 sms_otp,FR-3.3)。
+// Info 返回脱敏 claims + 可用方法 + create 能力状态。
+// 可用方法 = 配置 Methods ∩ 当前 claims 支持的手段(claims 无 verified phone → 屏蔽 sms_otp,FR-3.3)。
 func (s *BindService) Info(ctx context.Context, jti string) (*BindInfoResp, error) {
 	sess, err := s.store.Get(ctx, jti)
 	if err != nil {
@@ -131,6 +151,25 @@ func (s *BindService) Info(ctx context.Context, jti string) (*BindInfoResp, erro
 		SupportContact: s.cfg.SupportContact,
 	}
 	resp.Methods = s.availableMethods(claims)
+	resp.AllowCreate = s.cfg.AllowCreate
+	// 优先级 disabled > claims_incomplete > manual_conflict > consumed。
+	// disabled 是配置层面的"运维关闭",最高优先;claims_incomplete 是
+	// claims 自身欠缺,继续往下走也注定建不出;manual_conflict 是 token 来源
+	// 的策略拒绝(reviewer 强调 P2-1);consumed 是 token 已被推进出 issued
+	// 状态(verify/create 已发生),前端最多展示"重发起 OIDC 登录"提示。
+	switch {
+	case !s.cfg.AllowCreate:
+		resp.CreateBlocked = "disabled"
+	case s.checkClaimsForCreate(claims) != nil:
+		resp.CreateBlocked = "claims_incomplete"
+	case sess.IssueReason == BindReasonManualConflict:
+		resp.CreateBlocked = "manual_conflict"
+	case sess.Status != BindStatusIssued:
+		// token 已被推进(verified / creating / refused) —— 二次 /bind/info 仍可读,
+		// 但 /bind/create 已经不可能走通(状态机 CAS 必败)。提前告诉前端别让用户
+		// 误点"自助建号"按钮反复 429。
+		resp.CreateBlocked = "consumed"
+	}
 	return resp, nil
 }
 
@@ -445,6 +484,143 @@ func (s *BindService) Confirm(ctx context.Context, jti string) (*BindConfirmResp
 	}, nil
 }
 
+// BindCreateResp Create 返给 handler 的完整快照,与 BindConfirmResp 对齐。
+type BindCreateResp struct {
+	IssueResp *IssueSessionResp
+	SD        *StateData
+	UID       string
+	Issuer    string
+}
+
+// Create 在 status=issued 时用 bind_token 里的 claims 建号 + 写 identity + 签发会话。
+//
+// 顺序很关键(防 ghost user):
+//  1. Get session
+//  2. IncrAndCheck("bind:create:"+jti, bindCreateMax) — counter→status 与 Confirm 对齐,
+//     任何对 create 的探测都消耗配额
+//  3. decode claims + 校验(纯只读,无副作用,失败保持 token 在 issued 让用户重试)
+//  4. CASSave issued→creating — 唯一的"锁":只有拿到锁的 goroutine 才能进入
+//     产生副作用的 #5/#6/#7。并发 verify/create 都会撞 CAS 失败 → ErrBindStatusConflict,
+//     不会出现"副作用已发生但终态锁不上"的 ghost-user 窗口。
+//  5. IssueSession({CreateUser:true, ...}) — 副作用 #1:dmwork user 入库
+//  6. identity.Insert((uid, issuer, sub)) — 副作用 #2:user_oidc_identity 入库
+//  7. Consume(token) — 终态:token 整条删除,后续 Get 返 ErrBindNotFound
+//
+// 中途失败语义:
+//   - #5/#6 失败:token 卡在 creating,5min TTL 后自然消失。**不会**被同一 token
+//     的二次 create 重复触发(CAS issued→creating 第二次必败)—— 避免重试产生
+//     第二个 ghost user。用户体感:需要重走 OIDC 登录拿新 bind_token。
+//   - #6 撞 uk_issuer_subject(并发不同 token 同 issuer+sub):返 ErrBindAlreadyBound,
+//     handler 引导用户重发起 OIDC 登录拾取赢家会话(与 plan §4 一致)。
+//   - #7 失败:用户已建,会话已发,token 5min TTL 自清,只 log warn。
+func (s *BindService) Create(ctx context.Context, jti string) (*BindCreateResp, error) {
+	if s.identity == nil || s.users == nil {
+		return nil, errors.New("oidc bind Create: not configured (identity/users nil)")
+	}
+	sess, err := s.store.Get(ctx, jti)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.store.IncrAndCheck(ctx,
+		"bind:create:"+jti, bindCreateMax, s.cfg.TokenTTL); err != nil {
+		return nil, err
+	}
+	// manual_conflict 来源的 token 不允许走自助建号:用户在 dmwork 已经有(多条)
+	// 账号,/bind/create 会再造账号加剧脏数据 —— 走 P1 Admin 人工合并兜底。
+	// 空字符串视同 unknown_user(灰度兼容旧 token),与 IssueReason godoc 一致。
+	if sess.IssueReason == BindReasonManualConflict {
+		return nil, ErrBindCreateConflictNeedManual
+	}
+	claims, err := decodeClaimsSnapshot(sess.ClaimsSnapshot)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.checkClaimsForCreate(claims); err != nil {
+		return nil, err
+	}
+	// D. IssuerAllowlist 防御性复核:ShouldHandle 在 callback 阶段已挡过一遍,
+	// 这里在 Create 入口再校验一次,防止运维在 token 5min TTL 内把某 issuer
+	// 从 allowlist 移走、但 token 已经签发的窗口里继续被滥用。
+	// 仅在 Create 路径加(与 reviewer 描述一致):verify/confirm 路径的 token
+	// 是用户主动二次验证,IdP 信任由原 callback 时已校验,风险低。
+	if !s.issuerAllowedForCreate(claims.Issuer) {
+		return nil, fmt.Errorf("oidc bind Create: %w (issuer no longer in allowlist)", ErrBindAuthRejected)
+	}
+	sd, err := decodeSDSnapshot(sess.SDSnapshot)
+	if err != nil {
+		return nil, err
+	}
+	// CAS issued→creating:把后续所有副作用包在锁里。
+	// 失败原因:(a) 别的 goroutine 已推进了 status(verify / 另一个 create),
+	// (b) token TTL 已到。两种都返 ErrBindStatusConflict / ErrBindNotFound,无副作用。
+	if err := s.casLockForCreate(ctx, sess); err != nil {
+		return nil, err
+	}
+	zone, phone := extractZone(claims.PhoneNumber), extractPhone(claims.PhoneNumber)
+	issueReq := IssueSessionReq{
+		CreateUser: true,
+		Name:       claims.Name,
+		Email:      claims.Email,
+		Phone:      phone,
+		Zone:       zone,
+		DeviceFlag: sd.DeviceFlag,
+		PublicIP:   sd.IP,
+		// 进入本方法前已经过 ShouldHandle 的 IssuerAllowlist 校验(callback 阶段),
+		// 加上 bind_token 自身的 5min 单次性 + 上面的 checkClaimsForCreate / issuerAllowed
+		// 兜底,运维要授权的就是这条"OIDC 自助建号"路径 —— 告诉 user 模块绕过
+		// register.off 全局开关,与 callback `res.IsNew` 分支语义对称。
+		TrustedSSOCreate: true,
+	}
+	resp, err := s.users.IssueSession(ctx, issueReq)
+	if err != nil {
+		return nil, fmt.Errorf("oidc bind Create: issue session: %w", err)
+	}
+	uid := resp.UID
+	if err := s.identity.Insert(&IdentityModel{
+		UID:           uid,
+		Issuer:        claims.Issuer,
+		Subject:       claims.Subject,
+		Email:         claims.Email,
+		EmailVerified: boolToInt(claims.EmailVerified),
+		Phone:         claims.PhoneNumber,
+		PhoneVerified: boolToInt(claims.PhoneVerified),
+		LinkedAt:      time.Now(),
+	}); err != nil {
+		if isDuplicateKeyError(err) {
+			return nil, ErrBindAlreadyBound
+		}
+		return nil, fmt.Errorf("oidc bind Create: insert identity: %w", err)
+	}
+	if _, cerr := s.store.Consume(ctx, jti); cerr != nil {
+		log.Warn("OIDC bind Create: consume session failed (non-fatal, will TTL out)",
+			zap.String("jti_hash", subHash(jti)), zap.Error(cerr))
+	}
+	return &BindCreateResp{
+		IssueResp: resp,
+		SD:        sd,
+		UID:       uid,
+		Issuer:    claims.Issuer,
+	}, nil
+}
+
+// checkClaimsForCreate 校验 claims 至少有一条强标识(email 或 phone)。
+//
+// phone 可用性必须用 extractPhone 判定,不能只看 PhoneNumber != "":
+// dmwork 当前仅支持 +86 号段(service.go:extractPhone),非 +86 verified phone
+// 会被 IssueSession 默默丢成空 Phone/Zone,落库后用户没有可用手机号锚点。
+// 用 extractPhone 做能用性检查,把"格式不支持"提前到 422 而非建出残缺账号。
+//
+// email_verified / phone_verified 必须为 true,否则后续客服 / 找回流程没有可信锚点
+// (与 autolink 准入条件一致)。
+func (s *BindService) checkClaimsForCreate(claims *IDTokenClaims) error {
+	hasEmail := claims.Email != "" && claims.EmailVerified
+	hasPhone := claims.PhoneVerified && extractPhone(claims.PhoneNumber) != ""
+	if !hasEmail && !hasPhone {
+		return ErrBindCreateClaimsIncomplete
+	}
+	return nil
+}
+
 // decodeSDSnapshot 与 decodeClaimsSnapshot 对称。
 func decodeSDSnapshot(b []byte) (*StateData, error) {
 	var sd StateData
@@ -478,12 +654,48 @@ func (s *BindService) saveVerified(ctx context.Context, sess *BindSession) error
 	return nil
 }
 
+// saveCreated 把 sess.Status 从 issued CAS 到 created,使用绝对剩余 TTL。
+// 对称 saveVerified:CAS expected=issued,防并发 create 竞态。
+// casLockForCreate 把 issued 锁到 creating —— Create 路径下唯一的状态写入。
+//
+// 不复用 saveVerified 的"写整条 session"是因为 Create 没有 verify/sms 那种业务字段
+// 要落地(CandidateUID/VerifiedMethod),只需推进 status。CAS 用 BindStatusIssued
+// 作为期望值,保证并发 verify(已把 status 推到 verified)或并发 create(已推到
+// creating)都拒绝在此处,不进入下游副作用阶段。
+//
+// TTL 用 remainingTTL 而非完整 cfg.TokenTTL:防止 Create 把 token 续命到 issue 后
+// 的 "TokenTTL × 2",与文档承诺的 5min 不符。remaining<=0 时返 ErrBindNotFound 让
+// 上层按"已过期"处理。
+func (s *BindService) casLockForCreate(ctx context.Context, sess *BindSession) error {
+	remaining := s.remainingTTL(sess)
+	if remaining <= 0 {
+		return ErrBindNotFound
+	}
+	sess.Status = BindStatusCreating
+	if err := s.store.CASSave(ctx, sess, BindStatusIssued, remaining); err != nil {
+		return fmt.Errorf("oidc bind: cas lock creating: %w", err)
+	}
+	return nil
+}
+
 // remainingTTL 计算 sess 距离绝对过期(Issue 时刻 + TokenTTL)还剩多久。
 // 时间基准与 Issue 一致(nowUnix=time.Now().Unix(),time.Until 用 time.Now()),
 // 无 deterministic-clock 注入需求时可直接拿来用。
 func (s *BindService) remainingTTL(sess *BindSession) time.Duration {
 	deadline := time.Unix(sess.CreatedAt, 0).Add(s.cfg.TokenTTL)
 	return time.Until(deadline)
+}
+
+// issuerAllowedForCreate D. defense-in-depth 检查:Create 入口在
+// checkClaimsForCreate 后做最后一道 issuer allowlist 兜底。空 allowlist =
+// deny-all(灰度安全默认值),与 ShouldHandle 同语义。
+func (s *BindService) issuerAllowedForCreate(issuer string) bool {
+	for _, allowed := range s.cfg.IssuerAllowlist {
+		if allowed == issuer {
+			return true
+		}
+	}
+	return false
 }
 
 // ShouldHandle 给 callback 失败分支用的接管判定。任何一条不满足就走旧路径,

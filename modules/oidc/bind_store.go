@@ -84,6 +84,18 @@ var (
 	// 端点绕过运维"禁用密码"的安全开关。handler 翻 400,与"参数非法"同档,
 	// 不属于身份凭据拒绝,因此与 ErrBindAuthRejected 区分。
 	ErrBindMethodDisabled = errors.New("oidc: bind method disabled by configuration")
+
+	// ErrBindCreateClaimsIncomplete claims 既无 verified email 也无 verified phone:
+	// /bind/create 拒绝建号,因为后续客服 / 找回流程没有可信账号锚点。
+	// handler 翻 422,metric label claims_incomplete。
+	ErrBindCreateClaimsIncomplete = errors.New("oidc bind: claims missing required fields")
+
+	// ErrBindCreateConflictNeedManual bind_token 是从 manual-conflict 来源签发的
+	// (claims 命中多条 dmwork 账号);Create 路径拒绝建号,只能走 P1 Admin 人工合并。
+	// handler 翻 409,metric label conflict_need_manual。与 ErrBindConflictNeedManual
+	// (verify 路径短信多匹配)语义平行,但 token 维度的拒绝在 Create 入口落地,
+	// 与 Issue 阶段固化的 IssueReason 字段联动。
+	ErrBindCreateConflictNeedManual = errors.New("oidc bind: create rejected: claims conflict needs manual resolution")
 )
 
 // ---------- memory impl (单测 + 本地开发) ----------

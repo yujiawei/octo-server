@@ -554,7 +554,15 @@ func (o *OIDC) callback(c *wkhttp.Context) {
 		// 自助绑定流程。其它失败 / flag off / issuer 不在白名单都退回旧路径,确保
 		// NFR-6 一键回滚(关 flag + 重启)语义生效。
 		if o.bind.ShouldHandle(err, claims) {
-			jti, ierr := o.bind.Issue(c.Request.Context(), claims, sd)
+			// 把 ResolveOrLink 的 err 类型固化到 BindSession.IssueReason —— Create
+			// 路径用它拒绝 manual_conflict 来源的建号请求,Info 路径用它回填
+			// create_blocked。BindReasonManualConflict 仅在多账号冲突时落地;
+			// 其他可接管错误统一按 BindReasonUnknownUser(自助建号合法来源)签发。
+			reason := BindReasonUnknownUser
+			if errors.Is(err, ErrConflictNeedManual) {
+				reason = BindReasonManualConflict
+			}
+			jti, ierr := o.bind.IssueWithReason(c.Request.Context(), claims, sd, reason)
 			if ierr == nil {
 				result = "bind_pending" // 已在 callbackResultLabels 注册
 				o.writeAudit("bind:"+subHash(jti), EventBindIssued, sd, "")
@@ -590,6 +598,27 @@ func (o *OIDC) callback(c *wkhttp.Context) {
 		Zone:       zone,
 		DeviceFlag: sd.DeviceFlag,
 		PublicIP:   sd.IP,
+		// res.IsNew=true 进入 user.externalLoginCreate;TrustedSSOCreate=true
+		// 让 user 模块绕过 register.off 全局开关。
+		//
+		// callback 路径的信任锚(与 /bind/create 走 IssuerAllowlist 是**不同**的
+		// trust chain,不要混):
+		//   1. o.client.VerifyIDToken 用 cfg.Provider.Issuer discovery 出来的
+		//      IdP 公钥验签 → claims.Issuer 必然等于 cfg.Provider.Issuer
+		//      (不等则验签直接失败,根本走不到这里),等同于"size=1 的
+		//      隐式 issuer allowlist";
+		//   2. Service.ResolveOrLink 只在 cfg.Provider.AllowNewUser=true
+		//      时才返 IsNew=true,这是运维通过 DM_OIDC_PROVIDER_ALLOW_NEW_USER
+		//      显式开的 bool。
+		// 两条合在一起 = "运维显式信任的单一 Provider.Issuer 自动建号" —— 与
+		// 公开注册入口(email/phone signup / GitHub/Gitee OAuth)的不可控外部
+		// 输入语义不同,bypass register.off 的运维授权是显式的。
+		//
+		// 与 /bind/create 行为对称(都"OIDC 通道下让运维显式控制建号"),但
+		// 信任链的具体机制不同 —— /bind/create 用 IssuerAllowlist 兜底
+		// (多 issuer 配置 + bind_token 显式同意),callback 用单 Provider.Issuer
+		// 签名 + AllowNewUser flag。
+		TrustedSSOCreate: res.IsNew,
 	}
 	sessResp, err := o.service.IssueSession(c.Request.Context(), issueReq)
 	if err != nil {
