@@ -183,6 +183,46 @@ func TestGetAppConfig_LocalLoginOff_OnVersionShortCircuit(t *testing.T) {
 	assert.Contains(t, w.Body.String(), `"local_login_off":1`)
 }
 
+// PR #104 reviewer Jerry-Xin (P0 on commit 72e67c83): DM_OIDC_ENABLED 在
+// appconfig 三个 OIDC 出口(oidc_providers / oidc_account_url /
+// oidc_reset_password_url)上的解析必须与 LocalLoginOff() 安全回退完全一致,
+// 否则会出现"local_login_off=1 但 oidc_providers 为空"的前端死锁组合:
+// 前端按 local_login_off 隐藏本地登录卡片,又因 oidc_providers omitempty
+// 拿不到 SSO 入口,用户无路可走。
+//
+// 触发场景:DM_OIDC_ENABLED=T(或 True / TRUE 等 ParseBool 合法但非 "true"/
+// "1" 字面量) + 完整 OIDC + local_off=1。
+func TestGetAppConfig_OIDCProvidersHonoursParseBoolSpellings(t *testing.T) {
+	for _, spelling := range []string{"t", "T", "True", "TRUE"} {
+		t.Run(spelling, func(t *testing.T) {
+			enableFullOIDCForTest(t)
+			t.Setenv("DM_OIDC_ENABLED", spelling)
+
+			s, ctx := testutil.NewTestServer()
+			f := New(ctx)
+			err := testutil.CleanAllTables(ctx)
+			assert.NoError(t, err)
+			err = f.appConfigDB.insert(&appConfigModel{})
+			assert.NoError(t, err)
+
+			settings := EnsureSystemSettings(ctx)
+			assert.NoError(t, settings.db.upsert("login", "local_off", "1", settingTypeBool, ""))
+			assert.NoError(t, settings.Reload())
+
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+			req.Header.Set("token", testutil.Token)
+			s.GetRoute().ServeHTTP(w, req)
+			body := w.Body.String()
+			assert.Equal(t, http.StatusOK, w.Code)
+			assert.Contains(t, body, `"local_login_off":1`,
+				"DM_OIDC_ENABLED=%q + full OIDC + local_off=1 → 应下发 local_login_off=1", spelling)
+			assert.Contains(t, body, `"oidc_providers"`,
+				"同一个 DM_OIDC_ENABLED 值在 oidcEnabled() 与 isOIDCFullyConfigured() 必须解析一致,否则前端拿不到 SSO 入口")
+		})
+	}
+}
+
 // 安全回退在 appconfig 层同样要体现:DB 写了 local_off=1 但部署没配置任何
 // SSO 时,下发的 local_login_off 必须为 0,否则前端会隐藏本地登录卡片导致
 // 所有人都进不来。这条用例锁定"appconfig 返回的是 effective 值而不是 DB

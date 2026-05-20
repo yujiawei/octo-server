@@ -502,9 +502,20 @@ func oidcResetPasswordURL() string {
 	return os.Getenv("DM_OIDC_RESET_PASSWORD_URL")
 }
 
+// oidcEnabled reports whether OIDC is intended to be on. Parsing must match
+// modules/oidc/config.go:getBool (strconv.ParseBool) byte-for-byte and stay
+// in lockstep with isOIDCFullyConfigured in system_settings.go — diverging
+// here causes a front-end lockout where local_login_off=1 hides the local
+// card while oidc_providers / oidc_account_url are silently omitted because
+// this function rejects spellings like "T" or "True" that the OIDC module
+// itself accepts. See PR #104 P0 (Jerry-Xin).
 func oidcEnabled() bool {
-	v := strings.ToLower(os.Getenv("DM_OIDC_ENABLED"))
-	return v == "true" || v == "1"
+	v := os.Getenv("DM_OIDC_ENABLED")
+	if v == "" {
+		return false
+	}
+	enabled, err := strconv.ParseBool(v)
+	return err == nil && enabled
 }
 
 // 兼容历史 app_config 行（NOT NULL DEFAULT 7 在迁移前的行为）：值 ≤ 0 时回退为 7。
