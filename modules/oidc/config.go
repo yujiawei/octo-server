@@ -138,6 +138,10 @@ func loadProvider() (ProviderConfig, error) {
 
 	// 用 slice 保证检查顺序稳定,缺多个字段时报第一项固定,排查体验更好。
 	// 报错消息用新名,引导运维迁移到 PROVIDER_*。
+	//
+	// NOTE: 此 required 列表在 modules/common/system_settings.go 的
+	// isOIDCFullyConfigured() 有一份镜像副本(避免 common→oidc→user→common
+	// import 循环)。新增/删除必填项时,两处必须同步修改。
 	required := []struct {
 		name string
 		val  string

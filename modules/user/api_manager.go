@@ -143,7 +143,23 @@ func (m *Manager) online(c *wkhttp.Context) {
 	c.Response(result)
 }
 
-// 用户登录
+// 用户登录(管理后台)。
+//
+// 故意不受 login.local_off 守卫,与 /v1/user/* 的本地登录入口区分对待。
+// 理由(PR #104 P1 from yujiawei):
+//   - login.local_off 的 SSO 安全回退只兜得住"配置错误"(env 缺失/非法),
+//     兜不住 SSO 运行时故障(IdP 宕机、client_secret 过期、callback URL 被
+//     反代意外屏蔽等)。这类场景里普通用户全员锁死可接受 —— 等运维修;
+//     但运维自己也通过 SSO 进不来就成了死锁,只能从 DB 或重启回退。
+//   - 保留 /v1/manager/login 的本地账密入口给 SuperAdmin 当紧急通道,
+//     即使生产部署设了 local_off=1 也能登进管理面把开关关掉。
+//   - 与上游 octo-server 的安全模型一致:manager 路由本来就要求 admin/
+//     SuperAdmin 角色 + 独立速率限制,攻击面是 IdP 入口的子集而非超集。
+//
+// 如果未来要让 SSO 也接管管理面,正确做法是给管理面单独的 SSO 流程(可能
+// 接同一个 IdP 但用不同 client / 不同 scope),而不是把 local_off 扩到这
+// 里 —— 否则会把"屏蔽用户本地登录"和"屏蔽运维紧急入口"绑死,降低可
+// 运维性。
 func (m *Manager) login(c *wkhttp.Context) {
 	var req managerLoginReq
 	if err := c.BindJSON(&req); err != nil {

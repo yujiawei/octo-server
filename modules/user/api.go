@@ -1187,6 +1187,10 @@ func (u *User) wxLogin(c *wkhttp.Context) {
 
 // 登录
 func (u *User) login(c *wkhttp.Context) {
+	if common2.EnsureSystemSettings(u.ctx).LocalLoginOff() {
+		c.ResponseError(errors.New("本地登录已关闭"))
+		return
+	}
 
 	var req loginReq
 	if err := c.BindJSON(&req); err != nil {
@@ -2422,6 +2426,13 @@ func (u *User) closeLockScreenPwd(c *wkhttp.Context) {
 
 // sendLoginCheckPhoneCode 发送登录验证短信
 func (u *User) sendLoginCheckPhoneCode(c *wkhttp.Context) {
+	// 设备验证短信是本地登录二阶段的一部分,local_off=1 时必须连发码也拒,
+	// 否则攻击者跳过 /v1/user/login 直接走二阶段仍能拿到 token,
+	// 同时还把短信通道当作免费枚举/滥发入口。
+	if common2.EnsureSystemSettings(u.ctx).LocalLoginOff() {
+		c.ResponseError(errors.New("本地登录已关闭"))
+		return
+	}
 	var req struct {
 		UID string `json:"uid"`
 	}
@@ -2470,6 +2481,10 @@ func (u *User) sendLoginCheckPhoneCode(c *wkhttp.Context) {
 
 // loginCheckPhone 登录验证设备短信
 func (u *User) loginCheckPhone(c *wkhttp.Context) {
+	if common2.EnsureSystemSettings(u.ctx).LocalLoginOff() {
+		c.ResponseError(errors.New("本地登录已关闭"))
+		return
+	}
 	var req struct {
 		UID  string `json:"uid"`
 		Code string `json:"code"`

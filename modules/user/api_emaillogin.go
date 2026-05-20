@@ -41,6 +41,14 @@ func (u *User) emailSendCode(c *wkhttp.Context) {
 		c.ResponseError(errors.New("注册通道暂不开放"))
 		return
 	}
+	// 邮箱登录验证码与 emailLogin 守卫语义对齐:local_off=1 时连发码也拒,
+	// 不然攻击者绕过 /v1/user/emaillogin 仍能让后端发出真实登录验证码。
+	// 注意范围:只覆盖 CodeTypeEmailLogin —— 忘记密码 / 注册验证码各有
+	// 自己的开关(register.off / 长期保留),不在 local_off 守备范围内。
+	if codeType == commonapi.CodeTypeEmailLogin && settings.LocalLoginOff() {
+		c.ResponseError(errors.New("本地登录已关闭"))
+		return
+	}
 	if !settings.RegisterEmailOn() {
 		switch codeType {
 		case commonapi.CodeTypeRegister:
@@ -201,7 +209,12 @@ func (u *User) emailRegister(c *wkhttp.Context) {
 
 // emailLogin 邮箱登录（验证码方式）
 func (u *User) emailLogin(c *wkhttp.Context) {
-	if !common.EnsureSystemSettings(u.ctx).RegisterEmailOn() {
+	settings := common.EnsureSystemSettings(u.ctx)
+	if settings.LocalLoginOff() {
+		c.ResponseError(errors.New("本地登录已关闭"))
+		return
+	}
+	if !settings.RegisterEmailOn() {
 		c.ResponseError(errors.New("暂不支持邮箱登录"))
 		return
 	}

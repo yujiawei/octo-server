@@ -2,6 +2,9 @@ package common
 
 import (
 	"context"
+	"encoding/base64"
+	"os"
+	"regexp"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -247,6 +250,181 @@ func (s *SystemSettings) RegisterUsernameOn() bool {
 // RegisterEmailOn returns whether email-based registration / login is enabled.
 func (s *SystemSettings) RegisterEmailOn() bool {
 	return s.getBool("register", "email_on", s.ctx.GetConfig().Register.EmailOn)
+}
+
+// LocalLoginOff returns whether local-account login entry points should be
+// disabled. When true, frontend hides the local login UI and backend rejects
+// requests to /v1/user/login, /v1/user/usernamelogin, /v1/user/emaillogin and
+// their companion code-send endpoints. Password-recovery flows and third-party
+// /SSO (GitHub, Gitee, OIDC) are not affected — this toggle is meant for
+// deployments that have adopted SSO and want to force users through it.
+//
+// Default false (no yaml fallback): plain self-hosted deployments without DB
+// override keep the historical "local login enabled" behavior.
+//
+// Safety override: even if the DB says local_off=1, this getter returns false
+// when no third-party login (OIDC / GitHub / Gitee) is actually configured.
+// Without the override an admin who flips the switch before wiring up an IdP
+// would lock everyone — including themselves — out of the system. The
+// override always picks "open" so the deployment stays accessible while ops
+// fixes the missing SSO config. The hazard is surfaced via startup log
+// (logLocalLoginOffSafetyOverride) so it isn't silently swallowed.
+func (s *SystemSettings) LocalLoginOff() bool {
+	if !s.getBool("login", "local_off", false) {
+		return false
+	}
+	return anyThirdPartyLoginConfigured(s.ctx.GetConfig())
+}
+
+// anyThirdPartyLoginConfigured reports whether at least one external login
+// provider has the credentials it needs to handle a real auth round-trip.
+// LocalLoginOff guards on this so flipping the master switch without wiring
+// up an IdP can never brick the deployment.
+//
+// Checked providers:
+//   - OIDC: must be enabled AND all hard-required env present (see
+//     isOIDCFullyConfigured). DM_OIDC_ENABLED=true alone is insufficient —
+//     missing issuer / client_id / etc. makes the callback 4xx/5xx at
+//     runtime, effectively no usable SSO.
+//   - GitHub: client_id AND client_secret in yaml/env (both required for
+//     the OAuth code exchange in api_github.go).
+//   - Gitee:  client_id AND client_secret in yaml/env (same shape).
+func anyThirdPartyLoginConfigured(cfg *config.Config) bool {
+	if isOIDCFullyConfigured() {
+		return true
+	}
+	if cfg.Github.ClientID != "" && cfg.Github.ClientSecret != "" {
+		return true
+	}
+	if cfg.Gitee.ClientID != "" && cfg.Gitee.ClientSecret != "" {
+		return true
+	}
+	return false
+}
+
+// oidcProviderIDRe mirrors modules/oidc/config.go:providerIDRe. Kept in sync
+// by the reciprocal comments on both sides (see loadProvider's required block).
+// A literal duplication, not a regex compiled from a shared string, because
+// the alternative (extracting to a leaf package) would touch ~10 files for
+// one shared regex; the maintenance cost is one extra place to update if
+// the rule ever changes.
+var oidcProviderIDRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
+
+// isOIDCFullyConfigured mirrors the fatal checks inside
+// modules/oidc/config.go:loadProvider — including the provider-ID regex,
+// because an invalid ID makes LoadConfig fail, leaves oidc.cfg=nil, and
+// causes the OIDC routes to be registered as 404/disabled at request time.
+// Skipping the regex would let local_off=1 + invalid PROVIDER_ID slip past
+// the safety override and lock everyone out.
+//
+// Why duplicated instead of importing modules/oidc:
+//   modules/common ← system_settings.go would need to import modules/oidc,
+//   but modules/oidc transitively imports modules/user → modules/common,
+//   creating a cycle. Extracting oidc.LoadConfig into its own leaf package
+//   was considered and rejected as out-of-scope churn for this PR. The
+//   trade-off is mirroring the required-env list here; modules/oidc/
+//   config.go carries a reciprocal comment so adding a new required env
+//   prompts updating both places.
+//
+// Mirrored requirements (keep in sync with modules/oidc/config.go):
+//   - DM_OIDC_ENABLED  parsed by strconv.ParseBool — accepts 1/0/t/T/true/
+//     True/TRUE/f/F/false/etc, matching oidc/config.go:getBool exactly.
+//     Earlier strings.ToLower-style parsing diverged on "t"/"T".
+//   - DM_OIDC_PROVIDER_ID             default "oidc"; must match providerIDRe
+//   - DM_OIDC_PROVIDER_ISSUER         (alias DM_OIDC_AEGIS_ISSUER)
+//   - DM_OIDC_PROVIDER_CLIENT_ID      (alias DM_OIDC_AEGIS_CLIENT_ID)
+//   - DM_OIDC_PROVIDER_CLIENT_SECRET  (alias DM_OIDC_AEGIS_CLIENT_SECRET)
+//   - DM_OIDC_PROVIDER_REDIRECT_URI   (alias DM_OIDC_AEGIS_REDIRECT_URI)
+//   - DM_OIDC_RT_ENC_KEY              (base64, 32 bytes after decode)
+//
+// We intentionally do NOT replicate non-fatal checks (scope strings,
+// durations) — those don't make LoadConfig fail and don't disable the
+// callback path.
+func isOIDCFullyConfigured() bool {
+	v := os.Getenv("DM_OIDC_ENABLED")
+	if v == "" {
+		return false
+	}
+	enabled, err := strconv.ParseBool(v)
+	if err != nil || !enabled {
+		return false
+	}
+	required := []struct {
+		primary, alias string
+	}{
+		{"DM_OIDC_PROVIDER_ISSUER", "DM_OIDC_AEGIS_ISSUER"},
+		{"DM_OIDC_PROVIDER_CLIENT_ID", "DM_OIDC_AEGIS_CLIENT_ID"},
+		{"DM_OIDC_PROVIDER_CLIENT_SECRET", "DM_OIDC_AEGIS_CLIENT_SECRET"},
+		{"DM_OIDC_PROVIDER_REDIRECT_URI", "DM_OIDC_AEGIS_REDIRECT_URI"},
+	}
+	for _, r := range required {
+		if os.Getenv(r.primary) == "" && os.Getenv(r.alias) == "" {
+			return false
+		}
+	}
+	// Provider ID: empty falls back to "oidc" (matches loadProvider default),
+	// non-empty must satisfy the same regex or LoadConfig fails fatally.
+	providerID := os.Getenv("DM_OIDC_PROVIDER_ID")
+	if providerID == "" {
+		providerID = "oidc"
+	}
+	if !oidcProviderIDRe.MatchString(providerID) {
+		return false
+	}
+	// RT key must base64-decode to 32 bytes (AES-256). Just non-empty is not
+	// enough — oidc/config.go rejects wrong-length keys at boot, our guard
+	// should be at least as strict so a deployment that would fail to boot
+	// can't be marked "configured".
+	keyB64 := os.Getenv("DM_OIDC_RT_ENC_KEY")
+	if keyB64 == "" {
+		return false
+	}
+	key, err := base64.StdEncoding.DecodeString(keyB64)
+	if err != nil || len(key) != 32 {
+		return false
+	}
+	return true
+}
+
+// LogLocalLoginOffSafetyOverrideIfActive emits a single error-level log entry
+// when local_off is intended to be on but no third-party login is configured —
+// the exact state where LocalLoginOff() silently returns false to keep the
+// deployment from locking itself. The log is the only signal ops have that
+// the admin's intent is currently being overridden; without it the
+// inconsistency is invisible until someone wonders why local login still
+// works after flipping the switch.
+//
+// Why localOff is a parameter, not read from snapshot here:
+//   Callers know the intended value with stronger guarantees than the
+//   shared snapshot. The manager-write path can pass the just-validated
+//   request value (independent of whether Reload succeeded — PR #104 P2
+//   from yujiawei). Startup passes the freshly-loaded snapshot value.
+//   Reading the snapshot directly inside this method would silently miss
+//   the warning when Reload fails right after a write, exactly when ops
+//   most needs the signal.
+//
+// Callers: invoke once at server startup (Common.Route) after Load
+// completes, and from the manager update handler after a write that
+// touched login.local_off (passing the plan's value).
+func (s *SystemSettings) LogLocalLoginOffSafetyOverrideIfActive(localOff bool) {
+	if !localOff {
+		return
+	}
+	if anyThirdPartyLoginConfigured(s.ctx.GetConfig()) {
+		return
+	}
+	s.Error("login.local_off=1 但未配置任何第三方登录 (OIDC / GitHub / Gitee); " +
+		"已自动回退为允许本地登录,避免锁死;请尽快补齐第三方登录配置后再开启此开关")
+}
+
+// RawLocalLoginOffFromSnapshot returns the snapshot's raw DB value for
+// login.local_off without applying the SSO-safety override. Used by callers
+// that need to feed LogLocalLoginOffSafetyOverrideIfActive at startup (the
+// snapshot has just been loaded, so freshness isn't a concern). Exposed
+// publicly because the field-level `getBool` is package-private and the
+// only external need is this one logging path.
+func (s *SystemSettings) RawLocalLoginOffFromSnapshot() bool {
+	return s.getBool("login", "local_off", false)
 }
 
 // SupportEmail returns the From address used by the SMTP sender.

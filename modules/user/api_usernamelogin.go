@@ -73,6 +73,10 @@ func (u *User) usernameRegister(c *wkhttp.Context) {
 
 // 用户名登录
 func (u *User) usernameLogin(c *wkhttp.Context) {
+	if common.EnsureSystemSettings(u.ctx).LocalLoginOff() {
+		c.ResponseError(errors.New("本地登录已关闭"))
+		return
+	}
 	var req loginReq
 	if err := c.BindJSON(&req); err != nil {
 		c.ResponseError(errors.New("请求数据格式有误！"))

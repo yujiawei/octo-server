@@ -23,6 +23,67 @@ import (
 
 var token = "token122323"
 
+// login.local_off=1 时 /v1/user/login（用户名/手机号 + 密码登录入口）必须
+// 在请求体合法的情况下也被守卫拒绝,而不是继续走到 QueryByUsername / 密码
+// 校验。Reason: 接入 SSO 后所有本地账号密码登录通道都应统一关闭,避免出现
+// "前端隐藏了入口但后端仍接受请求"的绕过路径。
+func TestLoginBlockedByLocalLoginOff(t *testing.T) {
+	enableFullOIDCForUserTest(t) // 让 local_off=1 通过安全回退;验证守卫本身
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	setSystemSettingForUserTest(t, ctx, "login", "local_off", "1", "bool")
+	require.NoError(t, commonsettings.EnsureSystemSettings(ctx).Reload())
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/user/login", bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
+		"username": "13800000000",
+		"password": "1234567",
+	}))))
+	setPublicIPForUserTest(req, "9.9.9.11")
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Contains(t, w.Body.String(), "本地登录已关闭")
+}
+
+// login.local_off=1 时设备验证二阶段必须同步关闭,否则攻击者可以绕过
+// /v1/user/login 入口直接调 /v1/user/sms/login_check_phone +
+// /v1/user/login/check_phone 拿到 token。守卫位置必须在 uid 查询和短信
+// 发送之前,避免泄露用户存在性 + 滥发短信。
+func TestSendLoginCheckPhoneCodeBlockedByLocalLoginOff(t *testing.T) {
+	enableFullOIDCForUserTest(t)
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	setSystemSettingForUserTest(t, ctx, "login", "local_off", "1", "bool")
+	require.NoError(t, commonsettings.EnsureSystemSettings(ctx).Reload())
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/user/sms/login_check_phone", bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
+		"uid": "some-uid",
+	}))))
+	setPublicIPForUserTest(req, "9.9.9.12")
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Contains(t, w.Body.String(), "本地登录已关闭")
+}
+
+func TestLoginCheckPhoneBlockedByLocalLoginOff(t *testing.T) {
+	enableFullOIDCForUserTest(t)
+	s, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	setSystemSettingForUserTest(t, ctx, "login", "local_off", "1", "bool")
+	require.NoError(t, commonsettings.EnsureSystemSettings(ctx).Reload())
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/user/login/check_phone", bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
+		"uid":  "some-uid",
+		"code": "123456",
+	}))))
+	setPublicIPForUserTest(req, "9.9.9.13")
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Contains(t, w.Body.String(), "本地登录已关闭")
+}
+
 // 验证 register.only_china=1 时,非 0086 区号在真正注册入口被拦截。
 //
 // 这一道闸门必须在 register 这里,而不仅是在 sendRegisterCode:管理员通过
