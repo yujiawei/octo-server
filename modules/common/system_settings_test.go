@@ -9,6 +9,42 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// fullOIDCTestEnv 是测试用的"完整 OIDC 配置最小集",用法是
+// for k, v := range fullOIDCTestEnv { t.Setenv(k, v) }。把 OIDC 切换为
+// "完整可用"状态(对应 modules/oidc/config.go:loadProvider 的所有 required
+// 必填项 + 32 字节 RT 加密 key),从而让 isOIDCFullyConfigured() 返回 true。
+//
+// 这是 system_settings_test.go 和 api_test.go 共用的 fixture。修改
+// modules/oidc 的 required 列表时,这张表也要同步;反之亦然 —— 该常量缺项
+// 会导致原本应通过的守卫用例静默回退,排查路径明显。
+var fullOIDCTestEnv = map[string]string{
+	"DM_OIDC_ENABLED":                "true",
+	"DM_OIDC_PROVIDER_ISSUER":        "https://idp.example.com",
+	"DM_OIDC_PROVIDER_CLIENT_ID":     "test-client",
+	"DM_OIDC_PROVIDER_CLIENT_SECRET": "test-secret",
+	"DM_OIDC_PROVIDER_REDIRECT_URI":  "https://app.example.com/oidc/callback",
+	// 32 字节全零的 base64 编码 —— 仅供测试,不是真实密钥。
+	"DM_OIDC_RT_ENC_KEY": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+}
+
+// enableFullOIDCForTest 调用 t.Setenv 把整张 fullOIDCTestEnv 写进当前测试
+// 的环境,Setenv 在 t.Cleanup 自动复原。先 unset alias(AEGIS_*)防止外部
+// 残留绑定到测试场景,影响断言。
+func enableFullOIDCForTest(t *testing.T) {
+	t.Helper()
+	for _, alias := range []string{
+		"DM_OIDC_AEGIS_ISSUER",
+		"DM_OIDC_AEGIS_CLIENT_ID",
+		"DM_OIDC_AEGIS_CLIENT_SECRET",
+		"DM_OIDC_AEGIS_REDIRECT_URI",
+	} {
+		t.Setenv(alias, "")
+	}
+	for k, v := range fullOIDCTestEnv {
+		t.Setenv(k, v)
+	}
+}
+
 // helper to construct a SystemSettings backed by the test DB plus the given
 // yaml-side defaults applied to the context's config.
 func newTestSystemSettings(t *testing.T, apply func(s *SystemSettings)) *SystemSettings {
@@ -51,6 +87,96 @@ func TestSystemSettings_BoolOverridesYamlWhenSet(t *testing.T) {
 
 	assert.False(t, s.RegisterEmailOn(), "DB 0 must override yaml true")
 	assert.True(t, s.RegisterOff(), "DB 1 must override yaml false")
+}
+
+func TestSystemSettings_LocalLoginOff_DefaultsFalse(t *testing.T) {
+	s := newTestSystemSettings(t, nil)
+	assert.False(t, s.LocalLoginOff(), "DB 缺字段时默认 false（保持本地登录可用）")
+}
+
+func TestSystemSettings_LocalLoginOff_DBValueWins(t *testing.T) {
+	s := newTestSystemSettings(t, nil)
+	// 让 OIDC 完整可用,DB local_off=1 才会通过安全回退实际生效。
+	enableFullOIDCForTest(t)
+
+	require.NoError(t, s.db.upsert("login", "local_off", "1", settingTypeBool, ""))
+	require.NoError(t, s.Reload())
+	assert.True(t, s.LocalLoginOff(), "DB=1 + OIDC 已配置 → 关闭本地登录")
+
+	require.NoError(t, s.db.upsert("login", "local_off", "0", settingTypeBool, ""))
+	require.NoError(t, s.Reload())
+	assert.False(t, s.LocalLoginOff(), "DB=0 → 启用本地登录")
+}
+
+// 安全回退：DB local_off=1 但没有任何第三方登录配置时，LocalLoginOff() 必须
+// 返回 false，否则会把整个系统锁死（前端隐藏本地登录卡片 + 后端拒绝本地登录
+// 请求 = 无人可登录）。守卫此处而不是 panic：让服务能起来，admin 上去看日志
+// 再修复 SSO 配置；管理面写入也按这个语义验证。
+func TestSystemSettings_LocalLoginOff_AutoFalseWhenNoThirdPartyConfigured(t *testing.T) {
+	s := newTestSystemSettings(t, nil)
+	t.Setenv("DM_OIDC_ENABLED", "")
+	s.ctx.GetConfig().Github.ClientID = ""
+	s.ctx.GetConfig().Github.ClientSecret = ""
+	s.ctx.GetConfig().Gitee.ClientID = ""
+	s.ctx.GetConfig().Gitee.ClientSecret = ""
+
+	require.NoError(t, s.db.upsert("login", "local_off", "1", settingTypeBool, ""))
+	require.NoError(t, s.Reload())
+	assert.False(t, s.LocalLoginOff(),
+		"DB=1 但无任何第三方登录配置 → 自动回退为 false，避免锁死")
+}
+
+// DM_OIDC_ENABLED=true 只是 OIDC 的开关位,真正能用还需要 issuer / client_id
+// / client_secret / redirect_uri / rt_enc_key 等一批 env 齐备(详见
+// modules/oidc/config.go:LoadConfig)。任一缺失,callback 在请求时会 404/500,
+// 实际上不存在可用的第三方登录入口 —— 此时若 LocalLoginOff() 仍生效,前端隐藏
+// 本地登录 + 后端拒绝本地登录 + SSO 跑不通 = 全员锁死。安全回退必须看到
+// "OIDC 启用 但 config 残缺" 也算"无可用第三方登录"。
+func TestSystemSettings_LocalLoginOff_AutoFalseWhenOIDCEnabledButMisconfigured(t *testing.T) {
+	s := newTestSystemSettings(t, nil)
+	t.Setenv("DM_OIDC_ENABLED", "true")
+	// 故意只开 ENABLED,不配 issuer / client_id 等必填项。
+	t.Setenv("DM_OIDC_PROVIDER_ISSUER", "")
+	t.Setenv("DM_OIDC_PROVIDER_CLIENT_ID", "")
+	t.Setenv("DM_OIDC_PROVIDER_CLIENT_SECRET", "")
+	t.Setenv("DM_OIDC_PROVIDER_REDIRECT_URI", "")
+	t.Setenv("DM_OIDC_RT_ENC_KEY", "")
+	// aegis alias 也清掉,避免 alias 兜底。
+	t.Setenv("DM_OIDC_AEGIS_ISSUER", "")
+	t.Setenv("DM_OIDC_AEGIS_CLIENT_ID", "")
+	t.Setenv("DM_OIDC_AEGIS_CLIENT_SECRET", "")
+	t.Setenv("DM_OIDC_AEGIS_REDIRECT_URI", "")
+	s.ctx.GetConfig().Github.ClientID = ""
+	s.ctx.GetConfig().Github.ClientSecret = ""
+	s.ctx.GetConfig().Gitee.ClientID = ""
+	s.ctx.GetConfig().Gitee.ClientSecret = ""
+
+	require.NoError(t, s.db.upsert("login", "local_off", "1", settingTypeBool, ""))
+	require.NoError(t, s.Reload())
+	assert.False(t, s.LocalLoginOff(),
+		"OIDC ENABLED 但配置残缺时,等同无可用第三方登录,必须回退避免锁死")
+}
+
+func TestSystemSettings_LocalLoginOff_TrueWhenGitHubConfigured(t *testing.T) {
+	s := newTestSystemSettings(t, nil)
+	t.Setenv("DM_OIDC_ENABLED", "")
+	s.ctx.GetConfig().Github.ClientID = "gh-client"
+	s.ctx.GetConfig().Github.ClientSecret = "gh-secret"
+
+	require.NoError(t, s.db.upsert("login", "local_off", "1", settingTypeBool, ""))
+	require.NoError(t, s.Reload())
+	assert.True(t, s.LocalLoginOff(), "GitHub OAuth 配置齐备 → 守卫生效")
+}
+
+func TestSystemSettings_LocalLoginOff_TrueWhenGiteeConfigured(t *testing.T) {
+	s := newTestSystemSettings(t, nil)
+	t.Setenv("DM_OIDC_ENABLED", "")
+	s.ctx.GetConfig().Gitee.ClientID = "gitee-client"
+	s.ctx.GetConfig().Gitee.ClientSecret = "gitee-secret"
+
+	require.NoError(t, s.db.upsert("login", "local_off", "1", settingTypeBool, ""))
+	require.NoError(t, s.Reload())
+	assert.True(t, s.LocalLoginOff(), "Gitee OAuth 配置齐备 → 守卫生效")
 }
 
 func TestSystemSettings_StringFallsBackOnEmpty(t *testing.T) {

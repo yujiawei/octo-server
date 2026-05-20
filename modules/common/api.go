@@ -128,6 +128,11 @@ func (cn *Common) Route(r *wkhttp.WKHttp) {
 	}
 	cn.ctx.GetConfig().AppRSAPrivateKey = privateKey
 	cn.ctx.GetConfig().AppRSAPubKey = appConfigM.RSAPublicKey
+
+	// 启动期校验:DB 已写入 login.local_off=1 但部署没有任何第三方登录
+	// 提供方,LocalLoginOff() 会自动回退为 false 避免锁死。把这个状态作为
+	// error 日志显式打出,让运维一眼能看到"开关写了但当前不生效"。
+	cn.systemSettings.LogLocalLoginOffSafetyOverrideIfActive()
 }
 
 // 获取后台运行引导视频
@@ -358,6 +363,17 @@ func (cn *Common) insertAppConfigIfNeed() (*appConfigModel, error) {
 	return appConfigM, err
 }
 
+// boolToFlag normalises a bool getter result to the 0/1 int flag used by
+// existing appconfig JSON fields (phone_search_off, shortno_edit_off, ...).
+// Keeps the wire shape int across the response so frontend doesn't need a
+// special "boolean-or-int" decode path for one field.
+func boolToFlag(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
+}
+
 func (cn *Common) appConfig(c *wkhttp.Context) {
 	versionStr := c.Query("version")
 	appConfigM, err := cn.appConfigDB.query()
@@ -379,6 +395,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 		c.JSON(http.StatusOK, &appConfigResp{
 			Version:       appConfigM.Version,
 			SystemBotUIDs: spacepkg.SystemBotList(),
+			LocalLoginOff: boolToFlag(cn.systemSettings.LocalLoginOff()),
 		})
 		return
 	}
@@ -415,6 +432,7 @@ func (cn *Common) appConfig(c *wkhttp.Context) {
 		OIDCProviders:                  oidcProviders(),
 		// YUJ-219-A / GH#1283：单一真源下发系统 Bot UID 列表，替代三端硬编码。
 		SystemBotUIDs: spacepkg.SystemBotList(),
+		LocalLoginOff: boolToFlag(cn.systemSettings.LocalLoginOff()),
 	})
 }
 
@@ -696,6 +714,14 @@ type appConfigResp struct {
 	// 消费此字段并替换硬编码常量，保持与后端 SystemBotList() 完全一致。
 	// 未来系统 Bot 列表调整（加新 Bot / 改名）只需改后端，无需同步三端。
 	SystemBotUIDs []string `json:"system_bot_uids"`
+
+	// LocalLoginOff 控制前端是否隐藏"本地账号登录"卡片（用户名 / 手机号 / 邮箱
+	// 三种本地登录方式的统一开关）。值来源于 system_setting login.local_off，
+	// 默认 0；为 1 时前端只渲染 SSO/第三方登录入口。
+	//
+	// 与 app_config.version 解耦：即使客户端命中 version 短路分支，也必须能拿到
+	// 最新值，否则 admin 切换开关后老客户端会被本地缓存住。和 SystemBotUIDs 同理。
+	LocalLoginOff int `json:"local_login_off"`
 }
 
 type oidcProviderResp struct {

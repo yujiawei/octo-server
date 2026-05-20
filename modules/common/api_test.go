@@ -119,6 +119,100 @@ func TestGetAppConfig_SystemBotUIDsOnVersionShortCircuit(t *testing.T) {
 	assert.Contains(t, body, `"fileHelper"`)
 }
 
+// appconfig 必须下发 local_login_off：默认 0（缺 system_setting 行）。
+func TestGetAppConfig_LocalLoginOff_DefaultsZero(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+	err = f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"local_login_off":0`)
+}
+
+// system_setting login.local_off=1 + 第三方登录配置齐备时，appconfig 必须
+// 下发 local_login_off=1。OIDC 启用满足"第三方登录已配置"前置条件 —— 没有
+// 这一步 LocalLoginOff() 会触发安全回退强行返回 false,前端会继续渲染本地
+// 登录卡片。这条用例对齐"admin 在配齐 SSO 后才开关本地登录"的运维路径。
+func TestGetAppConfig_LocalLoginOff_DBOverride(t *testing.T) {
+	enableFullOIDCForTest(t)
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+	err = f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+
+	settings := EnsureSystemSettings(ctx)
+	assert.NoError(t, settings.db.upsert("login", "local_off", "1", settingTypeBool, ""))
+	assert.NoError(t, settings.Reload())
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"local_login_off":1`)
+}
+
+// 版本号短路分支同样要下发 local_login_off：system_setting 与 app_config.version
+// 解耦，老客户端命中版本短路也必须看到当前开关，避免被缓存住。
+func TestGetAppConfig_LocalLoginOff_OnVersionShortCircuit(t *testing.T) {
+	enableFullOIDCForTest(t)
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+	err = f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+
+	settings := EnsureSystemSettings(ctx)
+	assert.NoError(t, settings.db.upsert("login", "local_off", "1", settingTypeBool, ""))
+	assert.NoError(t, settings.Reload())
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig?version=99999999", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"local_login_off":1`)
+}
+
+// 安全回退在 appconfig 层同样要体现:DB 写了 local_off=1 但部署没配置任何
+// SSO 时,下发的 local_login_off 必须为 0,否则前端会隐藏本地登录卡片导致
+// 所有人都进不来。这条用例锁定"appconfig 返回的是 effective 值而不是 DB
+// 原始值"这个语义,与 LocalLoginOff() getter 的安全回退一致。
+func TestGetAppConfig_LocalLoginOff_SafetyOverrideWithoutSSO(t *testing.T) {
+	t.Setenv("DM_OIDC_ENABLED", "")
+	s, ctx := testutil.NewTestServer()
+	ctx.GetConfig().Github.ClientID = ""
+	ctx.GetConfig().Github.ClientSecret = ""
+	ctx.GetConfig().Gitee.ClientID = ""
+	ctx.GetConfig().Gitee.ClientSecret = ""
+	f := New(ctx)
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+	err = f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+
+	settings := EnsureSystemSettings(ctx)
+	assert.NoError(t, settings.db.upsert("login", "local_off", "1", settingTypeBool, ""))
+	assert.NoError(t, settings.Reload())
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"local_login_off":0`,
+		"无第三方登录配置 → 自动回退,前端继续显示本地登录")
+}
+
 func TestGetAppConfig_OIDCURLsExplicit(t *testing.T) {
 	t.Setenv("DM_OIDC_ENABLED", "true")
 	t.Setenv("DM_OIDC_ACCOUNT_URL", "https://accounts.example.com/")

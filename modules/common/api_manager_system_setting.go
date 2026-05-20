@@ -276,6 +276,18 @@ func (m *Manager) updateSystemSettings(c *wkhttp.Context) {
 		m.Warn("Reload SystemSettings 失败，等待自动刷新", zap.Error(err))
 	}
 
+	// 写入若涉及 login.local_off,在 Reload 之后再校验一次第三方登录是否齐备。
+	// 故意不阻塞写入:允许 admin 在尚未配置 SSO 时先把开关写到 DB(例如先准
+	// 备运维下一步切流的开关位),LocalLoginOff() 的安全回退会保证此时仍可
+	// 本地登录;日志是唯一信号,告诉运维"开关已落库但当前未生效,先去补
+	// SSO 配置"。
+	for _, p := range plans {
+		if p.def.Category == "login" && p.def.Key == "local_off" {
+			m.systemSettings.LogLocalLoginOffSafetyOverrideIfActive()
+			break
+		}
+	}
+
 	c.ResponseOK()
 }
 

@@ -44,6 +44,12 @@ var systemSettingSchema = []settingDef{
 	{Category: "register", Key: "email_on", Type: settingTypeBool, Description: "是否开启邮箱注册/登录",
 		Effective: func(s *SystemSettings) string { return boolToCanonical(s.RegisterEmailOn()) }},
 
+	// Local-account login master toggle — when on, hides local login UI and
+	// rejects /v1/user/login, /v1/user/usernamelogin, /v1/user/emaillogin so
+	// SSO-only deployments can route all users through OIDC/GitHub/Gitee.
+	{Category: "login", Key: "local_off", Type: settingTypeBool, Description: "是否关闭本地账号登录入口",
+		Effective: func(s *SystemSettings) string { return boolToCanonical(s.LocalLoginOff()) }},
+
 	// Email server config — formerly yaml-only (Support.* in config.go).
 	{Category: "support", Key: "email", Type: settingTypeString, Description: "技术支持邮箱（发件人）",
 		Effective: func(s *SystemSettings) string { return s.SupportEmail() }},
