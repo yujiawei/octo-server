@@ -15,20 +15,11 @@
 //     short-circuits the (grantor, bot) MySQL probe
 //     that checkOBO would otherwise issue per send.
 //   - obo:chan:{ctype}:{cid}   "1" channel has at least one (active grant ×
-//     enabled scope) match; "0" no match. Read AND
-//     written ONLY by the unfiltered
-//     `findActiveGrantsForChannel` — negative answer
+//     enabled scope) match; "0" no match. Read by
+//     findActiveGrantsForChannel — negative answer
 //     short-circuits the JOIN that the fan-out
 //     listener would otherwise issue per inbound
-//     message system-wide. The filtered sibling
-//     `findActiveGrantsForChannelByGrantors`
-//     deliberately bypasses this key in BOTH
-//     directions (PR#114 R4): its result is a
-//     UID-scoped subset, so it cannot prove the
-//     channel-wide negative answer the cache
-//     encodes, and reading a write from the
-//     unfiltered path against a same-string DM key
-//     would suppress legitimate group fan-outs.
+//     message system-wide.
 //
 // Both keys are negative-cache friendly: a "0" answer returned within the
 // 30-second TTL eliminates the MySQL round-trip entirely. Writes that can
@@ -53,6 +44,8 @@ import (
 	"github.com/gocraft/dbr/v2"
 )
 
+// ==================== Models ====================
+
 // isGroupLikeChannelType reports whether channelType is a "group-shaped"
 // type (Group / CommunityTopic) for which an OBO grant with
 // `global_enabled=1` covers EVERY group/topic the grantor participates in
@@ -73,22 +66,10 @@ import (
 // 1:1 conversation that the persona must be explicitly authorized for,
 // and the @grantor narrowing gate cannot be applied (DM payloads carry
 // no mention).
-//
-// PR#114 R3 update — `checkOBO` (the third-party reply send path) was
-// widened symmetrically in the same PR: for group-like channel types
-// it ALSO skips the scope-row requirement when the grant has
-// `global_enabled=1`, so a fan-out copy delivered into a group reaches
-// the bot AND the bot's OBO reply succeeds. The previous version of
-// this comment claimed `checkOBO` still required the scope row "regardless
-// of channel type" — true for the v1 ship but stale after the PR#114
-// commit `fix(obo): checkOBO skips scope check for group-like channels`.
-// DM (Person) `checkOBO` does still require the per-peer scope row.
 func isGroupLikeChannelType(channelType uint8) bool {
 	return channelType == common.ChannelTypeGroup.Uint8() ||
 		channelType == common.ChannelTypeCommunityTopic.Uint8()
 }
-
-// ==================== Models ====================
 
 // oboGrantModel mirrors the obo_grants row. JSON tags are reused by HTTP
 // handlers, which return rows verbatim (v0 has no nuanced DTOs).
@@ -109,25 +90,14 @@ type oboGrantModel struct {
 	// has no user row OR when the field was loaded by a query that did
 	// not include the JOIN. listGrantsByGrantor guarantees a non-empty
 	// value via COALESCE(u.name, g.grantee_bot_uid).
-	GranteeBotName string `db:"grantee_bot_name" json:"grantee_bot_name"`
-	Mode           string `db:"mode" json:"mode"`
-	GlobalEnabled  int    `db:"global_enabled" json:"global_enabled"`
-	Active         int    `db:"active" json:"active"`
-	// PersonaPrompt — YUJ-1465 / Mininglamp-OSS/octo-server#108 (OBO v2).
-	// Free-form, grantor-authored prompt that the fan-out path appends to
-	// the synthetic `obo_system_hint` string handed to the grantee bot.
-	// Empty string disables the append (the default for legacy grants).
-	// Column is TEXT (NULL-able at the schema level — `DEFAULT ''` cannot
-	// be expressed on TEXT for MySQL < 8.0.13). The migration backfills
-	// any pre-v2 NULL row to '' immediately after the ALTER, and every
-	// post-v2 insert / reactivate writes an explicit value, so this
-	// field is safe to scan into a non-pointer `string` on every read
-	// path. The defensive COALESCE in listGrantsByGrantor remains as
-	// belt-and-suspenders for any future non-migrated environment.
-	PersonaPrompt string     `db:"persona_prompt" json:"persona_prompt"`
-	CreatedAt     time.Time  `db:"created_at" json:"created_at"`
-	UpdatedAt     time.Time  `db:"updated_at" json:"updated_at"`
-	RevokedAt     *time.Time `db:"revoked_at" json:"revoked_at,omitempty"`
+	GranteeBotName string     `db:"grantee_bot_name" json:"grantee_bot_name"`
+	Mode           string     `db:"mode" json:"mode"`
+	GlobalEnabled  int        `db:"global_enabled" json:"global_enabled"`
+	Active         int        `db:"active" json:"active"`
+	CreatedAt      time.Time  `db:"created_at" json:"created_at"`
+	UpdatedAt      time.Time  `db:"updated_at" json:"updated_at"`
+	RevokedAt      *time.Time `db:"revoked_at" json:"revoked_at,omitempty"`
+	PersonaPrompt  string     `db:"persona_prompt" json:"persona_prompt,omitempty"`
 }
 
 // oboScopeModel mirrors obo_scopes.
@@ -155,29 +125,14 @@ type oboScopeModel struct {
 //     enabled=0, or the grant_id doesn't exist. The hot path on sendMessage
 //     only needs a boolean.
 //   - findActiveGrantsForChannel: feeder for the fan-out listener; returns
-//     active+global_enabled grants for the channel. Channel-type-aware
-//     (YUJ-1538 / PR#114): for DM (Person) the scope row is still
-//     required (strict per-peer white-list); for group-like channel
-//     types (Group / CommunityTopic) a `global_enabled=1` grant alone
-//     suffices and no `obo_scopes` row is consulted — the per-message
-//     v2 narrowing gate (`@grantor` / `mention.all=1`) and the
-//     `grantorCanReadChannel` re-check carry the opt-in. Empty slice
-//     (not nil) on no match keeps callers branch-free.
-//   - findActiveGrantsForChannelByGrantors: PR#114 R3. Same shape as
-//     findActiveGrantsForChannel for group-like channels but adds a
-//     `grantor_uid IN (...)` filter so the fan-out hot path can
-//     restrict the system-wide scan to the explicit @mentioned UIDs
-//     decoded from `payload.mention.uids`. Used ONLY for group-like
-//     channels with explicit @uids — `mention.all` (@所有人) still goes
-//     through the unfiltered method (see fanoutForMessage doc for the
-//     trade-off). An empty / nil grantorUIDs slice returns an empty
-//     result without touching MySQL — callers should early-return on
-//     the no-mention case instead of paying a wasted query.
+//     active+global_enabled grants whose scope row matches the channel and
+//     enabled=1. Empty slice (not nil) on no match keeps callers branch-free.
 type oboStore interface {
 	findActiveGrantByGrantorBot(grantorUID, granteeBotUID string) (*oboGrantModel, error)
-	// findGrantByGrantorBotActiveOnly — YUJ-1428. Same shape as
+	// findGrantByGrantorBotActiveOnly — YUJ-1428 / restored after PR#121
+	// R5 / B3 rebase regression. Same shape as
 	// findActiveGrantByGrantorBot but ONLY filters on active=1 (the
-	// `global_enabled` master switch is intentionally not consulted).
+	// `global_enabled` master switch is intentionally NOT consulted).
 	//
 	// Why a separate method instead of a parameter: the existing
 	// findActiveGrantByGrantorBot is the auth gate for third-party OBO
@@ -200,6 +155,7 @@ type oboStore interface {
 	// is acceptable.
 	findGrantByGrantorBotActiveOnly(grantorUID, granteeBotUID string) (*oboGrantModel, error)
 	scopeEnabled(grantID int64, channelID string, channelType uint8) (bool, error)
+	scopeRowExists(grantID int64, channelID string, channelType uint8) (bool, error)
 	findActiveGrantsForChannel(channelID string, channelType uint8) ([]*oboGrantModel, error)
 	// findActiveGrantsForChannelByGrantors — PR#114 R3 (Jerry-Xin).
 	// Group-like-only fan-out lookup that filters at the DB layer by the
@@ -209,9 +165,34 @@ type oboStore interface {
 	// empty result with no DB round-trip — callers should treat the
 	// "no mentions" case at the fan-out layer instead of asking the DB.
 	// DM (Person) MUST NOT call this method (no mention semantics on DMs).
+	//
+	// PR#114 R4 — this method MUST NOT read or write the channel-wide
+	// `obo:chan:{type}:{id}` cache: the result is a UID-scoped subset
+	// and cannot prove the channel-wide negative answer the cache
+	// encodes. Writing it would suppress legitimate fan-out for OTHER
+	// grantors; reading a cross-namespace DM write would suppress
+	// legitimate group fan-outs.
 	findActiveGrantsForChannelByGrantors(channelID string, channelType uint8, grantorUIDs []string) ([]*oboGrantModel, error)
+	// PR#121 R9 (YUJ-1676 / Jerry-Xin + lml2468 blocking) — the implicit-
+	// scope feeder now serves both Group and CommunityTopic channels.
+	// `membershipGroupID` is the group whose membership rows gate the
+	// implicit-scope predicate (the channel itself for Group; the PARENT
+	// group for CommunityTopic). `channelID` + `channelType` continue to
+	// identify the row used for the obo_scopes anti-join, so a topic's
+	// own `(parent____short_id, ChannelTypeCommunityTopic)` scope row is
+	// the one that gets honoured for the "explicit scope wins" invariant
+	// — never the parent-group's. See findGlobalGrantsWithoutScope for
+	// the full per-argument contract.
+	findGlobalGrantsWithoutScope(membershipGroupID, channelID string, channelType uint8) ([]*oboGrantModel, error)
 
-	// CRUD used by the REST layer
+	// CRUD used by the REST layer.
+	//
+	// insertGrant persists `persona_prompt` alongside the row. The column was
+	// added nullable in migration 20260521000001_obo_v2_persona_prompt.sql and
+	// existing call sites pass "" — the explicit parameter exists so the row
+	// is written with an empty string instead of NULL, which prevents
+	// downstream `SELECT *` reads from blowing up scanning a *string into a
+	// non-pointer string field. (GH#122)
 	insertGrant(grantorUID, granteeBotUID, mode, personaPrompt string) (int64, error)
 	listGrantsByGrantor(grantorUID string) ([]*oboGrantModel, error)
 	findGrantByID(id int64) (*oboGrantModel, error)
@@ -230,35 +211,41 @@ type oboStore interface {
 	// Returns nil on missing row so callers can treat reactivation as
 	// idempotent. See findGrantByGrantorBot for the lookup pattern.
 	reactivateGrant(id int64) error
-	// createOrReactivateGrantAtomic — YUJ-1471 / PR#109 review blocker #2.
+	// createOrReactivateGrantAtomic — YUJ-1471 / PR#109 review blocker #2
+	// (restored after PR#121 R5 / B2 rebase regression).
+	//
 	// Atomically creates a fresh grant or reactivates a soft-deleted grant
 	// for the (grantor, bot) pair, applies `personaPrompt`, and demotes
 	// every OTHER active grant under the same grantor. The entire flow
-	// runs inside a single transaction so callers can never observe a
-	// partial state — in particular, two concurrent creates for different
-	// bots under the same grantor cannot both succeed and then mutually
-	// demote each other to active=0.
+	// runs inside a single MySQL transaction so callers can never observe
+	// a partial state — in particular, two concurrent creates for
+	// different bots under the same grantor cannot both succeed and then
+	// mutually demote each other to active=0, leaving the grantor with
+	// zero active personas and a 200 OK on the wire.
 	//
-	// The transaction takes a `SELECT ... FOR UPDATE` row-lock on the
-	// grantor's user row before doing any obo_grants work, so concurrent
-	// create/reactivate flows for the SAME grantor serialize on that lock.
-	// The (grantor_uid, grantee_bot_uid) UNIQUE KEY remains the secondary
+	// The transaction takes a `SELECT 1 FROM user WHERE uid=? FOR UPDATE`
+	// row-lock on the grantor's user row before doing any obo_grants
+	// work, so concurrent create/reactivate flows for the SAME grantor
+	// serialize on that lock regardless of which bot they target. The
+	// (grantor_uid, grantee_bot_uid) UNIQUE KEY remains the secondary
 	// floor for same-bot duplicates.
 	//
 	// Reactivation semantics (PR#109 review blocker #3): on reactivation
-	// `personaPrompt` is written verbatim — including empty string, which
-	// is the explicit "clear the prompt" signal. The previously-revoked
-	// row's stale prompt is overwritten regardless of the new value, so
-	// a reactivation never inherits the prior persona's instructions.
+	// `personaPrompt` is written verbatim — including the empty string,
+	// which is the explicit "clear the prompt" signal. The
+	// previously-revoked row's stale prompt is overwritten regardless of
+	// the new value, so a reactivation never inherits the prior
+	// persona's instructions.
 	//
 	// Returns:
 	//   - (grant, false, nil) on a fresh insert
 	//   - (grant, true,  nil) on a reactivation of a previously-revoked row
-	//   - (nil,   false, errOBOGrantAlreadyActive) when the (grantor, bot)
-	//     pair already has an active grant (REST translates to 409)
+	//   - (nil,   false, errOBOGrantAlreadyActive) when the (grantor,
+	//     bot) pair already has an active grant (REST translates to 409)
 	//
 	// Any DB failure (insert, update, demotion, etc.) rolls the entire
-	// transaction back so the caller never observes a half-applied state.
+	// transaction back so the caller never observes a half-applied
+	// state.
 	createOrReactivateGrantAtomic(grantorUID, granteeBotUID, mode, personaPrompt string) (*oboGrantModel, bool, error)
 	revokeGrant(id int64) error
 	insertScope(grantID int64, channelID string, channelType uint8, enabled int) (int64, error)
@@ -295,10 +282,7 @@ const (
 	// have at least one (active grant × enabled scope) match". The fan-out
 	// listener consults this scalar before the JOIN it would otherwise
 	// issue per inbound message system-wide. Population: written on every
-	// UNFILTERED findActiveGrantsForChannel result (count 0 → "0",
-	// count >0 → "1"). The filtered sibling
-	// findActiveGrantsForChannelByGrantors MUST NOT write here — see
-	// PR#114 R4 and the function doc for the poisoning scenario.
+	// findActiveGrantsForChannel result (count 0 → "0", count >0 → "1").
 	// Eviction: insertScope / deleteScope (the only operations that can
 	// flip the answer for a given channel within the TTL window).
 	oboChannelActiveCacheKeyFmt = "obo:chan:%d:%s"
@@ -306,6 +290,24 @@ const (
 	// comment above.
 	oboCacheTTL = 30 * time.Second
 )
+
+// oboGrantColumns is the explicit column list used by every `obo_grants`
+// SELECT path that decodes into oboGrantModel. We avoid `SELECT *` because
+// `persona_prompt` is a nullable TEXT column (migration
+// 20260521000001_obo_v2_persona_prompt.sql) and dbr panics when a NULL is
+// scanned into the non-pointer `PersonaPrompt string` field. COALESCE
+// guarantees a string at the driver boundary so legacy rows written before
+// the column existed (or by call paths that pre-date insertGrant carrying
+// persona_prompt) still load cleanly. (GH#122)
+const oboGrantColumns = "id, grantor_uid, grantee_bot_uid, mode, global_enabled, active, " +
+	"created_at, updated_at, revoked_at, " +
+	"COALESCE(persona_prompt, '') AS persona_prompt"
+
+// oboGrantColumnsAliased mirrors oboGrantColumns for queries that JOIN the
+// `obo_grants` table aliased as `g` (the fan-out feeders).
+const oboGrantColumnsAliased = "g.id, g.grantor_uid, g.grantee_bot_uid, g.mode, g.global_enabled, g.active, " +
+	"g.created_at, g.updated_at, g.revoked_at, " +
+	"COALESCE(g.persona_prompt, '') AS persona_prompt"
 
 // findActiveGrantByGrantorBot — see oboStore for the contract.
 //
@@ -325,10 +327,11 @@ func (d *botAPIDB) findActiveGrantByGrantorBot(grantorUID, granteeBotUID string)
 		return nil, nil
 	}
 	var m *oboGrantModel
-	_, err := d.session.Select("*").From("obo_grants").
-		Where("grantor_uid=? AND grantee_bot_uid=? AND active=1 AND global_enabled=1",
-			grantorUID, granteeBotUID).
-		Load(&m)
+	_, err := d.session.SelectBySql(
+		"SELECT "+oboGrantColumns+" FROM obo_grants "+
+			"WHERE grantor_uid=? AND grantee_bot_uid=? AND active=1 AND global_enabled=1",
+		grantorUID, granteeBotUID,
+	).Load(&m)
 	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
 		return nil, err
 	}
@@ -344,7 +347,8 @@ func (d *botAPIDB) findActiveGrantByGrantorBot(grantorUID, granteeBotUID string)
 	return m, nil
 }
 
-// findGrantByGrantorBotActiveOnly — see oboStore. YUJ-1428.
+// findGrantByGrantorBotActiveOnly — see oboStore. YUJ-1428 / restored
+// after PR#121 R5 / B3 rebase regression.
 //
 // Bypasses the `obo:grantor:{uid}` negative cache because that cache
 // answers "any active AND global_enabled grant exists for grantor",
@@ -359,10 +363,11 @@ func (d *botAPIDB) findGrantByGrantorBotActiveOnly(grantorUID, granteeBotUID str
 		return nil, nil
 	}
 	var m *oboGrantModel
-	_, err := d.session.Select("*").From("obo_grants").
-		Where("grantor_uid=? AND grantee_bot_uid=? AND active=1",
-			grantorUID, granteeBotUID).
-		Load(&m)
+	_, err := d.session.SelectBySql(
+		"SELECT "+oboGrantColumns+" FROM obo_grants "+
+			"WHERE grantor_uid=? AND grantee_bot_uid=? AND active=1",
+		grantorUID, granteeBotUID,
+	).Load(&m)
 	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
 		return nil, err
 	}
@@ -385,46 +390,35 @@ func (d *botAPIDB) scopeEnabled(grantID int64, channelID string, channelType uin
 	return count > 0, nil
 }
 
-// findActiveGrantsForChannel — see oboStore. Single index-hit so the
-// fan-out hot path doesn't have to issue a per-grant scope lookup.
+// scopeRowExists checks if any scope row exists for this (grant, channel)
+// regardless of enabled state. Used to distinguish "no scope configured"
+// (implicit scope candidate) from "scope explicitly disabled" (admin
+// intentionally excluded this channel).
+func (d *botAPIDB) scopeRowExists(grantID int64, channelID string, channelType uint8) (bool, error) {
+	if grantID == 0 || channelID == "" {
+		return false, nil
+	}
+	var count int
+	err := d.session.SelectBySql(
+		"SELECT COUNT(*) FROM obo_scopes WHERE grant_id=? AND channel_id=? AND channel_type=?",
+		grantID, channelID, channelType,
+	).LoadOne(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// findActiveGrantsForChannel — see oboStore. Single JOIN so the fan-out
+// hot path doesn't have to issue a per-grant scope lookup.
 //
 // Read path consults `obo:chan:{type}:{id}` first. A cached "0" answer
 // returns an empty slice without touching MySQL — the fan-out listener
 // fires for every inbound message system-wide, so the vast majority of
-// channels (those with no OBO grants) avoid the lookup entirely. Positive
+// channels (those with no OBO grants) avoid the JOIN entirely. Positive
 // hits and MySQL fallback both repopulate the cache with the count-based
 // scalar ("1" any matches, "0" none). Cache errors swallowed; production
 // behavior is identical whether Redis is healthy or absent.
-//
-// YUJ-1538 — channel-type-aware lookup:
-//
-//   - DM (Person, channel_type=1): keeps the strict
-//     `obo_grants ⨝ obo_scopes` JOIN. DMs are 1:1 conversations and the
-//     persona must be explicitly white-listed per peer. This is the
-//     pre-existing contract and is unchanged.
-//
-//   - Group (channel_type=2) / CommunityTopic (channel_type=5): a grant
-//     with `active=1 AND global_enabled=1` covers EVERY group/topic the
-//     grantor participates in, WITHOUT requiring an `obo_scopes` row.
-//     v2 narrowing (`mention.uids` must contain the grantor, or
-//     `mention.all=1`) is the effective per-message opt-in instead of a
-//     scope row, and the per-grant `grantorCanReadChannel` re-check in
-//     fanoutForMessage still enforces live channel membership. The bug
-//     PR#109 left behind: `obo_scopes` only ever held `channel_type=1`
-//     rows in production (operators never created group scopes), so the
-//     INNER JOIN returned zero matches for every group inbound and the
-//     fan-out copy never reached the bot — even though `checkOBO` had
-//     already been updated to bypass the scope check for groups.
-//
-// Cache notes (group/topic): the per-channel cache key still gates the
-// hot path. When the FIRST `global_enabled=1` grant is enabled in a
-// previously-empty system, group channel cache entries holding a stale
-// "0" remain so for at most `oboCacheTTL` (30s); after that the next
-// inbound re-queries MySQL and the cache flips. Per-channel
-// invalidation of group caches at grant-enable time would require
-// enumerating every group the grantor participates in, which is more
-// work than the bounded warmup window saves; the same 30s TTL was the
-// design's accepted risk in RFC §11.
 func (d *botAPIDB) findActiveGrantsForChannel(channelID string, channelType uint8) ([]*oboGrantModel, error) {
 	if channelID == "" {
 		return []*oboGrantModel{}, nil
@@ -433,32 +427,13 @@ func (d *botAPIDB) findActiveGrantsForChannel(channelID string, channelType uint
 		return []*oboGrantModel{}, nil
 	}
 	var grants []*oboGrantModel
-	var err error
-	if isGroupLikeChannelType(channelType) {
-		// Group / CommunityTopic — `global_enabled=1` is sufficient,
-		// no scope row required. Returns every active+enabled grant
-		// system-wide; the per-grant `grantorCanReadChannel` re-check
-		// in the fan-out loop filters to grants whose grantor is
-		// actually a member of THIS group/topic. With the v2
-		// `uk_grantor_grantee` UNIQUE + create-mutex (PR#109), the
-		// number of active+enabled grants is bounded — at most one
-		// per grantor — so the fan-out cost is O(grantors) per
-		// inbound, not O(scopes).
-		_, err = d.session.SelectBySql(
-			"SELECT g.* FROM obo_grants g " +
-				"WHERE g.active=1 AND g.global_enabled=1",
-		).Load(&grants)
-	} else {
-		// DM (Person) and any other unrecognized channel type — keep
-		// the original strict JOIN so behavior is unchanged outside
-		// the group-like path.
-		_, err = d.session.SelectBySql(
-			"SELECT g.* FROM obo_grants g INNER JOIN obo_scopes s ON s.grant_id=g.id "+
-				"WHERE g.active=1 AND g.global_enabled=1 AND s.enabled=1 "+
-				"AND s.channel_id=? AND s.channel_type=?",
-			channelID, channelType,
-		).Load(&grants)
-	}
+	_, err := d.session.SelectBySql(
+		"SELECT "+oboGrantColumnsAliased+" "+
+			"FROM obo_grants g INNER JOIN obo_scopes s ON s.grant_id=g.id "+
+			"WHERE g.active=1 AND g.global_enabled=1 AND s.enabled=1 "+
+			"AND s.channel_id=? AND s.channel_type=?",
+		channelID, channelType,
+	).Load(&grants)
 	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
 		return nil, err
 	}
@@ -470,90 +445,169 @@ func (d *botAPIDB) findActiveGrantsForChannel(channelID string, channelType uint
 }
 
 // findActiveGrantsForChannelByGrantors — PR#114 R3 (Jerry-Xin perf
-// blocker). Same shape as `findActiveGrantsForChannel` for group-like
-// channels but scoped at the DB layer to the explicit `grantorUIDs`
-// set decoded from `payload.mention.uids`. The fan-out hot path uses
-// this when an inbound group message carries an explicit @grantor
-// mention so we never load grants for OTHER grantors who weren't
-// mentioned.
+// blocker). UID-FILTERED variant of findActiveGrantsForChannel for the
+// group-like fan-out path: when a message in a group / community-topic
+// explicitly @-mentions one or more grantor UIDs, the fan-out hot path
+// passes that set as `grantorUIDs` and the DB filters to just those
+// rows instead of returning every system-wide grant.
 //
-// Why this matters (Jerry-Xin's perf flag): the v2 group lookup loads
-// EVERY active+global_enabled grant system-wide and then post-filters
-// in Go, so every inbound group message — even plain text or @AI —
-// would otherwise pay an O(grants_total) DB scan. With this method
-// the DB returns at most `len(grantorUIDs)` rows (uk_grantor_grantee
-// guarantees one row per grantor), so the cost is O(mentioned_grantors)
-// per inbound and the unmentioned grantors never leave their index page.
+// PR#114 R4 invariant: this method MUST NOT consult or update the
+// channel-wide `obo:chan:{type}:{id}` cache in either direction. The
+// result is a UID-scoped subset and cannot prove the channel-wide
+// negative answer the cache encodes. See the function doc on
+// channelCacheSaysNone / writeChannelCache for the poisoning scenario.
 //
-// Behavior:
-//   - DM / Person (or any non-group-like type) → empty slice + nil
-//     error. Callers must NOT use this for DMs (no mention semantics).
-//   - Empty / nil grantorUIDs → empty slice + nil error WITHOUT a DB
-//     round-trip. The caller's early-return path should mean we never
-//     reach this branch, but the guard makes the contract self-evident.
-//   - channelID == "" → empty slice + nil error (defensive).
-//
-// Cache: this method MUST NOT touch the `obo:chan:{type}:{id}`
-// channel-wide scalar in either direction (PR#114 R4 — Jerry-Xin /
-// lml2468 cache-poisoning blocker, 2026-05-21).
-//
-// Why no WRITE: the cache key answers "does this channel have ANY
-// active grant × enabled scope" — a CHANNEL-WIDE property. This
-// method's result is a UID-filtered subset, so a zero result here
-// only proves "none of the mentioned grantors have a grant", NOT
-// "the channel has no grants". Writing "0" after a filtered miss
-// would poison the cache for the NEXT inbound that mentions a
-// different grantor who DOES have a grant — the channelCacheSaysNone
-// short-circuit at the top of `findActiveGrantsForChannel` (or any
-// other consumer) would early-return empty and suppress the fan-out.
-//
-// Why no READ: the same cache key may legitimately hold "0" written
-// by the unfiltered `findActiveGrantsForChannel` for a channelID that
-// happens to share its string with this method's group ID (DM peer
-// uids and group ids live in the same Redis namespace). Honoring
-// that "0" here would incorrectly suppress a group query whose
-// mentioned-grantor SET we have not actually probed against MySQL.
-//
-// The unfiltered `findActiveGrantsForChannel` (used by the DM path
-// and the `@所有人` group broadcast path) still manages the channel
-// cache correctly because its result IS the channel-wide truth.
+// PR#121 R5 / B1 (Jerry-Xin + lml2468 blocker): an explicit `obo_scopes`
+// row with `enabled=0` MUST suppress fan-out for this channel even when
+// the inbound message @-mentions the grantor. The "explicit scope row
+// takes precedence" invariant is enforced for the implicit-scope feeder
+// (findGlobalGrantsWithoutScope) and for the unfiltered explicit path
+// (findActiveGrantsForChannel via INNER JOIN obo_scopes ... enabled=1).
+// Pre-fix this UID-filtered query had no scope predicate at all, so a
+// channel admin could explicitly disable a channel via POST
+// /v1/obo/scopes (enabled=0) and a malicious peer could still trigger
+// a fan-out by @-mentioning the grantor — completely defeating the
+// admin's disable. The LEFT JOIN below acts as an anti-join: a row with
+// `enabled=0` for (grant_id, channel_id, channel_type) makes
+// `s.enabled=0` non-NULL and filters the grant out. Scope rows with
+// `enabled=1` (explicit allow) and the no-row case (implicit-scope
+// candidate) both pass through unaffected.
 func (d *botAPIDB) findActiveGrantsForChannelByGrantors(channelID string, channelType uint8, grantorUIDs []string) ([]*oboGrantModel, error) {
 	if channelID == "" || len(grantorUIDs) == 0 {
 		return []*oboGrantModel{}, nil
 	}
 	if !isGroupLikeChannelType(channelType) {
-		// Method is group-like-only by contract; defensive return so a
-		// caller wiring this on the DM path can't silently widen access.
 		return []*oboGrantModel{}, nil
 	}
-	// Intentionally NO channelCacheSaysNone check here — see the
-	// "Why no READ" paragraph in the doc comment above.
-
-	// Build the IN (...) placeholder list. dbr's positional binding
-	// expands a `[]interface{}` arg into the right number of `?` for
-	// the query, but we need to construct the literal placeholder
-	// string ourselves because the dbr SelectBySql shape in this file
-	// uses positional `?` markers.
-	placeholders := make([]string, len(grantorUIDs))
-	args := make([]interface{}, 0, len(grantorUIDs))
-	for i, uid := range grantorUIDs {
-		placeholders[i] = "?"
-		args = append(args, uid)
+	// Build the `IN (?,?,?...)` placeholder list. dbr handles the bind
+	// expansion when we pass a []string, but we go through the explicit
+	// placeholder shape so the SQL string is debuggable in slow-query
+	// logs.
+	placeholders := make([]string, 0, len(grantorUIDs))
+	args := make([]interface{}, 0, len(grantorUIDs)+2)
+	// LEFT JOIN bind args first (channel_id, channel_type) so they
+	// line up with the `?` slots in the JOIN clause; the IN-list args
+	// come after to match the trailing `WHERE ... IN (?, ?, ...)`.
+	args = append(args, channelID, channelType)
+	for _, u := range grantorUIDs {
+		placeholders = append(placeholders, "?")
+		args = append(args, u)
 	}
-
-	var grants []*oboGrantModel
-	q := "SELECT g.* FROM obo_grants g " +
+	// LEFT JOIN obo_scopes for the *disabled* scope row only — when no
+	// disabled row exists, `s.id IS NULL` lets the grant through; when a
+	// disabled row exists, the predicate filters the grant out. Allow
+	// rows (enabled=1) and absence-of-row both keep the grant eligible,
+	// preserving v2 implicit-scope semantics for @-mentioned grantors.
+	sqlStr := "SELECT " + oboGrantColumnsAliased + " FROM obo_grants g " +
+		"LEFT JOIN obo_scopes s " +
+		"  ON s.grant_id = g.id " +
+		"  AND s.channel_id = ? " +
+		"  AND s.channel_type = ? " +
+		"  AND s.enabled = 0 " +
 		"WHERE g.active=1 AND g.global_enabled=1 " +
-		"AND g.grantor_uid IN (" + strings.Join(placeholders, ",") + ")"
-	_, err := d.session.SelectBySql(q, args...).Load(&grants)
+		"  AND s.id IS NULL " +
+		"  AND g.grantor_uid IN (" + strings.Join(placeholders, ",") + ")"
+	var grants []*oboGrantModel
+	_, err := d.session.SelectBySql(sqlStr, args...).Load(&grants)
 	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
 		return nil, err
 	}
 	if grants == nil {
 		grants = []*oboGrantModel{}
 	}
-	// Intentionally NO writeChannelCache call here — see the
-	// "Why no WRITE" paragraph in the doc comment above.
+	// Intentionally NO cache write: PR#114 R4.
+	return grants, nil
+}
+
+// findGlobalGrantsWithoutScope returns active grants with global_enabled=1
+// that satisfy ALL three implicit-scope conditions for fan-out in (channelID,
+// channelType):
+//
+//  1. no explicit scope row exists for this channel (anything explicit, even
+//     `enabled=0`, takes precedence — admins disable a channel intentionally).
+//  2. the grantor IS currently a member of `membershipGroupID` (otherwise the
+//     grantor has no read access and the bot must not harvest the channel).
+//  3. the grantee bot is NOT currently a member of `membershipGroupID` (Gate 4
+//     — when the bot is already in the group it receives messages directly via
+//     the WuKongIM subscriber pipeline, so a fan-out copy would double-process).
+//
+// Implicit-scope applies to group-like channels — Group and CommunityTopic
+// (PR#121 R9 / YUJ-1676 Jerry-Xin + lml2468 blocker). For non-group-like
+// channels (DM, Customer Service, …) the function returns an empty slice;
+// the caller already gates on the channel type, the extra check here is
+// belt-and-braces so a future caller cannot accidentally trigger the JOIN
+// with a non-group `channel_id`.
+//
+// `membershipGroupID` vs (`channelID`, `channelType`) — pre-R9 the function
+// took a single channel id and used it for BOTH the `group_member` join
+// (membership predicates 2 & 3) AND the `obo_scopes` anti-join (predicate 1).
+// That worked for Group only, because Group's `channel_id` IS the membership
+// group_no. For CommunityTopic the `channel_id` is `"<parent>____<short_id>"`
+// and the membership rows live on `<parent>` — so we now accept the two
+// keys independently:
+//
+//   - Group           → caller passes (channelID, channelID, ChannelTypeGroup)
+//   - CommunityTopic  → caller passes (parentGroupID, topicChannelID,
+//                       ChannelTypeCommunityTopic)
+//
+// Scope anti-join still uses the channel's own (channel_id, channel_type) so
+// a topic's `enabled=0` row suppresses fan-out for that topic only — never
+// for sibling topics or the parent group itself. The "explicit scope wins"
+// invariant from PR#121 R5 / B1 is preserved per-channel.
+//
+// Perf rationale (PR#121 review — Jerry-Xin 15:21 blocking): the previous
+// implementation returned every active+global_enabled grant in the system
+// regardless of membership, and the caller looped in Go doing one
+// `userIsGroupMember(grantor)` query + one `userIsGroupMember(bot)` query
+// per grant. For every inbound group message that meant O(total global
+// grants) per-message DB round-trips. Pushing both membership predicates
+// into a single JOIN here collapses the entire scan into one SQL statement
+// — the planner uses the (group_no, uid) covering index on `group_member`
+// once for each join leg and the `(grant_id, channel_id, channel_type)`
+// index on `obo_scopes` once for the anti-join.
+//
+// Returned grants are READY FOR DISPATCH with respect to scope+membership:
+// the caller does NOT need to re-run `grantorCanReadChannel` or Gate 4 for
+// these rows. (Gates 1 / 2 / TOCTOU-after-DB-query still apply, of course;
+// see obo_fanout.go for the residual checks.)
+func (d *botAPIDB) findGlobalGrantsWithoutScope(membershipGroupID, channelID string, channelType uint8) ([]*oboGrantModel, error) {
+	if membershipGroupID == "" || channelID == "" {
+		return []*oboGrantModel{}, nil
+	}
+	// Implicit-scope semantics are group-like only — the membership joins
+	// below have no meaning for DMs or customer-service channels. Caller
+	// already gates on this; we re-assert defensively so a future caller
+	// cannot regress.
+	if !isGroupLikeChannelType(channelType) {
+		return []*oboGrantModel{}, nil
+	}
+	var grants []*oboGrantModel
+	_, err := d.session.SelectBySql(
+		"SELECT "+oboGrantColumnsAliased+" FROM obo_grants g "+
+			"INNER JOIN group_member gm_grantor "+
+			"  ON gm_grantor.uid = g.grantor_uid "+
+			"  AND gm_grantor.group_no = ? "+
+			"  AND gm_grantor.is_deleted = 0 "+
+			"LEFT JOIN group_member gm_bot "+
+			"  ON gm_bot.uid = g.grantee_bot_uid "+
+			"  AND gm_bot.group_no = ? "+
+			"  AND gm_bot.is_deleted = 0 "+
+			"LEFT JOIN obo_scopes s "+
+			"  ON s.grant_id = g.id "+
+			"  AND s.channel_id = ? "+
+			"  AND s.channel_type = ? "+
+			"WHERE g.active = 1 "+
+			"  AND g.global_enabled = 1 "+
+			"  AND gm_bot.uid IS NULL "+
+			"  AND s.id IS NULL",
+		membershipGroupID, membershipGroupID, channelID, channelType,
+	).Load(&grants)
+	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
+		return nil, err
+	}
+	if grants == nil {
+		grants = []*oboGrantModel{}
+	}
 	return grants, nil
 }
 
@@ -561,17 +615,20 @@ func (d *botAPIDB) findActiveGrantsForChannelByGrantors(channelID string, channe
 // constraint violations (grantor+grantee already exists) surface verbatim so
 // the REST layer can translate them to 409.
 //
-// YUJ-1465 — `personaPrompt` is the free-form behavioral prompt the
-// fan-out path appends to `obo_system_hint`. Empty string is the
-// schema default and the legacy behavior.
+// `personaPrompt` is persisted on insert (defaulting to "" when the caller
+// passes the zero value). Writing an explicit empty string — instead of
+// letting the column default to NULL — is what GH#122 required: legacy code
+// paths that re-read the row via dbr `Load(*oboGrantModel)` would otherwise
+// hit a "scan NULL into string" panic, because the column is nullable but
+// the struct field isn't.
 func (d *botAPIDB) insertGrant(grantorUID, granteeBotUID, mode, personaPrompt string) (int64, error) {
 	if mode == "" {
 		mode = "auto"
 	}
 	res, err := d.session.InsertInto("obo_grants").
-		Columns("grantor_uid", "grantee_bot_uid", "mode", "global_enabled", "active",
-			"persona_prompt", "created_at", "updated_at").
-		Values(grantorUID, granteeBotUID, mode, 0, 1, personaPrompt, time.Now(), time.Now()).
+		Columns("grantor_uid", "grantee_bot_uid", "mode", "persona_prompt",
+			"global_enabled", "active", "created_at", "updated_at").
+		Values(grantorUID, granteeBotUID, mode, personaPrompt, 0, 1, time.Now(), time.Now()).
 		Exec()
 	if err != nil {
 		return 0, err
@@ -630,7 +687,9 @@ func (d *botAPIDB) listGrantsByGrantor(grantorUID string) ([]*oboGrantModel, err
 // resolve+authorize the row before mutating.
 func (d *botAPIDB) findGrantByID(id int64) (*oboGrantModel, error) {
 	var m *oboGrantModel
-	_, err := d.session.Select("*").From("obo_grants").Where("id=?", id).Load(&m)
+	_, err := d.session.SelectBySql(
+		"SELECT "+oboGrantColumns+" FROM obo_grants WHERE id=?", id,
+	).Load(&m)
 	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
 		return nil, err
 	}
@@ -660,9 +719,6 @@ func (d *botAPIDB) updateGrant(id int64, mode string, globalEnabled *int, person
 		updates["global_enabled"] = v
 	}
 	if personaPrompt != nil {
-		// Empty string is the explicit "clear the prompt" signal; the
-		// schema default is also '' so callers can round-trip either
-		// shape safely.
 		updates["persona_prompt"] = *personaPrompt
 	}
 	if len(updates) == 0 {
@@ -808,9 +864,10 @@ func (d *botAPIDB) findGrantByGrantorBot(grantorUID, granteeBotUID string) (*obo
 		return nil, nil
 	}
 	var m *oboGrantModel
-	_, err := d.session.Select("*").From("obo_grants").
-		Where("grantor_uid=? AND grantee_bot_uid=?", grantorUID, granteeBotUID).
-		Load(&m)
+	_, err := d.session.SelectBySql(
+		"SELECT "+oboGrantColumns+" FROM obo_grants WHERE grantor_uid=? AND grantee_bot_uid=?",
+		grantorUID, granteeBotUID,
+	).Load(&m)
 	if err != nil && !errors.Is(err, dbr.ErrNotFound) {
 		return nil, err
 	}
@@ -842,16 +899,6 @@ func (d *botAPIDB) reactivateGrant(id int64) error {
 	return nil
 }
 
-// deactivateOtherActiveGrants — removed in PR#109 R3.
-// The non-transactional standalone soft-deleter was superseded by
-// createOrReactivateGrantAtomic, which folds the demote step inside the
-// same SERIALIZABLE-grade transaction (SELECT ... FOR UPDATE on the
-// grantor row + UPDATE on the OTHER active rows + commit). Keeping the
-// standalone method around encouraged callers to bypass the mutex
-// transaction and re-introduce the two-grant race PR#109 closed. The
-// fan-out cache-invalidation logic now lives inline in
-// createOrReactivateGrantAtomic.
-
 // errOBOGrantAlreadyActive is the sentinel returned by
 // createOrReactivateGrantAtomic when the (grantor, bot) pair already has
 // an active grant on file. The REST layer translates this into a 409
@@ -860,15 +907,15 @@ func (d *botAPIDB) reactivateGrant(id int64) error {
 var errOBOGrantAlreadyActive = errors.New("obo: active grant already exists for (grantor, bot) pair")
 
 // createOrReactivateGrantAtomic — see oboStore. YUJ-1471 / PR#109 review
-// blocker #2 + #3.
+// blocker #2 + #3, restored after the PR#121 R5 / B2 rebase regression.
 //
-// Wraps the entire (insert | reactivate) + deactivate-others sequence in
-// a single MySQL transaction. The first statement inside the tx is a
+// Wraps the entire (insert | reactivate) + demote-others sequence in a
+// single MySQL transaction. The first statement inside the tx is a
 // `SELECT 1 FROM user WHERE uid=? FOR UPDATE` row lock on the grantor's
 // user row — concurrent grant create/reactivate flows for the SAME
 // grantor block on this lock, eliminating the v2 race where two
-// concurrent POSTs (different bots, same grantor) could both succeed
-// and then mutually demote each other to active=0. The (grantor_uid,
+// concurrent POSTs (different bots, same grantor) could both succeed and
+// then mutually demote each other to active=0. The (grantor_uid,
 // grantee_bot_uid) UNIQUE KEY remains the floor for same-bot duplicates.
 //
 // Reactivation always overwrites the previously-revoked row's
@@ -1029,6 +1076,7 @@ func (d *botAPIDB) createOrReactivateGrantAtomic(grantorUID, granteeBotUID, mode
 	return grant, reactivated, nil
 }
 
+// findScopeOwner — see oboStore. Single JOIN replaces the
 // O(grants × scopes_per_grant) scan that scopeOwnedBy used to perform
 // on every `DELETE /v1/obo/scopes/:id` (PR#82 review #2 P1-3).
 func (d *botAPIDB) findScopeOwner(scopeID int64) (string, bool, error) {

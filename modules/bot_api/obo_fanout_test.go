@@ -308,6 +308,16 @@ func TestPayloadHasReservedOBOKey(t *testing.T) {
 		{"the marker itself", map[string]interface{}{"__obo_processed__": true}, true},
 		{"any double-underscore obo key", map[string]interface{}{"__obo_anything__": "x"}, true},
 		{"mixed in", map[string]interface{}{"type": 1, "__obo_marker": false}, true},
+		// PR#121 R3 — actual_sender_uid is server-only (no `obo_`
+		// prefix) so the bot-API ingress MUST reject a bot client
+		// that tries to spoof the real-bot-behind-OBO identity.
+		{"actual_sender_uid rejected", map[string]interface{}{"actual_sender_uid": "bot_admin"}, true},
+		{"actual_sender_uid mixed in", map[string]interface{}{"type": 1, "content": "hi", "actual_sender_uid": "bot_x"}, true},
+		// Anti-overreach: adjacent client field names must not
+		// trip the reject (otherwise we'd break unrelated bot
+		// schemas that happen to ship `sender_uid` / `actual_sender`).
+		{"adjacent sender_uid passes", map[string]interface{}{"sender_uid": "u"}, false},
+		{"adjacent actual_sender passes", map[string]interface{}{"actual_sender": "u"}, false},
 	}
 	for _, tc := range cases {
 		got := payloadHasReservedOBOKey(tc.payload)
@@ -1141,5 +1151,367 @@ func TestFanout_DispatchReq_RealDispatcher_ContractCheck(t *testing.T) {
 	}
 	if len(rejected) != 0 {
 		t.Fatalf("WuKongIM contract violations: %v", rejected)
+	}
+}
+
+// TestFanout_ImplicitScope_GrantorMember_BotNotMember — PR#121 perf
+// optimization. With global_enabled=1 and NO explicit scope row, the
+// implicit-scope SQL feeder is the source of truth for "grantor IS in
+// group AND bot is NOT in group". A group message into such a channel
+// must produce one fan-out copy without the dispatch loop ever calling
+// `grantorCanReadChannel` or `userIsGroupMember(bot)` again — the SQL
+// already established both predicates.
+func TestFanout_ImplicitScope_GrantorMember_BotNotMember(t *testing.T) {
+	const groupNo = "group_implicit_42"
+	ct := common.ChannelTypeGroup.Uint8()
+
+	s := newFakeOBOStore()
+	gid, err := s.insertGrant(tGrantor, tBot, "auto", "")
+	if err != nil {
+		t.Fatalf("insertGrant: %v", err)
+	}
+	enable := 1
+	if err := s.updateGrant(gid, "", &enable, nil); err != nil {
+		t.Fatalf("updateGrant: %v", err)
+	}
+	// Grantor is a member; bot is intentionally NOT a member.
+	s.seedGroupMember(groupNo, tGrantor)
+
+	fc := &fanoutCapture{}
+	ba := newBAforFanout(s, fc)
+	// If the access override fires for an implicit-scope grant, the SQL
+	// pre-validation got bypassed — surface that as a hard failure so a
+	// regression that re-introduces the per-grant Go check is caught.
+	ba.oboChannelAccessOverride = func(uid, channelID string, channelType uint8) (bool, error) {
+		t.Errorf("implicit-scope grant must NOT trigger grantorCanReadChannel (uid=%q chan=%q)", uid, channelID)
+		return true, nil
+	}
+
+	msg := &config.MessageResp{
+		FromUID:     "u_alice", // not bot, not grantor
+		ChannelID:   groupNo,
+		ChannelType: ct,
+		Payload:     []byte(`{"type":1,"content":"hello implicit-scope","mention":{"uids":["user_yu"]}}`),
+	}
+	if n := ba.fanoutForMessage(msg); n != 1 {
+		t.Fatalf("implicit-scope grantor-member happy path: expected 1 fan-out, got %d", n)
+	}
+	if len(fc.copies) != 1 || fc.copies[0].ChannelID != tBot {
+		t.Fatalf("implicit-scope grantor-member happy path: wrong dispatch, copies=%+v", fc.copies)
+	}
+}
+
+// TestFanout_ImplicitScope_GrantorNotMember_NoFanout — when the grantor
+// is NOT a current group member the SQL JOIN's `INNER JOIN group_member
+// gm_grantor` excludes the grant entirely. No fan-out copy must be
+// dispatched, and the access override must not fire (the candidate set
+// is empty, so the dispatch loop has nothing to re-check).
+func TestFanout_ImplicitScope_GrantorNotMember_NoFanout(t *testing.T) {
+	const groupNo = "group_implicit_43"
+	ct := common.ChannelTypeGroup.Uint8()
+
+	s := newFakeOBOStore()
+	gid, _ := s.insertGrant(tGrantor, tBot, "auto", "")
+	enable := 1
+	_ = s.updateGrant(gid, "", &enable, nil)
+	// Intentionally do NOT seed grantor as group member.
+
+	fc := &fanoutCapture{}
+	ba := newBAforFanout(s, fc)
+	ba.oboChannelAccessOverride = func(uid, channelID string, channelType uint8) (bool, error) {
+		t.Errorf("non-member grantor should never reach the access check (uid=%q)", uid)
+		return true, nil
+	}
+
+	msg := &config.MessageResp{
+		FromUID:     "u_alice",
+		ChannelID:   groupNo,
+		ChannelType: ct,
+		Payload:     []byte(`{"type":1,"content":"should be dropped"}`),
+	}
+	if n := ba.fanoutForMessage(msg); n != 0 {
+		t.Fatalf("non-member grantor must not fan out, got %d", n)
+	}
+	if len(fc.copies) != 0 {
+		t.Fatalf("non-member grantor leaked: captured %d copies, expected 0", len(fc.copies))
+	}
+}
+
+// TestFanout_ImplicitScope_BotAlsoMember_NoFanout — Gate 4 in SQL. When
+// the grantee bot is itself in the group it already receives messages
+// directly via the WuKongIM subscriber pipeline; a fan-out copy would
+// double-process. The new SQL `LEFT JOIN ... gm_bot.uid IS NULL` filter
+// excludes these grants without the dispatch loop having to call
+// `userIsGroupMember(bot)`.
+func TestFanout_ImplicitScope_BotAlsoMember_NoFanout(t *testing.T) {
+	const groupNo = "group_implicit_44"
+	ct := common.ChannelTypeGroup.Uint8()
+
+	s := newFakeOBOStore()
+	gid, _ := s.insertGrant(tGrantor, tBot, "auto", "")
+	enable := 1
+	_ = s.updateGrant(gid, "", &enable, nil)
+	// Both grantor AND bot are members → Gate 4 must drop this candidate.
+	s.seedGroupMember(groupNo, tGrantor)
+	s.seedGroupMember(groupNo, tBot)
+
+	fc := &fanoutCapture{}
+	ba := newBAforFanout(s, fc)
+
+	msg := &config.MessageResp{
+		FromUID:     "u_alice",
+		ChannelID:   groupNo,
+		ChannelType: ct,
+		Payload:     []byte(`{"type":1,"content":"bot is in group already"}`),
+	}
+	if n := ba.fanoutForMessage(msg); n != 0 {
+		t.Fatalf("bot-also-member must not fan out (Gate 4), got %d", n)
+	}
+	if len(fc.copies) != 0 {
+		t.Fatalf("Gate 4 leaked: captured %d copies, expected 0", len(fc.copies))
+	}
+}
+
+// TestFanout_ImplicitScope_ExplicitScopeWins — when an explicit scope row
+// exists (even with enabled=0) the implicit-scope feeder must NOT return
+// the grant. The explicit-scope feeder (`findActiveGrantsForChannel`)
+// requires `enabled=1`, so an `enabled=0` row produces zero fan-out
+// either way — exactly the "admin disabled this channel" semantics.
+func TestFanout_ImplicitScope_ExplicitScopeWins(t *testing.T) {
+	const groupNo = "group_implicit_45"
+	ct := common.ChannelTypeGroup.Uint8()
+
+	s := newFakeOBOStore()
+	gid, _ := s.insertGrant(tGrantor, tBot, "auto", "")
+	enable := 1
+	_ = s.updateGrant(gid, "", &enable, nil)
+	// Grantor is a member, bot is not — would normally trigger implicit
+	// scope. But an explicitly DISABLED scope row exists for this channel.
+	s.seedGroupMember(groupNo, tGrantor)
+	if _, err := s.insertScope(gid, groupNo, ct, 0); err != nil {
+		t.Fatalf("insertScope (disabled): %v", err)
+	}
+
+	fc := &fanoutCapture{}
+	ba := newBAforFanout(s, fc)
+
+	msg := &config.MessageResp{
+		FromUID:     "u_alice",
+		ChannelID:   groupNo,
+		ChannelType: ct,
+		Payload:     []byte(`{"type":1,"content":"admin disabled this channel"}`),
+	}
+	if n := ba.fanoutForMessage(msg); n != 0 {
+		t.Fatalf("explicitly disabled scope must suppress implicit-scope, got %d", n)
+	}
+	if len(fc.copies) != 0 {
+		t.Fatalf("explicit-disabled scope leaked: captured %d copies", len(fc.copies))
+	}
+}
+
+// TestFanout_PR121R6_ImplicitScopeRespectsMentionFilter — PR#121 R6 / B2
+// (Jerry-Xin + lml2468 2026-05-22 blocking) regression guard. With two
+// global-enabled grantors in the same group, an inbound message that
+// @-mentions only ONE of them must summon only that grantor's persona;
+// the implicit-scope feeder must NOT silently pull in the un-mentioned
+// grantor's clone. Pre-fix the implicit-scope branch appended every
+// candidate `findGlobalGrantsWithoutScope` returned (which is
+// mention-agnostic by design), so a message mentioning Alice would
+// also dispatch a fan-out copy to Bob's clone — a direct violation
+// of the documented v2 mention contract: `mention.uids` summons only
+// the mentioned grantor(s); only `mention.all` summons everyone.
+func TestFanout_PR121R6_ImplicitScopeRespectsMentionFilter(t *testing.T) {
+	const (
+		groupNo   = "group_pr121_r6"
+		grantorA  = "user_alice"
+		botCloneA = "bot_clone_alice"
+		grantorB  = "user_bob"
+		botCloneB = "bot_clone_bob"
+	)
+	ct := common.ChannelTypeGroup.Uint8()
+
+	s := newFakeOBOStore()
+	// Two global-enabled grants, no explicit scope rows — both are
+	// implicit-scope candidates for this group.
+	gidA, err := s.insertGrant(grantorA, botCloneA, "auto", "")
+	if err != nil {
+		t.Fatalf("insertGrant A: %v", err)
+	}
+	gidB, err := s.insertGrant(grantorB, botCloneB, "auto", "")
+	if err != nil {
+		t.Fatalf("insertGrant B: %v", err)
+	}
+	enable := 1
+	_ = s.updateGrant(gidA, "", &enable, nil)
+	_ = s.updateGrant(gidB, "", &enable, nil)
+	// Both grantors are in the group; neither bot is.
+	s.seedGroupMember(groupNo, grantorA)
+	s.seedGroupMember(groupNo, grantorB)
+
+	fc := &fanoutCapture{}
+	ba := newBAforFanout(s, fc)
+
+	// Inbound mentions ONLY Alice.
+	msg := &config.MessageResp{
+		FromUID:     "u_carol", // not bot, not grantor
+		ChannelID:   groupNo,
+		ChannelType: ct,
+		Payload:     []byte(`{"type":1,"content":"hi alice","mention":{"uids":["` + grantorA + `"]}}`),
+	}
+	n := ba.fanoutForMessage(msg)
+	if n != 1 {
+		t.Fatalf("expected exactly 1 fan-out (Alice only), got %d (copies=%+v)", n, fc.copies)
+	}
+	if len(fc.copies) != 1 {
+		t.Fatalf("expected exactly 1 captured copy, got %d", len(fc.copies))
+	}
+	cp := fc.copies[0]
+	if cp.ChannelID != botCloneA {
+		t.Fatalf("fan-out must address Alice's bot mailbox (%q), got %q — implicit-scope leaked an un-mentioned grantor", botCloneA, cp.ChannelID)
+	}
+	if cp.FromUID != grantorA {
+		t.Fatalf("fan-out FromUID must be Alice (%q), got %q", grantorA, cp.FromUID)
+	}
+	// Defensive: explicitly confirm Bob's clone was NOT addressed.
+	for _, c := range fc.copies {
+		if c.ChannelID == botCloneB {
+			t.Fatalf("implicit-scope leaked: Bob's clone %q was un-mentioned but received a fan-out copy", botCloneB)
+		}
+	}
+}
+
+// TestFanout_PR121R6_ImplicitScopeMentionAllSummonsEveryone — companion
+// to the filter test above. `mention.all=1` (= `@所有人`) summons every
+// grantor in the channel, so BOTH implicit-scope candidates must fan
+// out. This locks the symmetry: filter when `mention.uids` is the only
+// signal, pass through when `mention.all` is set.
+func TestFanout_PR121R6_ImplicitScopeMentionAllSummonsEveryone(t *testing.T) {
+	const (
+		groupNo   = "group_pr121_r6_all"
+		grantorA  = "user_alice"
+		botCloneA = "bot_clone_alice"
+		grantorB  = "user_bob"
+		botCloneB = "bot_clone_bob"
+	)
+	ct := common.ChannelTypeGroup.Uint8()
+
+	s := newFakeOBOStore()
+	gidA, _ := s.insertGrant(grantorA, botCloneA, "auto", "")
+	gidB, _ := s.insertGrant(grantorB, botCloneB, "auto", "")
+	enable := 1
+	_ = s.updateGrant(gidA, "", &enable, nil)
+	_ = s.updateGrant(gidB, "", &enable, nil)
+	s.seedGroupMember(groupNo, grantorA)
+	s.seedGroupMember(groupNo, grantorB)
+
+	fc := &fanoutCapture{}
+	ba := newBAforFanout(s, fc)
+
+	msg := &config.MessageResp{
+		FromUID:     "u_carol",
+		ChannelID:   groupNo,
+		ChannelType: ct,
+		Payload:     []byte(`{"type":1,"content":"@everyone","mention":{"all":1}}`),
+	}
+	n := ba.fanoutForMessage(msg)
+	if n != 2 {
+		t.Fatalf("mention.all must summon both grantors, got %d (copies=%+v)", n, fc.copies)
+	}
+	seen := map[string]bool{}
+	for _, c := range fc.copies {
+		seen[c.ChannelID] = true
+	}
+	if !seen[botCloneA] || !seen[botCloneB] {
+		t.Fatalf("mention.all must reach both bot mailboxes, got %+v", seen)
+	}
+}
+
+// TestFanout_Gate4_CommunityTopic_BotInParentGroup_NoFanout — PR#121 R8
+// (Jerry-Xin + lml2468 blocking). Gate 4 originally only fired for
+// ChannelTypeGroup; for CommunityTopic, when the grantee bot was already
+// a parent-group member it received BOTH the direct WuKongIM delivery
+// AND the OBO fan-out copy — exactly the duplicate case Gate 4 prevents.
+//
+// Setup: grantor + grantee bot are BOTH members of the parent group.
+// An explicit scope row covers the topic channel (`<parent>____<short>`).
+// A third party (`u_bob`) posts to the topic with a mention summoning
+// the grantor.
+//
+// Expected: ZERO fan-out copies. The bot already receives the topic
+// message directly via the parent-group subscriber pipeline; an OBO copy
+// would be a strict duplicate (double processing / double reply).
+func TestFanout_Gate4_CommunityTopic_BotInParentGroup_NoFanout(t *testing.T) {
+	const parentGroup = "group_topic_parent_88"
+	const topicChan = parentGroup + "____topic_99"
+	ct := common.ChannelTypeCommunityTopic.Uint8()
+
+	s := seedGrantWithScope(t, topicChan, ct)
+	// Both grantor and grantee bot are in the parent group — the bot's
+	// direct delivery covers this topic, so Gate 4 must skip the fan-out.
+	s.seedGroupMember(parentGroup, tGrantor)
+	s.seedGroupMember(parentGroup, tBot)
+
+	fc := &fanoutCapture{}
+	ba := newBAforFanout(s, fc)
+	// Route the Gate 4 membership lookup through the fake store so the
+	// dispatch-loop check observes the seeded membership without a live
+	// DB.
+	ba.oboGroupMemberOverride = func(uid, groupNo string) (bool, error) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.groupMembers[groupNo][uid], nil
+	}
+
+	msg := &config.MessageResp{
+		FromUID:     "u_bob",
+		ChannelID:   topicChan,
+		ChannelType: ct,
+		Payload:     []byte(`{"type":1,"content":"@yu look at this","mention":{"uids":["` + tGrantor + `"]}}`),
+	}
+	if n := ba.fanoutForMessage(msg); n != 0 {
+		t.Fatalf("CommunityTopic Gate 4: bot in parent group must not fan out, got %d", n)
+	}
+	if len(fc.copies) != 0 {
+		t.Fatalf("CommunityTopic Gate 4 leaked: captured %d copies, expected 0", len(fc.copies))
+	}
+}
+
+// TestFanout_Gate4_CommunityTopic_BotNotInParentGroup_FansOut — control
+// case for the test above. Same setup EXCEPT the bot is NOT a parent-
+// group member. The OBO fan-out is the ONLY delivery path to the bot
+// (it isn't a direct topic subscriber), so Gate 4 must NOT fire and the
+// bot must receive exactly one fan-out copy.
+func TestFanout_Gate4_CommunityTopic_BotNotInParentGroup_FansOut(t *testing.T) {
+	const parentGroup = "group_topic_parent_89"
+	const topicChan = parentGroup + "____topic_100"
+	ct := common.ChannelTypeCommunityTopic.Uint8()
+
+	s := seedGrantWithScope(t, topicChan, ct)
+	// Grantor is in the parent group; bot is NOT. Bot only sees the
+	// message via OBO fan-out, so Gate 4 must NOT fire.
+	s.seedGroupMember(parentGroup, tGrantor)
+
+	fc := &fanoutCapture{}
+	ba := newBAforFanout(s, fc)
+	// Same DB-free membership shim as the sibling test — proves the
+	// Gate 4 branch correctly answers "bot NOT a parent-group member"
+	// and lets the fan-out through.
+	ba.oboGroupMemberOverride = func(uid, groupNo string) (bool, error) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.groupMembers[groupNo][uid], nil
+	}
+
+	msg := &config.MessageResp{
+		FromUID:     "u_bob",
+		ChannelID:   topicChan,
+		ChannelType: ct,
+		Payload:     []byte(`{"type":1,"content":"@yu look at this","mention":{"uids":["` + tGrantor + `"]}}`),
+	}
+	if n := ba.fanoutForMessage(msg); n != 1 {
+		t.Fatalf("CommunityTopic with bot outside parent group must fan out exactly 1, got %d", n)
+	}
+	if len(fc.copies) != 1 {
+		t.Fatalf("CommunityTopic control: expected 1 captured copy, got %d", len(fc.copies))
 	}
 }

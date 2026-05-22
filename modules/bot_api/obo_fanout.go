@@ -84,9 +84,7 @@ package bot_api
 import (
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strings"
-	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -175,6 +173,10 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 	if m == nil || strings.TrimSpace(m.ChannelID) == "" {
 		return 0
 	}
+	ba.Info("OBO fan-out: processing message",
+		zap.String("from", m.FromUID),
+		zap.String("channel_id", m.ChannelID),
+		zap.Uint8("channel_type", m.ChannelType))
 
 	// Gate 3 (cheapest, no DB): drop messages already minted by the OBO
 	// dispatch path. Marker lives in payload (= message_extra). We don't
@@ -198,81 +200,55 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 	}
 
 	store := ba.oboStoreOrDefault()
-	isGroupLike := m.ChannelType != common.ChannelTypePerson.Uint8()
 
-	// PR#114 R3 (Jerry-Xin perf blocker, 2026-05-21) — mention gate runs
-	// BEFORE the grant DB lookup for group-like channels. The previous
-	// shape called `findActiveGrantsForChannel` first, which for groups
-	// loads EVERY active+global_enabled grant system-wide with no
-	// channel filter — so every ordinary group message (plain text,
-	// @AI only, @bot, etc.) paid a full obo_grants scan even though
-	// the per-message v2 narrowing gate (decoded a few lines below)
-	// was going to reject them anyway.
+	// YUJ-1465 / Mininglamp-OSS/octo-server#108 — OBO v2 fan-out
+	// narrowing. v1 fanned out EVERY message in a scoped channel
+	// (modulo the loop-protection gates) so the persona could observe
+	// the full conversation. v2 narrows the trigger: a fan-out copy is
+	// only minted when the inbound message explicitly summons the
+	// grantor via `payload.mention.uids`, OR sets `mention.all=1`
+	// (`@所有人` broadcast).
 	//
-	// New shape for group-like channels:
+	// PR#114 R3 (Jerry-Xin perf blocker) — the per-message mention gate
+	// runs BEFORE the grant DB lookup for group-like channels, so plain
+	// / @AI-only / @bot-only group traffic short-circuits without
+	// touching MySQL.
 	//
-	//  1. Decode mentions ONCE up-front (cheap, in-memory JSON parse).
-	//  2. If neither `mention.all` nor any `mention.uids` is set →
-	//     EARLY RETURN. No DB query, no Redis hit beyond the cache
-	//     short-circuit that channelCacheSaysNone already provides.
-	//  3. For `mention.uids` (explicit @grantor): filter the grant
-	//     query at the DB layer via `findActiveGrantsForChannelByGrantors`
-	//     so we never load grants for OTHER grantors who weren't
-	//     mentioned. uk_grantor_grantee guarantees one row per grantor,
-	//     so the query returns at most `len(mention.uids)` rows.
-	//  4. For `mention.all` (@所有人): the full grant scan is
-	//     UNAVOIDABLE because every grantor in the group is implicitly
-	//     mentioned and we don't know the membership at this layer.
-	//     This is acceptable because `@所有人` is rare — operators
-	//     restrict its use to admins / announcements — so the
-	//     occasional full scan is bounded. The per-grant
-	//     `grantorCanReadChannel` re-check below still drops grantors
-	//     who aren't actually in the group.
-	//
-	// DM (Person) path stays unchanged: DM payloads carry no mention
-	// metadata, so we still call `findActiveGrantsForChannel` first
-	// and rely on the JOIN against the (per-peer) scope row to narrow.
-	mentioned, mentionAll := decodeMentionGate(m.Payload)
-
-	var grants []*oboGrantModel
-	var err error
-	if isGroupLike {
-		// Mention gate first — refuse to touch MySQL for plain / @AI /
-		// @bot traffic. This is THE perf fix Jerry-Xin flagged on the
-		// PR#114 review: without it every group message went through a
-		// full `obo_grants` scan.
-		if !mentionAll && len(mentioned) == 0 {
+	// DM (Person) traffic does NOT run through the mention gate (DM
+	// payloads carry no mention object) and still uses the unfiltered
+	// scope-joined query.
+	var (
+		mentionedUIDs []string
+		mentionAll    bool
+		grants        []*oboGrantModel
+		err           error
+	)
+	if m.ChannelType == common.ChannelTypePerson.Uint8() {
+		// DM path — unchanged, uses scope-joined query.
+		grants, err = store.findActiveGrantsForChannel(lookupChannelID, m.ChannelType)
+	} else {
+		// Group-like channels: gate on mention first.
+		mentionedUIDs, mentionAll = decodeMentionGate(m.Payload)
+		if mentionAll {
+			// @所有人 — summon every grantor in the channel. Use the
+			// unfiltered channel-wide query (the only way to enumerate
+			// "every grant in this channel" without knowing membership).
+			grants, err = store.findActiveGrantsForChannel(lookupChannelID, m.ChannelType)
+		} else if len(mentionedUIDs) > 0 {
+			// Explicit @grantor(s) — use the UID-filtered query (PR#114
+			// R3). The query restricts the system-wide scan to just the
+			// mentioned UIDs and bypasses the channel-wide cache (PR#114
+			// R4) so the filtered miss cannot poison the unfiltered hit.
+			grants, err = store.findActiveGrantsForChannelByGrantors(lookupChannelID, m.ChannelType, mentionedUIDs)
+		} else {
+			// Plain / @AI / @bot only — no fan-out trigger for v2.
 			return 0
 		}
-		if mentionAll {
-			// @所有人 broadcast — every grantor is implicitly mentioned.
-			// The unfiltered scan is unavoidable here (we don't know
-			// who is in the group from this layer) but @所有人 is rare
-			// in practice and the alternative — fetching group
-			// membership just to filter the IN list — is more work
-			// than the scan saves.
-			grants, err = store.findActiveGrantsForChannel(lookupChannelID, m.ChannelType)
-		} else {
-			// Explicit @grantor(s) — filter at the DB layer so we
-			// never load grants for un-mentioned grantors. Collect
-			// the set into a slice in deterministic order so the
-			// IN(...) placeholder set is stable across calls (helps
-			// query-plan caching at the MySQL layer too).
-			grantorUIDs := make([]string, 0, len(mentioned))
-			for uid := range mentioned {
-				grantorUIDs = append(grantorUIDs, uid)
-			}
-			// Stable ordering — `range` on a map is unordered. Use a
-			// simple sort so identical mention sets produce identical
-			// query bind shapes.
-			sort.Strings(grantorUIDs)
-			grants, err = store.findActiveGrantsForChannelByGrantors(
-				lookupChannelID, m.ChannelType, grantorUIDs,
-			)
-		}
-	} else {
-		grants, err = store.findActiveGrantsForChannel(lookupChannelID, m.ChannelType)
 	}
+	ba.Info("OBO fan-out: scope lookup result",
+		zap.String("lookup_channel_id", lookupChannelID),
+		zap.Int("scope_grants", len(grants)),
+		zap.Bool("err", err != nil))
 	if err != nil {
 		ba.Error("OBO fan-out lookup failed",
 			zap.String("lookup_channel_id", lookupChannelID),
@@ -281,30 +257,128 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 			zap.Error(err))
 		return 0
 	}
+
+	// Implicit scope: for group-like channels (GROUP and CommunityTopic),
+	// also find global_enabled grants whose grantor is a member of the
+	// (parent) group AND whose bot is NOT a member, with no explicit scope
+	// row for the channel. The store call collapses all three predicates
+	// into a single JOIN — see findGlobalGrantsWithoutScope in obo_db.go
+	// for the SQL. Pre-PR#121 this loop did one `grantorCanReadChannel`
+	// query per global grant here AND one `userIsGroupMember(bot)` (Gate 4)
+	// query per grant in the dispatch loop below; for a system with N
+	// global grants every inbound group message paid 2*N per-message
+	// round-trips. After PR#121 the implicit-scope feeder is a single SQL
+	// statement and the dispatch loop skips both per-grant checks for
+	// these rows (tracked via `implicitGrantIDs`). Explicit-scope grants
+	// returned by findActiveGrantsForChannel still pay the per-grant
+	// Gate 4 + TOCTOU re-check below — that set is bounded by the number
+	// of scope rows installed for this specific channel and is never
+	// large.
+	//
+	// PR#121 R9 (YUJ-1676 / Jerry-Xin + lml2468 blocking) — extended
+	// from GROUP-only to also cover CommunityTopic. Without the topic
+	// branch, a `mention.all=1` topic message from a non-grantor whose
+	// parent group has a global_enabled grant on file (and bot NOT in
+	// the parent group) produced ZERO fan-out copies — even though
+	// checkOBO already authorized the symmetric reply path for topics
+	// (obo_check.go:105) and Gate 4 / send-permission bypass / explicit-
+	// mention feeder all already supported topics. The asymmetry meant
+	// the bot could authorize a reply but never receive the message in
+	// the first place. For topics we extract the parent group id (split
+	// on threadChannelIDSeparator, mirroring grantorCanReadChannel) and
+	// pass it to the store as `membershipGroupID`; the scope anti-join
+	// keeps using the topic's own (channel_id, channel_type) so an
+	// `enabled=0` row on the topic still wins.
+	//
+	// "admin is in any group → persona clone auto-covers it" UX without
+	// requiring manual scope management per channel.
+	implicitGrantIDs := map[int64]bool{}
+	if isGroupLikeChannelType(m.ChannelType) {
+		var membershipGroupID string
+		switch m.ChannelType {
+		case common.ChannelTypeGroup.Uint8():
+			membershipGroupID = lookupChannelID
+		case common.ChannelTypeCommunityTopic.Uint8():
+			parts := strings.SplitN(lookupChannelID, threadChannelIDSeparator, 2)
+			if len(parts) == 2 && parts[0] != "" {
+				membershipGroupID = parts[0]
+			}
+			// Malformed thread id → leave empty; the feeder fail-closes
+			// on an empty membership group id and returns no grants.
+		}
+		if membershipGroupID != "" {
+			globalGrants, gErr := store.findGlobalGrantsWithoutScope(membershipGroupID, lookupChannelID, m.ChannelType)
+			if gErr != nil {
+				ba.Warn("OBO global-grant lookup failed",
+					zap.String("channel_id", lookupChannelID),
+					zap.String("membership_group", membershipGroupID),
+					zap.Error(gErr))
+			} else {
+				// PR#121 R6 / B2 (Jerry-Xin + lml2468 2026-05-22 blocking)
+				// — when only specific grantors were @-mentioned (i.e.
+				// `mention.uids` is set and `mention.all` is NOT), the
+				// implicit-scope feeder MUST be filtered to those uids
+				// before being merged with the explicit-scope set above.
+				//
+				// Without this filter, a message that mentions only Alice
+				// (`mention.uids = [alice_uid]`) would silently pull in
+				// Bob's persona too — `findGlobalGrantsWithoutScope`
+				// returns every global-enabled grant whose grantor is in
+				// the group, with no awareness of the mention gate. That
+				// directly violates the documented v2 mention contract:
+				// `mention.uids` summons ONLY the mentioned grantor(s);
+				// only `mention.all` summons everyone.
+				//
+				// The mentionAll branch passes through unfiltered (matches
+				// the explicit-path behavior — `@所有人` summons every
+				// grantor in the channel). The DM branch never reaches
+				// this block (gated above on isGroupLikeChannelType) and
+				// therefore needs no symmetrical filter.
+				var mentionFilter map[string]struct{}
+				if !mentionAll && len(mentionedUIDs) > 0 {
+					mentionFilter = make(map[string]struct{}, len(mentionedUIDs))
+					for _, u := range mentionedUIDs {
+						mentionFilter[u] = struct{}{}
+					}
+				}
+				// PR#114 R3 dedup — when the mention-filtered query above
+				// already returned a grant that ALSO satisfies the implicit-
+				// scope predicates, mark it as implicit (skip the per-grant
+				// access re-check) rather than appending a duplicate row.
+				// The same SQL JOIN that proved implicit-scope ran inside
+				// findGlobalGrantsWithoutScope, so the access re-check is
+				// redundant for these grants and the test surface pins that
+				// invariant explicitly.
+				alreadyHave := map[int64]bool{}
+				for _, g := range grants {
+					alreadyHave[g.ID] = true
+				}
+				for _, g := range globalGrants {
+					if mentionFilter != nil {
+						if _, ok := mentionFilter[g.GrantorUID]; !ok {
+							// Grantor not mentioned — implicit-scope
+							// fan-out must NOT summon them. (B2.)
+							continue
+						}
+					}
+					ba.Info("OBO implicit-scope: SQL-validated grant, auto-including",
+						zap.String("grantor", g.GrantorUID),
+						zap.String("bot", g.GranteeBotUID),
+						zap.String("channel_id", lookupChannelID),
+						zap.String("membership_group", membershipGroupID))
+					implicitGrantIDs[g.ID] = true
+					if alreadyHave[g.ID] {
+						continue
+					}
+					grants = append(grants, g)
+				}
+			}
+		}
+	}
+
 	if len(grants) == 0 {
 		return 0
 	}
-
-	// YUJ-1465 / Mininglamp-OSS/octo-server#108 — OBO v2 fan-out
-	// narrowing. v1 fanned out EVERY message in a scoped channel
-	// (modulo the loop-protection gates) so the persona could observe
-	// the full conversation. v2 narrows the trigger: a fan-out copy is
-	// only minted when the inbound message explicitly summons the
-	// grantor via `payload.mention.uids` — OR (YUJ-1538) when the
-	// message is a `@所有人` broadcast (`payload.mention.all=1`), which
-	// by spec is the strongest possible "you specifically were
-	// addressed" signal. @AI-only / @bot / plain (no mention) traffic
-	// still does NOT trigger the persona.
-	//
-	// PR#114 R3 — for group-like channels the mention gate has already
-	// run UP-FRONT (above) and either early-returned or narrowed the
-	// grant query by the mentioned UIDs. The per-grant check inside
-	// the loop below remains as a belt-and-suspenders verification —
-	// the DB filter could in principle drop rows but mentionAll uses
-	// the unfiltered scan, and we still want to verify each surviving
-	// grantor was actually summoned. For DMs the mention set is
-	// always empty (DM payloads carry no mention), but the DM-only
-	// "implicitly mentioned" branch below preserves the v2 contract.
 
 	// PR#82 round-2 P1-A — per-call cache for the grantor channel-access
 	// re-check. Multiple active grants for the same (channel, grantor)
@@ -329,6 +403,83 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 		if g.GrantorUID == m.FromUID {
 			continue
 		}
+		// Gate 4: bot is already a member of this group → it receives
+		// messages directly via the WuKongIM subscriber pipeline, so a
+		// fan-out copy would cause duplicate processing (double typing,
+		// double reply, identity confusion on @AI/@bot). The adapter-
+		// side mention logic handles identity switching (“@所有人 →
+		// respond as grantor”) for the direct-receipt path.
+		// Applies to GROUP and CommunityTopic channels; DM fan-out is
+		// the sole delivery path (bot is never a “member” of the peer’s
+		// DM). For CommunityTopic the membership we care about is the
+		// PARENT group: a topic message is delivered to every parent-
+		// group member, so a bot that is already in the parent group
+		// gets the message normally and the OBO copy would be a strict
+		// duplicate (same bug Gate 4 prevents for ChannelTypeGroup).
+		// Parent-group extraction mirrors grantorCanReadChannel /
+		// send.go — split on threadChannelIDSeparator.
+		//
+		// PR#121 perf: implicit-scope grants (sourced from
+		// findGlobalGrantsWithoutScope) have ALREADY been filtered by the
+		// SQL JOIN to guarantee `gm_bot.uid IS NULL`, so the per-grant
+		// `userIsGroupMember(bot)` query here is redundant for them. We
+		// keep it for explicit-scope grants (sourced from
+		// findActiveGrantsForChannel) where the bot-membership status is
+		// not part of the feeder's filter. PR#121 R9 (YUJ-1676) extended
+		// the implicit-scope feeder to CommunityTopic as well, so the
+		// implicit-grant skip below now correctly fires for both Group
+		// and CommunityTopic when the SQL JOIN already proved the bot
+		// is NOT a (parent-)group member.
+		if !implicitGrantIDs[g.ID] {
+			var membershipGroup string
+			switch m.ChannelType {
+			case common.ChannelTypeGroup.Uint8():
+				membershipGroup = lookupChannelID
+			case common.ChannelTypeCommunityTopic.Uint8():
+				parts := strings.SplitN(lookupChannelID, threadChannelIDSeparator, 2)
+				if len(parts) == 2 && parts[0] != "" {
+					membershipGroup = parts[0]
+				}
+				// Malformed thread id → leave membershipGroup empty
+				// and skip the check; downstream gates (TOCTOU
+				// re-check via grantorCanReadChannel) still fail-
+				// closed on the same malformed id.
+			}
+			if membershipGroup != "" {
+				isBotInGroup, gErr := ba.userIsGroupMember(g.GranteeBotUID, membershipGroup)
+				if gErr != nil {
+					// PR#121 R9 (YUJ-1676) fail-closed. Pre-R9 a
+					// userIsGroupMember error fell through to the
+					// dispatch path, which caused a duplicate fan-out
+					// whenever the bot ACTUALLY was a parent-group
+					// member but the membership query transiently
+					// errored (DB blip, deadlock, …). The bot would
+					// then receive the message BOTH directly via the
+					// WuKongIM subscriber pipeline AND as an OBO
+					// fan-out copy — the exact double-processing bug
+					// Gate 4 is meant to prevent. Log and skip the
+					// grant: a missed fan-out copy on a transient
+					// error is strictly safer than a guaranteed
+					// duplicate, and the next inbound message in the
+					// channel will retry naturally.
+					ba.Warn("OBO fan-out gate 4: bot membership check errored, skipping grant (fail-closed)",
+						zap.String("bot", g.GranteeBotUID),
+						zap.String("channel_id", lookupChannelID),
+						zap.String("membership_group", membershipGroup),
+						zap.Uint8("channel_type", m.ChannelType),
+						zap.Error(gErr))
+					continue
+				}
+				if isBotInGroup {
+					ba.Info("OBO fan-out gate 4: bot is parent-group member, skipping fan-out (adapter handles directly)",
+						zap.String("bot", g.GranteeBotUID),
+						zap.String("channel_id", lookupChannelID),
+						zap.String("membership_group", membershipGroup),
+						zap.Uint8("channel_type", m.ChannelType))
+					continue
+				}
+			}
+		}
 		// PR#82 round-3 P1 — Multi-grantor DM recipient filter. For
 		// DMs, findActiveGrantsForChannel is keyed by the peer uid
 		// (= m.FromUID after the P1-B lookup normalization), so it
@@ -350,36 +501,6 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 		if m.ChannelType == common.ChannelTypePerson.Uint8() && m.ChannelID != g.GrantorUID {
 			continue
 		}
-		// YUJ-1465 / Mininglamp-OSS/octo-server#108 — OBO v2 fan-out
-		// narrowing gate. The grantor MUST be explicitly mentioned in
-		// `payload.mention.uids` for this message; @AI / @bot / plain
-		// traffic does NOT summon the persona. Mention set was decoded
-		// once at the top of fanoutForMessage; map lookup is O(1).
-		//
-		// YUJ-1538 — `@所有人` (`mention.all=1`) ALSO counts as
-		// "grantor was summoned". Real WuKongIM `@所有人` payloads
-		// commonly carry `mention.all=1` without re-listing every
-		// group member in `mention.uids`, so without this branch a
-		// broadcast in a group with an active persona grant would
-		// silently never fan out.
-		//
-		// DM-only special case: a DM is a 1:1 conversation in which the
-		// grantor is the implicit recipient (m.ChannelID == grantor for
-		// DMs after the round-3 P1 filter above). DM payloads in
-		// practice carry no mention.uids array, so requiring an
-		// explicit @grantor on every DM would silently break the
-		// managed-persona DM path. We treat the DM recipient as
-		// implicitly mentioned for v2 — the narrowing gate's
-		// `@AI / @bot / plain` rejection is targeted at GROUP /
-		// COMMUNITY_TOPIC traffic where the persona summon is
-		// disambiguating.
-		if m.ChannelType != common.ChannelTypePerson.Uint8() {
-			if !mentionAll {
-				if _, ok := mentioned[g.GrantorUID]; !ok {
-					continue
-				}
-			}
-		}
 		// PR#82 round-2 P1-A — TOCTOU close-out on the fan-out hot path.
 		// Even though the scope row exists, the grantor may have lost
 		// access to the channel since (kicked from group, un-friended
@@ -388,28 +509,37 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 		// no longer has eyes on. DB error → fail-closed (skip this
 		// grant, log, continue with the remaining ones; we never want a
 		// transient DB blip to leak otherwise-denied traffic).
-		canRead, cached := grantorAccess[g.GrantorUID]
-		if !cached {
-			ok, err := ba.grantorCanReadChannel(g.GrantorUID, lookupChannelID, m.ChannelType)
-			if err != nil {
-				ba.Error("OBO fan-out grantor channel-access re-check failed",
+		//
+		// PR#121 perf: implicit-scope grants are skipped here. Their SQL
+		// feeder INNER JOIN'd `group_member` on the grantor exactly
+		// 1ms ago, so a redundant Go-level recheck would just pay for
+		// the same index lookup twice without changing the answer. The
+		// TOCTOU window between the SQL JOIN and the dispatch is
+		// negligible compared to the per-message cost we are removing.
+		if !implicitGrantIDs[g.ID] {
+			canRead, cached := grantorAccess[g.GrantorUID]
+			if !cached {
+				ok, err := ba.grantorCanReadChannel(g.GrantorUID, lookupChannelID, m.ChannelType)
+				if err != nil {
+					ba.Error("OBO fan-out grantor channel-access re-check failed",
+						zap.String("grantor", g.GrantorUID),
+						zap.String("lookup_channel_id", lookupChannelID),
+						zap.Uint8("channel_type", m.ChannelType),
+						zap.Error(err))
+					grantorAccess[g.GrantorUID] = false
+					continue
+				}
+				canRead = ok
+				grantorAccess[g.GrantorUID] = canRead
+			}
+			if !canRead {
+				ba.Warn("OBO fan-out skipped: grantor no longer has read access",
 					zap.String("grantor", g.GrantorUID),
+					zap.String("grantee_bot", g.GranteeBotUID),
 					zap.String("lookup_channel_id", lookupChannelID),
-					zap.Uint8("channel_type", m.ChannelType),
-					zap.Error(err))
-				grantorAccess[g.GrantorUID] = false
+					zap.Uint8("channel_type", m.ChannelType))
 				continue
 			}
-			canRead = ok
-			grantorAccess[g.GrantorUID] = canRead
-		}
-		if !canRead {
-			ba.Warn("OBO fan-out skipped: grantor no longer has read access",
-				zap.String("grantor", g.GrantorUID),
-				zap.String("grantee_bot", g.GranteeBotUID),
-				zap.String("lookup_channel_id", lookupChannelID),
-				zap.Uint8("channel_type", m.ChannelType))
-			continue
 		}
 		// Build a fan-out copy addressed to the bot's own Person mailbox.
 		// NoPersist=1 + SyncOnce=1 keep delivery silent and the bot is the
@@ -422,10 +552,10 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 		// conversation entry on the original sender's client. See the
 		// package-level comment for the full rationale.
 		//
-		// YUJ-1465 — also pass through the grant so the v2 payload can
-		// carry `obo_grantor_uid` / `obo_grantor_name` / `obo_respond_as`
-		// + a natural-language `obo_system_hint` composed from the
-		// grant's persona_prompt and the resolved display names.
+		// YUJ-1465 — also pass the grant + resolved display names so the
+		// v2 payload can carry `obo_grantor_uid` / `obo_grantor_name` /
+		// `obo_respond_as` + a natural-language `obo_system_hint`
+		// composed from persona_prompt and the channel/sender context.
 		grantorName := ba.oboResolveDisplayName(g.GrantorUID)
 		senderName := ba.oboResolveDisplayName(m.FromUID)
 		var groupName string
@@ -440,25 +570,18 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 				zap.Error(err))
 			continue
 		}
-		// YUJ-1424 / PR#82 Jerry-Xin review blocker (2026-05-20) —
-		// directly enqueue the fan-out copy into the grantee bot's
-		// /v1/bot/events queue. WuKongIM has now accepted the message
-		// (above) and will deliver it to the bot's mailbox, but the
-		// webhook → NotifyMessagesListeners path drops NoPersist=1
-		// messages before listeners fire (modules/webhook/api.go,
-		// handleMessageNotify, by design). Without this enqueue the
-		// grantee bot never observes the fan-out — the bug Jerry-Xin
-		// flagged. The synthetic event mirrors what the listener path
-		// would have produced, so /v1/bot/events serves it
-		// transparently. Best-effort: a Redis failure here logs but
-		// does NOT roll back the dispatch (the message is already in
-		// WuKongIM's store and a later replay path is preferable to a
-		// no-op).
-		copyResp := buildFanoutCopyMessageResp(copyReq, m)
-		if err := ba.enqueueFanoutBotEvent(g.GranteeBotUID, copyResp); err != nil {
-			ba.Error("OBO fan-out bot-event enqueue failed",
+		// YUJ-1424 — also enqueue the synthetic event into the grantee
+		// bot's event queue so /v1/bot/events serves it. WuKongIM's
+		// webhook.handleMessageNotify drops messages flagged
+		// NoPersist=1 / SyncOnce=1 (the very flags we set on the
+		// fan-out copy), so the bot would otherwise never observe the
+		// message even though dispatch succeeded. Best-effort: enqueue
+		// failure does NOT roll back the dispatch (the copy is already
+		// in WuKongIM).
+		enqueueMsg := fanoutCopyToMessageResp(copyReq)
+		if err := ba.enqueueFanoutBotEvent(g.GranteeBotUID, enqueueMsg); err != nil {
+			ba.Warn("OBO fan-out bot-event enqueue failed",
 				zap.String("grantee_bot", g.GranteeBotUID),
-				zap.String("channel_id", m.ChannelID),
 				zap.Error(err))
 		}
 		dispatched++
@@ -467,22 +590,10 @@ func (ba *BotAPI) fanoutForMessage(m *config.MessageResp) int {
 }
 
 // buildFanoutCopyReq turns an inbound MessageResp into a one-shot copy
-// addressed to `g.GranteeBotUID`'s PERSONAL mailbox. The payload is augmented
+// addressed to `granteeBotUID`'s PERSONAL mailbox. The payload is augmented
 // with `obo_fanout=true` plus `obo_origin_*` fields that pin down the
-// original conversation, plus the v2 (YUJ-1465 / octo-server#108) fields
-// the persona-clone adapter consumes:
-//
-//	obo_grantor_uid     — the OBO grantor (also the FromUID of the copy)
-//	obo_grantor_name    — display name of the grantor (best-effort)
-//	obo_respond_as      — the uid the adapter should sign the reply with
-//	                      (always the grantor in v2 — the bot replies AS
-//	                      the persona, not as itself)
-//	obo_system_hint     — natural-language Chinese prompt summarising
-//	                      "you are running as <grantor>'s persona; this
-//	                      came from group <X>; sender is <Y>". The
-//	                      persona_prompt (if non-empty) is appended after
-//	                      the auto hint so the grantor's behavioral
-//	                      prompt overrides / extends the base context.
+// original conversation (the marker is informational; loop protection
+// uses `__obo_processed__` set by the bot's own outbound).
 //
 // Contract enforcement (PR#82 R5 P0): the returned MsgSendReq sets exactly
 // ONE of `ChannelID` / `Subscribers` (channel_id mode), never both —
@@ -612,115 +723,76 @@ func buildFanoutCopyReq(m *config.MessageResp, g *oboGrantModel, grantorName, se
 	)
 }
 
-// decodeMentionGate — YUJ-1465 / Mininglamp-OSS/octo-server#108 (OBO v2)
-// + YUJ-1538 (`@所有人` broadcast support).
+// decodeMentionGate — YUJ-1465 / YUJ-1538. Pulls `mention.uids` and
+// `mention.all` off the raw payload. Returns:
+//   - mentionedUIDs: slice of distinct UIDs (sorted ascending for
+//     stable IN(...) bind ordering); empty when payload has no
+//     mention.uids or it is empty / malformed.
+//   - mentionAll: true iff `mention.all` is the integer 1 (numeric form)
+//     OR boolean true. Mirrors the two shapes real WuKongIM clients
+//     emit. PR#114 R3 + YUJ-1538.
 //
-// Pulls the v2 narrowing-gate inputs off the raw inbound payload:
-//
-//   - `uids`: the explicit `mention.uids` array, returned as a
-//     set keyed by uid (O(1) per-grant membership tests in
-//     fanoutForMessage's loop).
-//   - `all`:  whether `mention.all` is truthy (1 / true). `@所有人`
-//     traffic in WuKongIM commonly carries `mention.all=1` without
-//     re-listing every group member in `mention.uids`, so the gate
-//     treats it as "every grantor was implicitly mentioned" for
-//     group/topic channels.
-//
-// Returns an empty (non-nil) set + `all=false` when:
-//
-//   - the payload is empty or not JSON-decodable;
-//   - the payload has no `mention` object;
-//   - `mention.uids` is missing, not an array, or empty;
-//   - `mention.all` is missing / falsey;
-//   - individual `uids` entries are not strings.
-//
-// Empty set + `all=false` = "no one was mentioned"; combined with the
-// v2 narrowing gate it means "do not fan out" for the GROUP /
-// COMMUNITY_TOPIC path. We intentionally do NOT honour `mention.ais`
-// here — per the v2 spec, @AI / @bot traffic by itself MUST NOT summon
-// the persona; the grantor must be a target of `mention.uids` OR the
-// message must be a `@所有人` broadcast.
-func decodeMentionGate(payload []byte) (uids map[string]struct{}, all bool) {
-	uids = map[string]struct{}{}
+// Returns (nil, false) on any decode error or absent `mention` field.
+// The fan-out narrowing gate treats (no uids, no all) as "no summon".
+func decodeMentionGate(payload []byte) ([]string, bool) {
 	if len(payload) == 0 {
-		return uids, false
+		return nil, false
 	}
 	var decoded map[string]interface{}
 	if err := json.Unmarshal(payload, &decoded); err != nil {
-		return uids, false
+		return nil, false
 	}
 	raw, ok := decoded["mention"]
 	if !ok || raw == nil {
-		return uids, false
+		return nil, false
 	}
 	mentionMap, ok := raw.(map[string]interface{})
 	if !ok {
-		return uids, false
+		return nil, false
 	}
+	// mention.all — accept both numeric 1 and boolean true.
+	var all bool
+	if v, ok := mentionMap["all"]; ok && v != nil {
+		switch t := v.(type) {
+		case float64:
+			all = t == 1
+		case int:
+			all = t == 1
+		case bool:
+			all = t
+		}
+	}
+	// mention.uids — distinct, trim whitespace, drop empties.
+	var uids []string
 	if uidsRaw, ok := mentionMap["uids"]; ok && uidsRaw != nil {
 		if uidsSlice, ok := uidsRaw.([]interface{}); ok {
+			seen := map[string]struct{}{}
 			for _, v := range uidsSlice {
 				if s, ok := v.(string); ok {
 					s = strings.TrimSpace(s)
-					if s != "" {
-						uids[s] = struct{}{}
+					if s == "" {
+						continue
 					}
+					if _, dup := seen[s]; dup {
+						continue
+					}
+					seen[s] = struct{}{}
+					uids = append(uids, s)
 				}
 			}
 		}
 	}
-	all = mentionFlagTruthy(mentionMap["all"])
-	return uids, all
-}
-
-// mentionFlagTruthy reports whether a parsed `mention.*` flag is the
-// numeric/boolean form of 1. Mirrors `pkg/mentionrewrite.isTruthyOne`
-// (unexported there) and the read-side helper in
-// `modules/message/api_reminders.go` so the OBO fan-out gate cannot
-// disagree with the message-write/read-reminders code about what
-// counts as "set". Kept local to avoid widening pkg/mentionrewrite's
-// public surface for a helper that's mostly used at write-time.
-//
-// Real WuKongIM payloads decode into a mix of float64 (the default
-// json.Unmarshal numeric type — what `decodeMentionGate` produces) and
-// json.Number (used by other read paths that opt into
-// `json.Decoder.UseNumber()`). We accept both plus bool / int* / uint*
-// so a caller sending the legacy `"all": true` shape continues to work.
-func mentionFlagTruthy(v interface{}) bool {
-	switch x := v.(type) {
-	case nil:
-		return false
-	case bool:
-		return x
-	case float64:
-		return x == 1
-	case float32:
-		return x == 1
-	case json.Number:
-		n, err := x.Int64()
-		return err == nil && n == 1
-	case int:
-		return x == 1
-	case int8:
-		return x == 1
-	case int16:
-		return x == 1
-	case int32:
-		return x == 1
-	case int64:
-		return x == 1
-	case uint:
-		return x == 1
-	case uint8:
-		return x == 1
-	case uint16:
-		return x == 1
-	case uint32:
-		return x == 1
-	case uint64:
-		return x == 1
+	// Sort for stable IN(...) bind ordering (lets tests pin a
+	// deterministic call shape).
+	if len(uids) > 1 {
+		// Use a tiny manual sort to avoid pulling in sort just for this.
+		for i := 1; i < len(uids); i++ {
+			for j := i; j > 0 && uids[j-1] > uids[j]; j-- {
+				uids[j-1], uids[j] = uids[j], uids[j-1]
+			}
+		}
 	}
-	return false
+	return uids, all
 }
 
 // oboResolveDisplayName — YUJ-1465. Resolves a uid to a human display
@@ -804,6 +876,42 @@ func (ba *BotAPI) dispatchFanout(req *config.MsgSendReq) error {
 	return ba.ctx.SendMessage(req)
 }
 
+// fanoutCopyToMessageResp converts a dispatched MsgSendReq into the
+// MessageResp shape /v1/bot/events serves. Used by enqueueFanoutBotEvent
+// so the bot observes a synthetic event identical to what the listener
+// path would have produced for a normally-persisted message.
+func fanoutCopyToMessageResp(req *config.MsgSendReq) *config.MessageResp {
+	if req == nil {
+		return nil
+	}
+	return &config.MessageResp{
+		FromUID:     req.FromUID,
+		ChannelID:   req.ChannelID,
+		ChannelType: req.ChannelType,
+		Payload:     req.Payload,
+		Header:      req.Header,
+	}
+}
+
+// enqueueFanoutBotEvent — YUJ-1424 — pushes the synthetic event into
+// the grantee bot's event queue. WuKongIM's webhook.handleMessageNotify
+// drops NoPersist=1 / SyncOnce=1 messages, so without this direct
+// enqueue the fan-out copy would dispatch successfully but never reach
+// /v1/bot/events. Test seam (oboFanoutBotEnqueue) consulted first;
+// production path goes through ba.robotService.EnqueueBotEvent.
+func (ba *BotAPI) enqueueFanoutBotEvent(robotID string, message *config.MessageResp) error {
+	if ba.oboFanoutBotEnqueue != nil {
+		return ba.oboFanoutBotEnqueue(robotID, message)
+	}
+	if ba.robotService == nil {
+		// Defensive: tests that don't wire robotService nor the
+		// enqueue seam see a no-op, which mirrors the
+		// "production with Redis disabled" degraded mode.
+		return nil
+	}
+	return ba.robotService.EnqueueBotEvent(robotID, message)
+}
+
 // oboProcessedMarkerKey is the JSON payload key set by sendMessage on
 // every OBO-authorized send so the fan-out listener can short-circuit
 // gate 3 without re-querying. The double-underscore prefix marks it as
@@ -847,62 +955,4 @@ func hasOBOProcessedMarker(payload []byte) bool {
 // would attempt to spoof a server-only OBO marker (gate-3 bypass).
 func payloadHasReservedOBOKey(payload map[string]interface{}) bool {
 	return obopayload.HasReservedKey(payload)
-}
-
-// buildFanoutCopyMessageResp synthesizes a *config.MessageResp that
-// mirrors what the WuKongIM → webhook → listener path WOULD have
-// produced for the just-dispatched fan-out copy, but doesn't (the
-// webhook drops NoPersist=1 — see fanoutForMessage and the package
-// comment).
-//
-// The fields are kept tight to what /v1/bot/events consumers actually
-// read: ChannelID / ChannelType / FromUID / Payload identify the
-// conversation, Header records the NoPersist+SyncOnce semantics the
-// listener path would have surfaced, and Timestamp lets the bot order
-// events. MessageID / MessageSeq / ClientMsgNo are left zero / empty
-// because we did not round-trip through WuKongIM's SendMessageWithResult
-// (the existing dispatchFanout uses SendMessage, which intentionally
-// discards the response per its docstring — "we don't need the result
-// and the simpler call avoids a wait"). A future change can upgrade
-// dispatchFanout to capture the response and populate these fields if
-// a bot adapter starts requiring them; the current persona-clone
-// adapter reads obo_origin_* from the payload, not the wire IDs.
-//
-// `origin` is the inbound message that triggered the fan-out — used
-// only to propagate the original Timestamp when present, falling back
-// to time.Now() when the inbound carried no timestamp.
-func buildFanoutCopyMessageResp(req *config.MsgSendReq, origin *config.MessageResp) *config.MessageResp {
-	if req == nil {
-		return nil
-	}
-	ts := time.Now().Unix()
-	if origin != nil && origin.Timestamp > 0 {
-		ts = int64(origin.Timestamp)
-	}
-	return &config.MessageResp{
-		Header:      req.Header,
-		FromUID:     req.FromUID,
-		ChannelID:   req.ChannelID,
-		ChannelType: req.ChannelType,
-		Payload:     req.Payload,
-		Timestamp:   int32(ts),
-	}
-}
-
-// enqueueFanoutBotEvent appends the synthetic fan-out event to the
-// grantee bot's /v1/bot/events queue. Honors the oboFanoutBotEnqueue
-// test seam first so unit tests can assert enqueue behavior without
-// standing up Redis; production path goes through
-// ba.robotService.EnqueueBotEvent. A nil robotService (defensive — the
-// constructor wires one, but BotAPI is sometimes assembled piecemeal
-// in older tests) is treated as a silent no-op so the dispatch loop
-// stays robust.
-func (ba *BotAPI) enqueueFanoutBotEvent(robotID string, message *config.MessageResp) error {
-	if ba.oboFanoutBotEnqueue != nil {
-		return ba.oboFanoutBotEnqueue(robotID, message)
-	}
-	if ba.robotService == nil {
-		return nil
-	}
-	return ba.robotService.EnqueueBotEvent(robotID, message)
 }

@@ -30,29 +30,13 @@ var (
 // ErrOBONotAuthorized when any check fails. Unexpected DB errors are
 // returned wrapped so the handler can 500.
 //
-// Layered checks (any failure → ErrOBONotAuthorized):
+// Four layered checks (any failure → ErrOBONotAuthorized):
 //  1. Grant row exists with active=1 AND global_enabled=1 for
 //     (grantor, botUID). This rejects revoked grants and grants whose
 //     master switch is off.
 //  2. Scope row exists with enabled=1 for (grant_id, channel_id,
-//     channel_type) — DM / Person ONLY. White-list semantics per RFC §2
-//     for 1:1 conversations: the persona must be explicitly authorized
-//     per peer because there is no in-message narrowing signal
-//     (mentions don't apply to DMs).
-//
-//     YUJ-1538 / PR#114 review fix — for group-like channel types
-//     (Group / CommunityTopic), the scope-row requirement is SKIPPED
-//     entirely. A grant with `active=1 AND global_enabled=1` covers
-//     every group/topic the grantor participates in; the per-message
-//     v2 narrowing gate (`@grantor` mention or `mention.all=1`) is the
-//     effective opt-in instead of a scope row, and the
-//     `grantorCanReadChannel` re-check below still enforces live
-//     membership. Without this skip, the fan-out copy delivered into a
-//     group reaches the bot but the bot's OBO reply hits scopeEnabled,
-//     returns false (operators never installed group scopes), and the
-//     reply 403s — defeating the whole PR#109 group fan-out path.
-//     `findActiveGrantsForChannel` (modules/bot_api/obo_db.go) was
-//     already widened symmetrically in PR#114.
+//     channel_type). White-list semantics per RFC §2 — opening a channel
+//     to a persona is always explicit.
 //  3. PR#82 round-2 P1-A — the grantor STILL has read access to the
 //     channel right now (`grantorCanReadChannel`). The scope-create-time
 //     check is not load-bearing for live membership: a grantor who
@@ -87,28 +71,67 @@ func (ba *BotAPI) checkOBO(botUID, grantor, channelID string, channelType uint8)
 		return ErrOBONotAuthorized
 	}
 
-	// YUJ-1538 / PR#114 review fix (Jerry-Xin, lml2468) — skip the
-	// scope-row check for group-like channel types when the grant is
-	// `global_enabled=1`. See the function-level doc comment for the
-	// full rationale; without this branch, a group fan-out copy reaches
-	// the bot but the bot's OBO reply hits scopeEnabled, returns false
-	// (operators never install group scopes in production), and the
-	// reply 403s. DM (Person) and any unrecognized channel type keep
-	// the strict scope-row contract — the test
-	// TestCheckOBO_DMNoScope_StillUnauthorized pins that regression.
-	if !isGroupLikeChannelType(channelType) {
-		ok, err := store.scopeEnabled(grant.ID, channelID, channelType)
-		if err != nil {
-			ba.Error("OBO scope lookup failed",
+	ok, err := store.scopeEnabled(grant.ID, channelID, channelType)
+	if err != nil {
+		ba.Error("OBO scope lookup failed",
+			zap.Int64("grant_id", grant.ID),
+			zap.String("channel_id", channelID),
+			zap.Uint8("channel_type", channelType),
+			zap.Error(err))
+		return err
+	}
+	// Implicit scope: when global_enabled=1 and NO explicit scope row exists
+	// for this channel, check if the grantor is a member. If so, allow the OBO
+	// send. BUT if a scope row exists (even with enabled=0), respect it —
+	// an explicitly disabled scope means the admin intentionally excluded
+	// this channel.
+	//
+	// GH#122 — scopeRowExists is fail-closed: a DB error here is propagated,
+	// not swallowed. Treating an error as "no explicit scope" would silently
+	// fall through to the implicit-scope branch and could approve a send the
+	// admin explicitly disabled, because the disabled scope row would be
+	// invisible to the check. Bubble up so the handler can 500 and the
+	// operator notices the outage.
+	//
+	// PR#121 R7 (YUJ-1671) — only consult scopeRowExists when we actually
+	// need it, i.e. the explicit-scope check was negative (`!ok`) AND the
+	// channel type is one where implicit scope is possible
+	// (isGroupLikeChannelType). For DM (Person) and any future
+	// non-group-like channel, scopeRowExists adds nothing — the
+	// implicit-scope branch below would short-circuit on the
+	// isGroupLikeChannelType guard regardless. Skipping the redundant
+	// SELECT trims one DB round-trip off every successful OBO send (where
+	// `ok=true`), which is the dominant case.
+	if !ok && isGroupLikeChannelType(channelType) {
+		hasExplicitScope, scopeExistErr := store.scopeRowExists(grant.ID, channelID, channelType)
+		if scopeExistErr != nil {
+			ba.Error("OBO scopeRowExists check failed",
 				zap.Int64("grant_id", grant.ID),
 				zap.String("channel_id", channelID),
 				zap.Uint8("channel_type", channelType),
-				zap.Error(err))
-			return err
+				zap.Error(scopeExistErr))
+			return scopeExistErr
 		}
-		if !ok {
-			return ErrOBONotAuthorized
+		if !hasExplicitScope && grant.GlobalEnabled == 1 {
+			isMember, mErr := ba.grantorCanReadChannel(grantor, channelID, channelType)
+			if mErr != nil {
+				ba.Error("OBO implicit-scope membership check failed",
+					zap.String("grantor", grantor),
+					zap.String("channel_id", channelID),
+					zap.Error(mErr))
+				return mErr
+			}
+			if isMember {
+				ba.Info("OBO checkOBO: implicit-scope approved (grantor is group member)",
+					zap.String("grantor", grantor),
+					zap.String("bot", botUID),
+					zap.String("channel_id", channelID))
+				ok = true
+			}
 		}
+	}
+	if !ok {
+		return ErrOBONotAuthorized
 	}
 
 	// PR#82 round-2 P1-A — TOCTOU close-out. Re-check the grantor's live
@@ -148,28 +171,13 @@ func (ba *BotAPI) oboStoreOrDefault() oboStore {
 }
 
 // botHasActiveGrantFrom reports whether bot `botUID` is currently authorised
-// as a grantee by `grantorUID` — i.e. there is an active row in obo_grants
-// for (grantor=grantorUID, grantee=botUID), regardless of the
-// `global_enabled` master switch.
-//
-// YUJ-1428: this helper deliberately uses
-// `findGrantByGrantorBotActiveOnly` rather than the strict
-// `findActiveGrantByGrantorBot` that checkOBO consults. The two checks
-// answer different questions:
-//
-//   - checkOBO (third-party send path) — "may this bot fan out a message
-//     while impersonating grantor X to peer Y?". Must respect
-//     global_enabled because that switch is the user-facing kill for
-//     persona fan-out and silently demoting it on the hot path re-opens
-//     the bug the switch exists to solve.
-//   - botHasActiveGrantFrom (grantor-reply bypass) — "is this bot
-//     legitimately authorised to talk to its OWN grantor in DM?". The
-//     relationship is established by the grant existing and not being
-//     revoked; whether the grantor has temporarily silenced fan-out is
-//     orthogonal. Pre-YUJ-1428 this consulted the global_enabled-aware
-//     query and broke the bypass whenever a user flipped the persona
-//     off — the bot could no longer reply to the grantor in DM even
-//     though the grant was still active.
+// as a grantee by `grantorUID` — i.e. there is an `active=1` row in
+// obo_grants for (grantor=grantorUID, grantee=botUID), REGARDLESS of the
+// `global_enabled` flag. It is a thin boolean wrapper over the
+// `findGrantByGrantorBotActiveOnly` store call (YUJ-1428 / PR#121 R5 / B3),
+// which deliberately bypasses the global_enabled predicate so the grantor-
+// reply bypass keeps working even when the persona is globally paused
+// (see the inline rationale below).
 //
 // Used by sendMessage to power the YUJ-1418 grantor-reply bypass: when a
 // persona-clone bot is asked to reply (on behalf of the grantor) to the
@@ -193,6 +201,17 @@ func (ba *BotAPI) botHasActiveGrantFrom(botUID, grantorUID string) (bool, error)
 		return false, nil
 	}
 	store := ba.oboStoreOrDefault()
+	// YUJ-1428 / PR#121 R5 / B3: must NOT consult the
+	// global_enabled-aware lookup. The grantor-reply bypass is the
+	// "bot may always talk to its OWN grantor in DM as long as the
+	// grant is active" gate; the global switch only governs whether
+	// the persona intercepts THIRD-PARTY messages for fan-out. Using
+	// findActiveGrantByGrantorBot (active=1 AND global_enabled=1)
+	// here would falsely return "no grant" the moment a user paused
+	// the persona, fall through to the strict OBO scope check, and
+	// reject the reply with "obo not authorized" — breaking direct
+	// grantor→bot DM conversation. checkOBO (the strict third-party
+	// send path) still uses findActiveGrantByGrantorBot.
 	grant, err := store.findGrantByGrantorBotActiveOnly(grantorUID, botUID)
 	if err != nil {
 		return false, err

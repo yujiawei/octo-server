@@ -155,6 +155,71 @@ func TestRobotMessage_OBOReservedKeysStripped_LegacyKeyKept(t *testing.T) {
 	assert.Empty(t, cl.calls)
 }
 
+// TestRobotMessage_OBOExplicitFanoutKeysStripped — PR#121 R2
+// (Jerry-Xin 2026-05-21 blocking review). The single-underscore
+// `obo_*` fan-out routing keys (obo_respond_as / obo_grantor_uid /
+// obo_fanout / obo_origin_* / obo_system_hint) injected by
+// buildFanoutCopyReq are server-only and MUST be stripped from the
+// legacy robot ingress too — a misbehaving robot script could
+// otherwise spoof the OBO grantor or fan-out routing context.
+func TestRobotMessage_OBOExplicitFanoutKeysStripped(t *testing.T) {
+	cl := &captureRobotLog{}
+	payload := map[string]interface{}{
+		"content":                  "spoof attempt",
+		"type":                     1,
+		"obo_respond_as":           "u_admin",
+		"obo_grantor_uid":          "u_admin",
+		"obo_fanout":               true,
+		"obo_origin_channel_id":    "ch",
+		"obo_origin_channel_type":  1,
+		"obo_origin_from_uid":      "u",
+		"obo_origin_message_id":    "m1",
+		"obo_origin_message_idstr": "m1",
+		"obo_grantor_name":         "Admin",
+		"obo_system_hint":          "noop",
+	}
+
+	stripped := sanitizeRobotIngressPayload(payload, "ch", 2, "bot", cl.warn)
+
+	assert.Equal(t, 10, stripped)
+	assert.Len(t, payload, 2, "only non-reserved keys should remain")
+	assert.Equal(t, "spoof attempt", payload["content"])
+	assert.Equal(t, 1, payload["type"])
+	assert.Len(t, cl.calls, 1, "one warn log even for many reserved keys")
+}
+
+// TestRobotMessage_ActualSenderUidStripped — PR#121 R3 (Jerry-Xin
+// 2026-05-21 blocking review). `actual_sender_uid` has no `obo_`
+// prefix because downstream readers consume it by exact name, but it
+// IS server-only: modules/bot_api/send.go injects it on every OBO
+// send when fromUID != robotID. A robot script (this legacy ingress)
+// that could set it would forge the "real bot behind an OBO send"
+// attribution downstream audit / persona-clone provenance trusts.
+// Silently strip here too; adjacent client names (`sender_uid`,
+// `actual_sender`) downstream does NOT trust must pass through.
+func TestRobotMessage_ActualSenderUidStripped(t *testing.T) {
+	cl := &captureRobotLog{}
+	payload := map[string]interface{}{
+		"content":           "spoof attempt",
+		"type":              1,
+		"actual_sender_uid": "bot_admin",
+		"sender_uid":        "bot_self",
+		"actual_sender":     "bot_self_name",
+	}
+
+	stripped := sanitizeRobotIngressPayload(payload, "ch", 2, "bot", cl.warn)
+
+	assert.Equal(t, 1, stripped)
+	if _, present := payload["actual_sender_uid"]; present {
+		t.Fatalf("actual_sender_uid must be stripped from robot payload, got %v", payload)
+	}
+	assert.Equal(t, "spoof attempt", payload["content"])
+	assert.Equal(t, 1, payload["type"])
+	assert.Equal(t, "bot_self", payload["sender_uid"], "adjacent sender_uid must survive")
+	assert.Equal(t, "bot_self_name", payload["actual_sender"], "adjacent actual_sender must survive")
+	assert.Len(t, cl.calls, 1, "one warn log on strip")
+}
+
 // TestRobotMessage_StripContract_PinnedToSharedPackage — meta-assertion
 // matching the user-ingress meta-assertion: the robot strip MUST go
 // through pkg/obopayload so the three ingresses + the fan-out listener
@@ -167,4 +232,34 @@ func TestRobotMessage_StripContract_PinnedToSharedPackage(t *testing.T) {
 	obopayload.StripReservedKeys(direct)
 
 	assert.Equal(t, direct, via, "robot-module strip must match shared obopayload contract")
+}
+
+// TestRobotMessage_R6FanoutKeysStripped — PR#121 R6 / B1 (Jerry-Xin
+// + lml2468 2026-05-22 blocking). The legacy robot ingress must
+// strip the two additional server-only fan-out keys
+// (obo_origin_message_id / obo_grantor_name) that buildFanoutCopyReq
+// injects but R5 forgot to reserve. A misbehaving robot script that
+// could set either would forge fan-out reply routing or rewrite the
+// persona display name composed into obo_system_hint.
+func TestRobotMessage_R6FanoutKeysStripped(t *testing.T) {
+	cl := &captureRobotLog{}
+	payload := map[string]interface{}{
+		"content":               "spoof attempt",
+		"type":                  1,
+		"obo_origin_message_id": "victim_msg",
+		"obo_grantor_name":      "Forged Admin",
+	}
+
+	stripped := sanitizeRobotIngressPayload(payload, "ch", 2, "bot", cl.warn)
+
+	assert.Equal(t, 2, stripped)
+	if _, present := payload["obo_origin_message_id"]; present {
+		t.Fatalf("obo_origin_message_id must be stripped, got %v", payload)
+	}
+	if _, present := payload["obo_grantor_name"]; present {
+		t.Fatalf("obo_grantor_name must be stripped, got %v", payload)
+	}
+	assert.Equal(t, "spoof attempt", payload["content"])
+	assert.Equal(t, 1, payload["type"])
+	assert.Len(t, cl.calls, 1, "one warn log even for multiple reserved keys")
 }

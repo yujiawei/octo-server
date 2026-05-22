@@ -139,6 +139,10 @@ func TestUserMessage_OBOReservedKeysStripped_NilPayload(t *testing.T) {
 // `__obo_*` namespace is server-only. Locking this in protects
 // downstream consumers that might still inspect the legacy field for
 // debugging.
+// TestUserMessage_OBOReservedKeysStripped_LegacyKeyKept — the legacy
+// `obo_processed` key (single underscore, not in either reserved set)
+// must remain untouched: it's a client-readable hint, not a
+// server-only marker. Anti-overreach guard.
 func TestUserMessage_OBOReservedKeysStripped_LegacyKeyKept(t *testing.T) {
 	cl := &captureLog{}
 	payload := map[string]interface{}{
@@ -149,6 +153,75 @@ func TestUserMessage_OBOReservedKeysStripped_LegacyKeyKept(t *testing.T) {
 	assert.Equal(t, 0, stripped)
 	assert.Equal(t, true, payload["obo_processed"], "legacy key must survive")
 	assert.Empty(t, cl.calls)
+}
+
+// TestUserMessage_OBOExplicitFanoutKeysStripped — PR#121 R2
+// (Jerry-Xin 2026-05-21 blocking review). The single-underscore
+// `obo_*` fan-out routing keys injected by buildFanoutCopyReq
+// (obo_respond_as / obo_grantor_uid / obo_fanout / obo_origin_* /
+// obo_system_hint) are server-only and MUST be silently stripped from
+// user-message payloads — a malicious user could otherwise spoof the
+// OBO grantor identity or impersonate the system-hint pathway via
+// /v1/message/send.
+func TestUserMessage_OBOExplicitFanoutKeysStripped(t *testing.T) {
+	cl := &captureLog{}
+	payload := map[string]interface{}{
+		"content":                  "spoof attempt",
+		"type":                     1,
+		"obo_respond_as":           "u_admin",
+		"obo_grantor_uid":          "u_admin",
+		"obo_fanout":               true,
+		"obo_origin_channel_id":    "ch",
+		"obo_origin_channel_type":  1,
+		"obo_origin_from_uid":      "u",
+		"obo_origin_message_id":    "m1",
+		"obo_origin_message_idstr": "m1",
+		"obo_grantor_name":         "Admin",
+		"obo_system_hint":          "noop",
+	}
+
+	stripped := sanitizeUserIngressPayload(payload, "ch", 1, "u", cl.warn)
+
+	assert.Equal(t, 10, stripped)
+	assert.Len(t, payload, 2, "only non-reserved keys should remain")
+	assert.Equal(t, "spoof attempt", payload["content"])
+	assert.Equal(t, 1, payload["type"])
+	assert.Len(t, cl.calls, 1, "one warn log even for many reserved keys")
+}
+
+// TestUserMessage_ActualSenderUidStripped — PR#121 R3
+// (Jerry-Xin 2026-05-21 blocking review). `actual_sender_uid` has no
+// `obo_` prefix because downstream readers consume it by exact name,
+// but it IS server-only: modules/bot_api/send.go injects it on every
+// OBO send when fromUID != robotID. A user who could set it on
+// /v1/message/send would forge the "real bot behind an OBO send"
+// attribution downstream audit / persona-clone provenance trusts.
+// Silently stripping at the user ingress closes that gap; the
+// adjacent `sender_uid` / `actual_sender` schemas downstream code does
+// NOT trust must remain pass-through so we don't break unrelated
+// client payloads.
+func TestUserMessage_ActualSenderUidStripped(t *testing.T) {
+	cl := &captureLog{}
+	payload := map[string]interface{}{
+		"content":           "spoof attempt",
+		"type":              1,
+		"actual_sender_uid": "bot_admin",
+		// adjacent names — must survive
+		"sender_uid":    "u_self",
+		"actual_sender": "u_self_name",
+	}
+
+	stripped := sanitizeUserIngressPayload(payload, "ch", 1, "u", cl.warn)
+
+	assert.Equal(t, 1, stripped)
+	if _, present := payload["actual_sender_uid"]; present {
+		t.Fatalf("actual_sender_uid must be stripped, got %v", payload)
+	}
+	assert.Equal(t, "spoof attempt", payload["content"])
+	assert.Equal(t, 1, payload["type"])
+	assert.Equal(t, "u_self", payload["sender_uid"], "adjacent sender_uid must survive")
+	assert.Equal(t, "u_self_name", payload["actual_sender"], "adjacent actual_sender must survive")
+	assert.Len(t, cl.calls, 1, "one warn log on strip")
 }
 
 // TestUserMessage_StripContract_PinnedToSharedPackage — meta-assertion:
@@ -165,4 +238,38 @@ func TestUserMessage_StripContract_PinnedToSharedPackage(t *testing.T) {
 	obopayload.StripReservedKeys(direct)
 
 	assert.Equal(t, direct, via, "message-module strip must match shared obopayload contract")
+}
+
+// TestUserMessage_R6FanoutKeysStripped — PR#121 R6 / B1 (Jerry-Xin +
+// lml2468 2026-05-22 blocking). buildFanoutCopyReq injects two
+// additional server-only fields the R5 reserved set missed:
+// `obo_origin_message_id` (v2-canonical message id; legacy
+// `obo_origin_message_idstr` is preserved for older adapters) and
+// `obo_grantor_name` (resolved display name used to compose the
+// `obo_system_hint` Chinese narration). A user that could set either
+// on /v1/message/send would (a) redirect a v2-aware adapter's reply
+// to an arbitrary message id, or (b) rewrite the persona's
+// user-visible display name. Silently strip both at the user
+// ingress, matching the rest of the fan-out routing namespace.
+func TestUserMessage_R6FanoutKeysStripped(t *testing.T) {
+	cl := &captureLog{}
+	payload := map[string]interface{}{
+		"content":               "spoof attempt",
+		"type":                  1,
+		"obo_origin_message_id": "victim_msg",
+		"obo_grantor_name":      "Forged Admin",
+	}
+
+	stripped := sanitizeUserIngressPayload(payload, "ch", 1, "u", cl.warn)
+
+	assert.Equal(t, 2, stripped)
+	if _, present := payload["obo_origin_message_id"]; present {
+		t.Fatalf("obo_origin_message_id must be stripped, got %v", payload)
+	}
+	if _, present := payload["obo_grantor_name"]; present {
+		t.Fatalf("obo_grantor_name must be stripped, got %v", payload)
+	}
+	assert.Equal(t, "spoof attempt", payload["content"])
+	assert.Equal(t, 1, payload["type"])
+	assert.Len(t, cl.calls, 1, "one warn log even for multiple reserved keys")
 }

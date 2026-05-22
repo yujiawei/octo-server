@@ -7,17 +7,16 @@
 // NOT support cross-user persona management in v0 (RFC §2 / out-of-scope).
 //
 // Status code map (kept narrow on purpose):
-//
-//	200 — success (single object or list)
-//	400 — bad request body / missing required fields
-//	401 — no user token (handled by upstream middleware)
-//	403 — (reserved — production currently uses 404 for cross-user attempts
-//	       as a user-enumeration defense; see requireOwnedGrant comment.)
-//	404 — grant_id / scope_id not found; cross-user grant/scope access
-//	       (existence-leak defense)
-//	409 — duplicate (grantor+grantee already exists / scope already exists,
-//	       with no soft-deleted row to reactivate in place)
-//	500 — DB error
+//   200 — success (single object or list)
+//   400 — bad request body / missing required fields
+//   401 — no user token (handled by upstream middleware)
+//   403 — (reserved — production currently uses 404 for cross-user attempts
+//          as a user-enumeration defense; see requireOwnedGrant comment.)
+//   404 — grant_id / scope_id not found; cross-user grant/scope access
+//          (existence-leak defense)
+//   409 — duplicate (grantor+grantee already exists / scope already exists,
+//          with no soft-deleted row to reactivate in place)
+//   500 — DB error
 package bot_api
 
 import (
@@ -79,9 +78,7 @@ type oboUpdateGrantReq struct {
 	// GlobalEnabled uses *int (not int / bool) so "field omitted" and
 	// "field set to 0" are distinguishable on the wire. Per RFC §5.1
 	// PUT semantics: only provided fields are updated.
-	GlobalEnabled *int `json:"global_enabled,omitempty"`
-	// PersonaPrompt — YUJ-1465. Pointer so callers can distinguish
-	// "leave unchanged" (omit) from "clear the prompt" (empty string).
+	GlobalEnabled *int    `json:"global_enabled,omitempty"`
 	PersonaPrompt *string `json:"persona_prompt,omitempty"`
 }
 
@@ -115,23 +112,6 @@ type oboCreateScopeReq struct {
 //     pair (review #2 P1-1). global_enabled is intentionally reset to 0
 //     on reactivation so the caller must re-issue a PUT to enable fan-out
 //     — matches the fail-closed default for a brand-new grant.
-//
-// PR#109 / YUJ-1471 — review fixes:
-//   - The INSERT/reactivate + deactivate-others sequence now runs in a
-//     single MySQL transaction (createOrReactivateGrantAtomic) with
-//     `SELECT ... FOR UPDATE` on the grantor's user row, so two
-//     concurrent creates for different bots under the same grantor
-//     cannot both succeed and then mutually demote each other to
-//     active=0. Demotion failure rolls back the entire operation and
-//     surfaces a 500-class error (was previously a logged no-op that
-//     still returned 200).
-//   - Reactivation now always overwrites persona_prompt with the
-//     request value — including the empty string, which is the
-//     explicit "clear the prompt" signal. The previous behavior
-//     silently inherited the prior persona's prompt when a caller
-//     recreated a revoked grant without specifying one.
-//   - PersonaPrompt is capped at oboPersonaPromptMaxBytes; oversize
-//     payloads are rejected with HTTP 400 before any DB work.
 func (ba *BotAPI) oboCreateGrant(c *wkhttp.Context) {
 	uid := c.GetLoginUID()
 	if uid == "" {
@@ -192,6 +172,17 @@ func (ba *BotAPI) oboCreateGrant(c *wkhttp.Context) {
 		return
 	}
 
+	// PR#109 / YUJ-1471 / PR#121 R5 B2 — atomic create-or-reactivate +
+	// demote. The store call wraps INSERT-or-reactivate + the v2 mutex
+	// demote in a single MySQL transaction (`SELECT ... FOR UPDATE` on
+	// the grantor's user row serializes concurrent create flows for
+	// the same grantor). The handler MUST NOT split these into separate
+	// autocommit ops: two concurrent POSTs for different bots under the
+	// same grantor could both succeed and then mutually demote each
+	// other to active=0, leaving the grantor with zero active personas
+	// and a 200 OK on the wire. Reactivation also re-writes
+	// persona_prompt verbatim (including "") so a tombstoned grant
+	// never inherits the prior persona's instructions.
 	grant, _, err := ba.oboStoreOrDefault().createOrReactivateGrantAtomic(uid, req.GranteeBotUID, mode, req.PersonaPrompt)
 	if err != nil {
 		if errors.Is(err, errOBOGrantAlreadyActive) {
@@ -248,19 +239,19 @@ func (ba *BotAPI) oboDeleteGrant(c *wkhttp.Context) {
 // oboUpdateGrant — PUT /v1/obo/grants/:id. Toggle global_enabled / change
 // mode. mode validation matches Create (v0 only accepts "auto").
 //
-// YUJ-1424 / PR#82 Jerry-Xin review (2026-05-20, "Also fix" non-blocking):
-// requireOwnedGrant verifies ownership but NOT `active` status, so a
-// caller can flip mode / global_enabled on a grant they previously
-// revoked (active=0). That silently un-tombstones the row's logical
-// state from the caller's perspective (the row still has active=0 and
-// won't be picked up by findActiveGrantByGrantorBot / -ForChannel, but
-// PUTting mode="auto" + global_enabled=1 reads back as "live" via
-// findGrantByID and gives misleading client UX). The fix is to reject
-// the PUT when the row is revoked — callers that want to revive a
-// revoked grant must POST /v1/obo/grants (Create takes the
-// reactivation path; see oboCreateGrant's "soft-revoked → reactivate
-// in place" branch). 404 (not 409) mirrors the existence-leak posture
-// of requireOwnedGrant: a revoked grant is treated as "no longer
+// YUJ-1424 / PR#82 Jerry-Xin review (restored after PR#121 R5 / W1
+// rebase regression): requireOwnedGrant verifies ownership but NOT
+// `active` status, so a caller can flip mode / global_enabled on a
+// grant they previously revoked (active=0). That silently un-tombstones
+// the row's logical state from the caller's perspective (the row still
+// has active=0 and won't be picked up by findActiveGrantByGrantorBot /
+// -ForChannel, but PUTting mode="auto" + global_enabled=1 reads back
+// as "live" via findGrantByID and gives misleading client UX). The fix
+// is to reject the PUT when the row is revoked — callers that want to
+// revive a revoked grant must POST /v1/obo/grants (Create takes the
+// reactivation path; see oboCreateGrant's atomic create-or-reactivate
+// flow). 404 (not 409) mirrors the existence-leak posture of
+// requireOwnedGrant: a revoked grant is treated as "no longer
 // addressable" by per-grant write endpoints.
 //
 // Scope: oboUpdateGrant only. oboDeleteGrant is intentionally left
@@ -277,8 +268,9 @@ func (ba *BotAPI) oboUpdateGrant(c *wkhttp.Context) {
 	if err != nil || grant == nil {
 		return
 	}
-	// YUJ-1424 — active gate. See function doc for rationale. Defensive
-	// check on the row we already loaded; no extra DB roundtrip.
+	// YUJ-1424 / W1 — active gate. See function doc for rationale.
+	// Defensive check on the row we already loaded; no extra DB
+	// roundtrip.
 	if grant.Active != 1 {
 		ba.Warn("OBO update rejected: grant is revoked",
 			zap.Int64("grant_id", id),
@@ -555,7 +547,15 @@ func (ba *BotAPI) grantorCanReadChannel(uid, channelID string, channelType uint8
 // userIsGroupMember returns true iff `uid` has an undeleted row in
 // group_member for group_no=groupNo. Mirrors the SQL used by
 // checkSendPermission's BotKindUser/ChannelTypeGroup branch.
+//
+// Test hook: ba.oboGroupMemberOverride lets unit tests stub the answer
+// without standing up MySQL (PR#121 R8 / YUJ-1673 — needed to exercise
+// the explicit-scope Gate 4 paths in fanoutForMessage). nil override →
+// DB path.
 func (ba *BotAPI) userIsGroupMember(uid, groupNo string) (bool, error) {
+	if ba.oboGroupMemberOverride != nil {
+		return ba.oboGroupMemberOverride(uid, groupNo)
+	}
 	if ba.db == nil || ba.db.session == nil {
 		// No DB session (some test contexts) — fail-closed.
 		return false, nil

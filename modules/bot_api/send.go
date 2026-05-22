@@ -53,15 +53,29 @@ func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
 		c.ResponseError(errors.New("payload不能为空"))
 		return
 	}
-	// PR#82 review #2 P1-2 — reject any inbound payload that carries a
-	// reserved server-only key. The fan-out gate-3 marker
-	// (`__obo_processed__`) and any future server-injected OBO field live
-	// under this prefix; allowing a bot client to set them would let a
-	// malicious bot suppress its own fan-out copy or spoof OBO-state
-	// downstream. Reject before checkSendPermission / checkOBO so the
-	// error is fast and the auth path doesn't run on poisoned input.
+	// PR#82 review #2 P1-2 + PR#121 R2 + PR#121 R3 — reject any
+	// inbound payload that carries a reserved server-only key. Three
+	// overlapping namespaces are reserved:
+	//   - `__obo_*` (double-underscore prefix): home of the fan-out
+	//     gate-3 marker `__obo_processed__` and any future
+	//     server-injected OBO field;
+	//   - explicit `obo_*` keys injected by buildFanoutCopyReq
+	//     (obo_respond_as, obo_grantor_uid, obo_fanout, obo_origin_*,
+	//     obo_system_hint);
+	//   - `actual_sender_uid` — the prefix-less server-injected
+	//     "real bot behind an OBO send" identity set below in the
+	//     fan-out marker block (PR#121 R3).
+	// Allowing a bot client to set any of them would let a malicious
+	// bot suppress its own fan-out copy, spoof the OBO grantor /
+	// fan-out routing context downstream, or forge the
+	// authenticated-by-server sender identity downstream consumers
+	// trust. Membership is owned by pkg/obopayload so this site
+	// cannot drift from the user / robot ingress strip or the
+	// fan-out listener's gate-3 check. Reject before
+	// checkSendPermission / checkOBO so the error is fast and the
+	// auth path doesn't run on poisoned input.
 	if payloadHasReservedOBOKey(req.Payload) {
-		c.ResponseError(errors.New("payload 不允许使用以 __obo_ 开头的保留字段"))
+		c.ResponseError(errors.New("payload 不允许使用 OBO 保留字段（__obo_* 前缀、obo_respond_as/obo_grantor_uid/obo_fanout/obo_origin_*/obo_system_hint，或 actual_sender_uid）"))
 		return
 	}
 
@@ -275,36 +289,59 @@ func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, chann
 
 	case BotKindUser:
 		if channelType == common.ChannelTypeGroup.Uint8() {
-			// Group: check bot is a group member
-			var count int
-			err := ba.db.session.SelectBySql(
-				"SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0",
-				channelID, robotID,
-			).LoadOne(&count)
-			if err != nil {
-				ba.Error("查询群成员失败", zap.Error(err))
-				return errors.New("查询群成员失败")
-			}
-			if count == 0 {
-				return errors.New("bot is not a member of this group")
+			// OBO bypass: when the bot acts on behalf of a grantor who IS a
+			// group member, skip the bot's own membership check. The downstream
+			// checkOBO validates that the grantor has a legitimate grant+scope
+			// (or implicit scope via global_enabled) for this channel.
+			if !hasOBOContext {
+				// Group: check bot is a group member
+				var count int
+				err := ba.db.session.SelectBySql(
+					"SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0",
+					channelID, robotID,
+				).LoadOne(&count)
+				if err != nil {
+					ba.Error("查询群成员失败", zap.Error(err))
+					return errors.New("查询群成员失败")
+				}
+				if count == 0 {
+					return errors.New("bot is not a member of this group")
+				}
 			}
 		} else if channelType == common.ChannelTypeCommunityTopic.Uint8() {
-			// Thread: extract parent group_no and verify membership
-			parts := strings.SplitN(channelID, threadChannelIDSeparator, 2)
-			if len(parts) != 2 {
-				return errors.New("invalid thread channel_id format")
-			}
-			var count int
-			err := ba.db.session.SelectBySql(
-				"SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0",
-				parts[0], robotID,
-			).LoadOne(&count)
-			if err != nil {
-				ba.Error("查询群成员失败", zap.Error(err))
-				return errors.New("查询群成员失败")
-			}
-			if count == 0 {
-				return errors.New("bot is not a member of this group")
+			// Thread: extract parent group_no and verify membership.
+			//
+			// PR#121 R7 (YUJ-1671) — OBO bypass parity with Group above.
+			// CommunityTopic fan-out (`obo_fanout.go` / mention-gated)
+			// already delivers topic messages to clone bots that are
+			// NOT parent-group members; the bot must be allowed to reply
+			// on behalf of a grantor who IS a member. Without this
+			// bypass, `checkSendPermission` rejects the OBO reply with
+			// "bot is not a member of this group" before `checkOBO`
+			// gets the chance to authorize the grantor. Mirrors the
+			// `if !hasOBOContext` skip used by ChannelTypeGroup just
+			// above. Live grantor membership is still re-verified by
+			// `checkOBO` → `grantorCanReadChannel`, so the bypass does
+			// not widen access (the grantor must currently be in the
+			// parent group, or the implicit-scope membership branch
+			// will fail).
+			if !hasOBOContext {
+				parts := strings.SplitN(channelID, threadChannelIDSeparator, 2)
+				if len(parts) != 2 {
+					return errors.New("invalid thread channel_id format")
+				}
+				var count int
+				err := ba.db.session.SelectBySql(
+					"SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0",
+					parts[0], robotID,
+				).LoadOne(&count)
+				if err != nil {
+					ba.Error("查询群成员失败", zap.Error(err))
+					return errors.New("查询群成员失败")
+				}
+				if count == 0 {
+					return errors.New("bot is not a member of this group")
+				}
 			}
 		} else if channelType == common.ChannelTypePerson.Uint8() {
 			// DM: creator can always talk to their bot; otherwise check friend

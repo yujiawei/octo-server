@@ -276,8 +276,8 @@ func TestSendMessage_OBO_GrantorReplyBypass_DM(t *testing.T) {
 	}
 }
 
-// TestSendMessage_OBO_GrantorReplyBypass_DM_GlobalDisabled — YUJ-1428
-// regression guard.
+// TestSendMessage_OBO_GrantorReplyBypass_DM_GlobalDisabled — YUJ-1428 /
+// PR#121 R5 B3 regression guard.
 //
 // Scenario: same as TestSendMessage_OBO_GrantorReplyBypass_DM but the
 // user has toggled the persona's global_enabled switch OFF. The grant
@@ -288,7 +288,10 @@ func TestSendMessage_OBO_GrantorReplyBypass_DM(t *testing.T) {
 // requires `global_enabled=1`, so it incorrectly returned "no grant",
 // fell through to the strict OBO scope check, and replied with
 // "obo not authorized" — breaking direct grantor→bot DM conversation
-// every time a user paused the persona.
+// every time a user paused the persona. The PR#121 rebase
+// re-introduced this regression by deleting both the
+// findGrantByGrantorBotActiveOnly store method and this test; both are
+// restored as part of the R5 fix.
 //
 // Expected post-fix behaviour: bypass still fires (200 OK, FromUID =
 // bot, no OBO markers), exactly like the global_enabled=1 case. The
@@ -312,7 +315,7 @@ func TestSendMessage_OBO_GrantorReplyBypass_DM_GlobalDisabled(t *testing.T) {
 	// Seed an active grant from admin → james WITHOUT enabling
 	// global_enabled. insertGrant defaults global_enabled=0 (matches
 	// production schema), so omitting the updateGrant(enable=1) call
-	// reproduces the YUJ-1428 condition exactly.
+	// reproduces the YUJ-1428 / B3 condition exactly.
 	s := newFakeOBOStore()
 	_, _ = s.insertGrant(grantor, botID, "auto", "")
 
@@ -697,5 +700,140 @@ func TestBotMessage_OBOReservedKeysKept(t *testing.T) {
 	// uses MUST NOT have leaked into the bot ingress).
 	if dc.captured != nil {
 		t.Fatalf("bot ingress must REJECT (not strip) reserved OBO keys; dispatch fired with %+v", dc.captured)
+	}
+}
+
+// TestSendMessage_RejectsExplicitFanoutKeys — PR#121 R2 (Jerry-Xin
+// 2026-05-21 blocking review) regression guard. The fan-out copy
+// builder (buildFanoutCopyReq) injects single-underscore obo_*
+// routing fields (obo_respond_as / obo_grantor_uid / obo_fanout /
+// obo_origin_* / obo_system_hint) — these are NOT under the legacy
+// `__obo_*` reserved prefix, but they ARE server-only. A bot client
+// that could set them on inbound /v1/bot/sendMessage payloads could
+// spoof the OBO grantor identity, redirect fan-out, or impersonate a
+// system-hint message. Per pkg/obopayload.IsReservedKey they are now
+// part of the same reject set; this test pins the bot-API behavior to
+// match.
+func TestSendMessage_RejectsExplicitFanoutKeys(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const (
+		botID  = "bot_legacy"
+		owner  = "creator_uid"
+		authSp = "space_A"
+	)
+
+	keys := []string{
+		"obo_respond_as",
+		"obo_grantor_uid",
+		"obo_fanout",
+		"obo_origin_channel_id",
+		"obo_origin_channel_type",
+		"obo_origin_from_uid",
+		"obo_origin_message_id",
+		"obo_origin_message_idstr",
+		"obo_grantor_name",
+		"obo_system_hint",
+	}
+	for _, key := range keys {
+		t.Run(key, func(t *testing.T) {
+			dc := &dispatchCapture{}
+			ba := &BotAPI{
+				Log:              log.NewTLog("BotAPI-reject-fanout-key"),
+				spaceQuerier:     &fakeSpaceQuerier{defaultSpace: authSp},
+				dispatchOverride: dc.hook,
+				oboStoreOverride: newFakeOBOStore(),
+			}
+
+			body, _ := json.Marshal(BotSendMessageReq{
+				ChannelID:   owner,
+				ChannelType: common.ChannelTypePerson.Uint8(),
+				Payload: map[string]interface{}{
+					"content": "spoof attempt",
+					"type":    1,
+					key:       "victim_value",
+				},
+			})
+			httpReq := httptest.NewRequest(http.MethodPost, "/v1/bot/sendMessage", bytes.NewReader(body))
+			httpReq.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			gc, _ := gin.CreateTestContext(rec)
+			gc.Request = httpReq
+			c := &wkhttp.Context{Context: gc}
+			c.Set(CtxKeyRobotID, botID)
+			c.Set(CtxKeyBotKind, BotKindUser)
+			c.Set(CtxKeyRobot, &robotModel{RobotID: botID, CreatorUID: owner})
+
+			ba.sendMessage(c)
+			if dc.captured != nil {
+				t.Fatalf("dispatch must NOT fire when reserved OBO key %q is rejected, got %+v", key, dc.captured)
+			}
+			// Reject body should mention OBO so bot authors can grep
+			// for the cause; we don't pin the exact phrasing.
+			if !strings.Contains(rec.Body.String(), "obo") && !strings.Contains(rec.Body.String(), "OBO") {
+				t.Fatalf("expected reject body for %q to mention OBO, got %s", key, rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestSendMessage_RejectsR6FanoutKeys — PR#121 R6 / B1 (Jerry-Xin +
+// lml2468 2026-05-22 blocking) regression guard. buildFanoutCopyReq
+// also injects the v2-canonical `obo_origin_message_id` (alongside the
+// legacy `obo_origin_message_idstr`) and the resolved
+// `obo_grantor_name`. The R5 reserved set was missing both, so a bot
+// client could spoof either: faking `obo_origin_message_id` would let
+// a bot redirect a v2-aware adapter's reply to an arbitrary message;
+// faking `obo_grantor_name` would let a bot rewrite the persona's
+// user-visible display name (the system-hint copy is composed from
+// it). The bot ingress now rejects both, same as the rest of the
+// fan-out routing namespace.
+func TestSendMessage_RejectsR6FanoutKeys(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const (
+		botID  = "bot_legacy"
+		owner  = "creator_uid"
+		authSp = "space_A"
+	)
+	keys := []string{
+		"obo_origin_message_id",
+		"obo_grantor_name",
+	}
+	for _, key := range keys {
+		t.Run(key, func(t *testing.T) {
+			dc := &dispatchCapture{}
+			ba := &BotAPI{
+				Log:              log.NewTLog("BotAPI-reject-r6-key"),
+				spaceQuerier:     &fakeSpaceQuerier{defaultSpace: authSp},
+				dispatchOverride: dc.hook,
+				oboStoreOverride: newFakeOBOStore(),
+			}
+
+			body, _ := json.Marshal(BotSendMessageReq{
+				ChannelID:   owner,
+				ChannelType: common.ChannelTypePerson.Uint8(),
+				Payload: map[string]interface{}{
+					"content": "spoof attempt",
+					"type":    1,
+					key:       "victim_value",
+				},
+			})
+			httpReq := httptest.NewRequest(http.MethodPost, "/v1/bot/sendMessage", bytes.NewReader(body))
+			httpReq.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			gc, _ := gin.CreateTestContext(rec)
+			gc.Request = httpReq
+			c := &wkhttp.Context{Context: gc}
+			c.Set(CtxKeyRobotID, botID)
+			c.Set(CtxKeyBotKind, BotKindUser)
+			c.Set(CtxKeyRobot, &robotModel{RobotID: botID, CreatorUID: owner})
+
+			ba.sendMessage(c)
+			if dc.captured != nil {
+				t.Fatalf("dispatch must NOT fire when reserved OBO key %q is rejected, got %+v", key, dc.captured)
+			}
+			if !strings.Contains(rec.Body.String(), "obo") && !strings.Contains(rec.Body.String(), "OBO") {
+				t.Fatalf("expected reject body for %q to mention OBO, got %s", key, rec.Body.String())
+			}
+		})
 	}
 }

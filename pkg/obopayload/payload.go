@@ -54,26 +54,122 @@ const ReservedKeyPrefix = "__obo_"
 // prefix.
 const ProcessedMarkerKey = "__obo_processed__"
 
+// ExplicitReservedKeys lists payload keys that the server injects on
+// the OBO send / fan-out path and that MUST be server-only: a client
+// that could set them on inbound payloads could spoof the grantor
+// identity, redirect fan-out, impersonate the system-hint pathway, or
+// (for `actual_sender_uid`) forge the message's effective sender for
+// any downstream consumer that trusts the field as the
+// authenticated-by-server identity behind an OBO send.
+//
+// Two namespace shapes share this allowlist:
+//
+//   - `obo_*` (single-underscore) — the routing context injected by
+//     modules/bot_api/obo_fanout.go's buildFanoutCopyReq (PR#121 R2 —
+//     Jerry-Xin 2026-05-21 blocking review). They use the legacy
+//     single-underscore `obo_` prefix (not the double-underscore
+//     `__obo_` reserved-marker prefix) for compatibility with
+//     downstream consumers that already read these names. We can't
+//     retroactively switch to a `__obo_` prefix without breaking
+//     those consumers, so the ingress filters guard the same set via
+//     an explicit allowlist instead of by prefix.
+//
+//   - `actual_sender_uid` (no `obo_` prefix) — the server-injected
+//     "real bot behind an OBO send" identity set by
+//     modules/bot_api/send.go when fromUID != robotID (PR#121 R3 —
+//     Jerry-Xin 2026-05-21 blocking review). It does NOT live under
+//     any prefix because the field name predates the OBO reserved
+//     namespace and downstream consumers (audit, persona-clone
+//     attribution, fan-out copy provenance) read it by exact name. A
+//     client that could set `actual_sender_uid` on an inbound payload
+//     would be able to forge the bot identity that downstream paths
+//     attribute the message to — the same impersonation risk the
+//     `obo_grantor_uid` reservation closes for the user side.
+//
+// Notes
+//   - `obo_processed` (single-underscore) is intentionally NOT in this
+//     list: it is a legacy client-readable hint, not the server-only
+//     gate-3 marker (that one is `__obo_processed__` under the
+//     ReservedKeyPrefix).
+//   - PR#121 R6 (Jerry-Xin + lml2468 2026-05-22 blocking): the
+//     v2-canonical `obo_origin_message_id` and the resolved
+//     `obo_grantor_name` are ALSO injected by buildFanoutCopyReq
+//     alongside the legacy `obo_origin_message_idstr` /
+//     `obo_grantor_uid`. They were missing from the allowlist in R5,
+//     so a client could spoof either: faking `obo_origin_message_id`
+//     would let a peer redirect a v2-aware adapter's reply to an
+//     arbitrary message id, and faking `obo_grantor_name` would let a
+//     peer rewrite the persona's user-visible display name (the
+//     system-hint text is composed from it). Both are now reserved.
+//   - When adding a new server-only OBO payload key in
+//     buildFanoutCopyReq, send.go's OBO marker block, or any other
+//     server injection site, add it here too. The shared
+//     payload_test.go locks the contract.
+var ExplicitReservedKeys = map[string]struct{}{
+	"obo_respond_as":           {},
+	"obo_grantor_uid":          {},
+	"obo_fanout":               {},
+	"obo_origin_channel_id":    {},
+	"obo_origin_channel_type":  {},
+	"obo_origin_from_uid":      {},
+	"obo_origin_message_id":    {},
+	"obo_origin_message_idstr": {},
+	"obo_grantor_name":         {},
+	"obo_system_hint":          {},
+	// PR#121 R3 (Jerry-Xin 2026-05-21 blocking): server-set actual
+	// sender identity behind an OBO send. Injected by
+	// modules/bot_api/send.go when fromUID != robotID; no `obo_`
+	// prefix because downstream readers use the exact field name.
+	"actual_sender_uid": {},
+}
+
+// IsReservedKey reports whether a single top-level payload key name
+// belongs to the server-only OBO reserved namespace. A key is reserved
+// if EITHER:
+//
+//   - it starts with ReservedKeyPrefix (`__obo_`) — the original
+//     double-underscore namespace, home of `__obo_processed__` (the
+//     gate-3 marker) and any future server-only marker; OR
+//   - it matches an entry in ExplicitReservedKeys — the
+//     single-underscore `obo_*` set covering the buildFanoutCopyReq
+//     routing fields (`obo_respond_as`, `obo_grantor_uid`,
+//     `obo_fanout`, `obo_origin_*`, `obo_system_hint`) PLUS the
+//     prefix-less `actual_sender_uid` field injected by send.go's
+//     OBO marker block (PR#121 R3).
+//
+// Used by HasReservedKey (bot-API reject) and StripReservedKeys
+// (user / robot ingress strip) so both ingresses + the listener's
+// gate-3 check share one definition of "reserved".
+func IsReservedKey(k string) bool {
+	if strings.HasPrefix(k, ReservedKeyPrefix) {
+		return true
+	}
+	_, ok := ExplicitReservedKeys[k]
+	return ok
+}
+
 // HasReservedKey reports whether any top-level key in the decoded
-// payload map starts with ReservedKeyPrefix. Used by the bot API
-// ingress (modules/bot_api/send.go) to fail fast with a 4xx when a bot
-// client tries to forge server-only state.
+// payload map is part of the OBO reserved namespace (see IsReservedKey
+// for the full membership rule). Used by the bot API ingress
+// (modules/bot_api/send.go) to fail fast with a 4xx when a bot client
+// tries to forge server-only state.
 func HasReservedKey(payload map[string]interface{}) bool {
 	if len(payload) == 0 {
 		return false
 	}
 	for k := range payload {
-		if strings.HasPrefix(k, ReservedKeyPrefix) {
+		if IsReservedKey(k) {
 			return true
 		}
 	}
 	return false
 }
 
-// StripReservedKeys removes every top-level key from `payload` whose
-// name starts with ReservedKeyPrefix. Returns the number of keys
-// stripped so the caller can log/metric the rare events. Safe on a nil
-// or empty map (no-op, returns 0).
+// StripReservedKeys removes every top-level key from `payload` that
+// IsReservedKey reports as reserved (the `__obo_*` prefix namespace
+// plus the explicit single-underscore `obo_*` allowlist). Returns the
+// number of keys stripped so the caller can log/metric the rare
+// events. Safe on a nil or empty map (no-op, returns 0).
 //
 // The map is mutated in place — callers that need to preserve the
 // caller-supplied map should clone first. The user-message ingress in
@@ -82,16 +178,17 @@ func HasReservedKey(payload map[string]interface{}) bool {
 //
 // We do NOT recurse into nested objects/arrays. The OBO reserved
 // namespace is defined at the TOP LEVEL of the dispatch payload (that
-// is the level the fan-out listener inspects); nested fields under a
-// user-controlled key (e.g. `extra.__obo_processed__`) are not part of
-// the contract and would not affect gate 3.
+// is the level the fan-out listener and downstream routers inspect);
+// nested fields under a user-controlled key (e.g.
+// `extra.__obo_processed__` or `extra.obo_respond_as`) are not part of
+// the contract and would not affect gate 3 or fan-out routing.
 func StripReservedKeys(payload map[string]interface{}) int {
 	if len(payload) == 0 {
 		return 0
 	}
 	stripped := 0
 	for k := range payload {
-		if strings.HasPrefix(k, ReservedKeyPrefix) {
+		if IsReservedKey(k) {
 			delete(payload, k)
 			stripped++
 		}
