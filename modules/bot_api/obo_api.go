@@ -80,6 +80,20 @@ type oboUpdateGrantReq struct {
 	// PUT semantics: only provided fields are updated.
 	GlobalEnabled *int    `json:"global_enabled,omitempty"`
 	PersonaPrompt *string `json:"persona_prompt,omitempty"`
+	// Active — YUJ-1728 / octo-server#129 — persona selector switch.
+	// `*int` (not int / bool) so "field omitted" stays distinguishable
+	// from "field set to 0" — same wire convention as `GlobalEnabled`
+	// above. The handler treats `*Active != 0` as activate and
+	// `*Active == 0` as pause. Activate mutex-demotes every OTHER
+	// active grant under the same grantor (single-active-persona
+	// invariant, matching createOrReactivateGrantAtomic). Pause only
+	// flips this row's bit — siblings are untouched. Active=nil leaves
+	// the row's active column untouched. The handler's pre-existing
+	// `if grant.Active != 1` gate continues to reject PUTs on already
+	// soft-deleted (revoked OR previously-paused) rows; resurrecting a
+	// paused grant requires the POST /v1/obo/grants reactivation path
+	// (see oboCreateGrant) rather than a second PUT, by design.
+	Active *int `json:"active,omitempty"`
 }
 
 type oboCreateScopeReq struct {
@@ -294,15 +308,38 @@ func (ba *BotAPI) oboUpdateGrant(c *wkhttp.Context) {
 		c.ResponseError(errors.New("persona_prompt 长度超过上限 (最多 4096 字节)"))
 		return
 	}
-	if req.Mode == "" && req.GlobalEnabled == nil && req.PersonaPrompt == nil {
+	if req.Mode == "" && req.GlobalEnabled == nil && req.PersonaPrompt == nil && req.Active == nil {
 		// Idempotent no-op — return the existing row.
 		c.Response(grant)
 		return
 	}
-	if err := ba.oboStoreOrDefault().updateGrant(id, req.Mode, req.GlobalEnabled, req.PersonaPrompt); err != nil {
-		ba.Error("updateGrant failed", zap.Error(err), zap.Int64("id", id))
-		c.ResponseError(errors.New("内部错误"))
-		return
+	// YUJ-1728 / octo-server#129 — apply the `active` selector first.
+	// It has mutex semantics (activate ⇒ demote every other active
+	// grant for the grantor in one tx) that don't compose with the
+	// per-column update path, so it lives behind its own store method.
+	// Order vs. updateGrant: active-first means a single PUT that
+	// flips `active=true` AND sets `mode`/`persona_prompt` will land
+	// on the row in its post-activation state — siblings are demoted
+	// before the persona-prompt write, eliminating the race where a
+	// concurrent fan-out could observe the new prompt against the
+	// pre-demotion sibling set.
+	if req.Active != nil {
+		v := 0
+		if *req.Active != 0 {
+			v = 1
+		}
+		if err := ba.oboStoreOrDefault().setGrantActive(id, v); err != nil {
+			ba.Error("setGrantActive failed", zap.Error(err), zap.Int64("id", id))
+			c.ResponseError(errors.New("内部错误"))
+			return
+		}
+	}
+	if req.Mode != "" || req.GlobalEnabled != nil || req.PersonaPrompt != nil {
+		if err := ba.oboStoreOrDefault().updateGrant(id, req.Mode, req.GlobalEnabled, req.PersonaPrompt); err != nil {
+			ba.Error("updateGrant failed", zap.Error(err), zap.Int64("id", id))
+			c.ResponseError(errors.New("内部错误"))
+			return
+		}
 	}
 	refreshed, _ := ba.oboStoreOrDefault().findGrantByID(id)
 	if refreshed != nil {
