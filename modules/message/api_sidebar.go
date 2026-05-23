@@ -45,6 +45,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	convext "github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
 	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/space"
 	"github.com/Mininglamp-OSS/octo-server/modules/thread"
 	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
@@ -99,6 +100,22 @@ type SidebarItem struct {
 	TargetID    string `json:"target_id"`
 	ChannelType uint8  `json:"channel_type"`
 	ChannelID   string `json:"channel_id"`
+	// SpaceID 是该 sidebar 条目所属 Space 的 ID（GH octo-server#153）。
+	//   - GROUP: group 表的 space_id；
+	//   - COMMUNITY_TOPIC: 父群的 space_id；
+	//   - PERSON: 留空 —— DM 的 Space 归属在消息级 payload.space_id 上，
+	//     conversation 级别保持空避免误锁定。
+	// 客户端 WebSocket 收到群消息时拿这个字段决定渲染到哪个 Space tab，
+	// 与服务端 FilterRawConversationsBySpace 的可见性判定同口径。
+	SpaceID     string `json:"space_id,omitempty"`
+	// MySourceSpaceID 是当前用户加入该群的"来源 Space"（外部成员场景）。
+	//   - GROUP: externalGroupMap[channelID]，即 group_external_member.source_space_id；
+	//   - COMMUNITY_TOPIC: externalGroupMap[parentGroupNo]（与父群保持同口径）；
+	//   - 其它（PERSON / 内部群成员）: 留空。
+	// 与 v1 SyncUserConversationResp.MySourceSpaceID 字段口径一致
+	// （GH octo-server#153 Round-2 P1）。客户端在 source Space 下用 sidebar 时
+	// 需要这个字段才能识别"我以哪个 Space 身份加入了这个外部群"。
+	MySourceSpaceID string `json:"my_source_space_id,omitempty"`
 	Timestamp   int64  `json:"timestamp"`
 	Unread      int    `json:"unread"`
 	IsPinned    bool   `json:"is_pinned"`
@@ -393,11 +410,48 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 		pinnedSet = map[string]struct{}{}
 	}
 
+	// 2f. groupNo -> space_id 映射，用于把 group / thread 父群的 SpaceID 回填到
+	//     SidebarItem.SpaceID（GH octo-server#153）。
+	//     使用 conversations（已 Space 过滤）作为输入：当前 Space tab 不会出现
+	//     其他 Space 的群，因此即便 group service 调用失败也只是少填一些字段，
+	//     不会泄露跨 Space 元数据。失败时退化为空 map，fail-open 把 SpaceID
+	//     置空，客户端走"未知 Space"分支（与历史行为一致）。
+	//
+	//     额外把 threadExtRows 的父群 groupNo 合入查询集合（GH octo-server#153
+	//     Round-2 Critical 2）：DB-only thread 的父群可能不在 IM 返回里，
+	//     如果不显式带上，mergeThreadEntries 写 SidebarItem.SpaceID 时
+	//     groupSpaceMap[parentGroupNo] 会 miss，space_id 被回填为空。
+	var extraParentGroupNos []string
+	if len(threadExtRows) > 0 {
+		extraParentGroupNos = uniqueThreadParentGroupNos(threadExtRows)
+	}
+	groupSpaceMap, ok := CollectGroupSpaceMap(conversations, extraParentGroupNos, sb.groupService)
+	if !ok {
+		sb.Warn("sidebar sync: group space map query failed (non-fatal, SidebarItem.SpaceID will be empty)")
+		groupSpaceMap = map[string]string{}
+	}
+
+	// 2g. externalGroupMap：当前 user 作为外部成员加入的 (groupNo -> source_space_id)
+	//     映射，用来回填 SidebarItem.MySourceSpaceID（GH octo-server#153 Round-2 P1）。
+	//     与 api_conversation.go syncUserConversation 同口径：非致命错误时降级为
+	//     空 map，仅缺失 my_source_space_id 字段，不影响 SpaceID 回填。
+	externalGroupMap, externalErr := sb.groupDB.QueryExternalGroupNosForUser(loginUID)
+	if externalErr != nil {
+		sb.Warn("sidebar sync: external group map query failed (non-fatal, my_source_space_id will be empty)", zap.Error(externalErr))
+		externalGroupMap = map[string]string{}
+	}
+
+	// 2h. defaultSpaceID：用户最早加入的 Space，用于外部群 source_space_id="" 的
+	//     空值兜底（GH octo-server#154 Round-2 Finding 2，与 decideConvKeepInSpace
+	//     同口径）。查询失败回空串，sidebarMySourceSpaceID 退化为不写
+	//     my_source_space_id —— omitempty 保持向后兼容。
+	defaultSpaceID := space.GetUserDefaultSpaceID(sb.ctx, loginUID)
+
 	// 3. Build tab-specific items
 	var items []*SidebarItem
 	switch req.Tab {
 	case "follow":
-		items = buildFollowItems(conversations, categorySetting, unfollowedGroups, followedDMs, threadExtMap, groupExts, dmCategorySorts)
+		items = buildFollowItems(conversations, categorySetting, unfollowedGroups, followedDMs, threadExtMap, groupExts, dmCategorySorts, groupSpaceMap, externalGroupMap, defaultSpaceID)
 		// Append standalone thread ext entries not present in IM result.
 		// Pass categorySetting + unfollowedGroups so parent-follow filter applies
 		// to DB-only thread entries as well (PR review Round-3 Blocking #4).
@@ -405,9 +459,9 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 		if failClosedForFollow("thread last_message_at query", err) {
 			return
 		}
-		items = mergeThreadEntries(items, threadExtRows, lastMsgAtMap, categorySetting, unfollowedGroups)
+		items = mergeThreadEntries(items, threadExtRows, lastMsgAtMap, categorySetting, unfollowedGroups, groupSpaceMap, externalGroupMap, defaultSpaceID)
 	case "recent":
-		items = buildRecentItems(conversations, pinnedSet)
+		items = buildRecentItems(conversations, pinnedSet, groupSpaceMap, externalGroupMap, defaultSpaceID)
 	}
 
 	// 4. Enrich pinned flag (follow tab items also need it)
@@ -668,6 +722,9 @@ func buildFollowItems(
 	threadExtMap map[string]*convext.Model,
 	groupExts map[string]*convext.Model,
 	dmCategorySorts map[string]int,
+	groupSpaceMap map[string]string,
+	externalGroupMap map[string]string,
+	defaultSpaceID string,
 ) []*SidebarItem {
 	items := make([]*SidebarItem, 0, len(convs))
 	for _, conv := range convs {
@@ -691,6 +748,8 @@ func buildFollowItems(
 				TargetID:          conv.ChannelID,
 				ChannelType:       conv.ChannelType,
 				ChannelID:         conv.ChannelID,
+				SpaceID:           groupSpaceMap[conv.ChannelID],
+				MySourceSpaceID:   sidebarMySourceSpaceID(externalGroupMap, conv.ChannelID, defaultSpaceID),
 				Timestamp:         conv.Timestamp,
 				Unread:            conv.Unread,
 				IsFollowed:        true,
@@ -710,10 +769,12 @@ func buildFollowItems(
 				TargetID:    conv.ChannelID,
 				ChannelType: conv.ChannelType,
 				ChannelID:   conv.ChannelID,
-				Timestamp:   conv.Timestamp,
-				Unread:      conv.Unread,
-				IsFollowed:  true,
-				FollowSort:  ext.FollowSort,
+				// PERSON 频道 SpaceID 留空：DM 的 Space 归属在消息级 payload.space_id 上
+				// （GH octo-server#153）。
+				Timestamp:  conv.Timestamp,
+				Unread:     conv.Unread,
+				IsFollowed: true,
+				FollowSort: ext.FollowSort,
 			}
 			// PR #21 Round-6：DMCategoryID 现在已经是 VARCHAR(32) UUID（与 group_category
 			// 共用 namespace），直接透传给客户端即可。
@@ -754,6 +815,11 @@ func buildFollowItems(
 				TargetID:          conv.ChannelID,
 				ChannelType:       conv.ChannelType,
 				ChannelID:         conv.ChannelID,
+				// thread 继承父群 SpaceID（GH octo-server#153）。
+				SpaceID:           groupSpaceMap[groupNo],
+				// thread 同样继承父群的 MySourceSpaceID（GH octo-server#153 Round-2 P1）。
+				// Round-3 (GH#154 Round-2 Finding 2)：父群 source_space_id="" 兜底到 defaultSpaceID。
+				MySourceSpaceID:   sidebarMySourceSpaceID(externalGroupMap, groupNo, defaultSpaceID),
 				Timestamp:         conv.Timestamp,
 				Unread:            conv.Unread,
 				IsFollowed:        true,
@@ -783,6 +849,9 @@ func buildFollowItems(
 func buildRecentItems(
 	convs []*config.SyncUserConversationResp,
 	pinnedSet map[string]struct{},
+	groupSpaceMap map[string]string,
+	externalGroupMap map[string]string,
+	defaultSpaceID string,
 ) []*SidebarItem {
 	cutoff := threeDaysAgo()
 	items := make([]*SidebarItem, 0, len(convs))
@@ -796,10 +865,24 @@ func buildRecentItems(
 			_, pinned = pinnedSet[channelKey(conv.ChannelID, conv.ChannelType)]
 		}
 		parentID := ""
-		if conv.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
+		// spaceID 取自 groupSpaceMap：GROUP 直接查 channelID；COMMUNITY_TOPIC 取
+		// 父群；PERSON 留空（GH octo-server#153，规则与 buildFollowItems 一致）。
+		// mySourceSpaceID 同口径：从 externalGroupMap 查 channelID / parentGroupNo
+		// （GH octo-server#153 Round-2 P1）。
+		// Round-3 (GH#154 Round-2 Finding 2)：externalGroupMap[k]="" 时兜底到
+		// defaultSpaceID，与 decideConvKeepInSpace 同口径。
+		spaceID := ""
+		mySourceSpaceID := ""
+		switch conv.ChannelType {
+		case common.ChannelTypeGroup.Uint8():
+			spaceID = groupSpaceMap[conv.ChannelID]
+			mySourceSpaceID = sidebarMySourceSpaceID(externalGroupMap, conv.ChannelID, defaultSpaceID)
+		case common.ChannelTypeCommunityTopic.Uint8():
 			groupNo, _, err := parseThreadChannelIDSidebar(conv.ChannelID)
 			if err == nil {
 				parentID = groupNo
+				spaceID = groupSpaceMap[groupNo]
+				mySourceSpaceID = sidebarMySourceSpaceID(externalGroupMap, groupNo, defaultSpaceID)
 			}
 		}
 		items = append(items, &SidebarItem{
@@ -807,6 +890,8 @@ func buildRecentItems(
 			TargetID:        conv.ChannelID,
 			ChannelType:     conv.ChannelType,
 			ChannelID:       conv.ChannelID,
+			SpaceID:         spaceID,
+			MySourceSpaceID: mySourceSpaceID,
 			Timestamp:       conv.Timestamp,
 			Unread:          conv.Unread,
 			IsPinned:        pinned,
@@ -844,6 +929,9 @@ func mergeThreadEntries(
 	lastMsgAtMap map[string]*time.Time,
 	categorySetting map[string]*GroupCategorySetting,
 	unfollowedGroups map[string]struct{},
+	groupSpaceMap map[string]string,
+	externalGroupMap map[string]string,
+	defaultSpaceID string,
 ) []*SidebarItem {
 	if len(threadExtRows) == 0 {
 		return existing
@@ -890,6 +978,11 @@ func mergeThreadEntries(
 			TargetID:          ext.TargetID,
 			ChannelType:       common.ChannelTypeCommunityTopic.Uint8(),
 			ChannelID:         ext.TargetID,
+			// thread 继承父群 SpaceID（GH octo-server#153）。
+			SpaceID:           groupSpaceMap[groupNo],
+			// thread 同样继承父群的 MySourceSpaceID（GH octo-server#153 Round-2 P1）。
+			// Round-3 (GH#154 Round-2 Finding 2)：父群 source_space_id="" 兜底到 defaultSpaceID。
+			MySourceSpaceID:   sidebarMySourceSpaceID(externalGroupMap, groupNo, defaultSpaceID),
 			Timestamp:         ts,
 			IsFollowed:        true,
 			FollowSort:        ext.FollowSort,
@@ -900,6 +993,27 @@ func mergeThreadEntries(
 		})
 	}
 	return result
+}
+
+// sidebarMySourceSpaceID 解析 sidebar item 的 my_source_space_id：
+//   - externalGroupMap 没记录该 groupNo（用户不是外部成员）：返回空串，omitempty
+//     让客户端拿不到字段，与历史一致。
+//   - 记录了非空 source_space_id：直接返回。
+//   - 记录了 source_space_id=""（旧外部成员行）：兜底到 defaultSpaceID
+//     （GH octo-server#154 Round-2 Finding 2，与 decideConvKeepInSpace 同口径）。
+//     defaultSpaceID 也空时退化为空串——保持向后兼容。
+func sidebarMySourceSpaceID(externalGroupMap map[string]string, groupNo, defaultSpaceID string) string {
+	if externalGroupMap == nil {
+		return ""
+	}
+	src, ok := externalGroupMap[groupNo]
+	if !ok {
+		return ""
+	}
+	if src != "" {
+		return src
+	}
+	return defaultSpaceID
 }
 
 // ---------------------------------------------------------------------------
