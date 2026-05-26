@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/textproto"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-server/modules/flow/trigger"
@@ -254,10 +255,7 @@ func (s *Service) HandleWebhook(ctx context.Context, path string, body []byte, h
 	secret, _ := cfg["secret"].(string)
 	sigHeader, _ := cfg["signature_header"].(string)
 	algo, _ := cfg["signature_algo"].(string)
-	headerVal := ""
-	if sigHeader != "" {
-		headerVal = headers[sigHeader]
-	}
+	headerVal := lookupHeader(headers, sigHeader)
 	if err := trigger.VerifyWebhookSignature(body, secret, headerVal, algo); err != nil {
 		return nil, err
 	}
@@ -362,21 +360,30 @@ func (s *Service) deactivateTriggers(f *Flow) error {
 	return s.db.DeleteTriggersByFlow(f.ID)
 }
 
+// lookupHeader 在 headers map 中按大小写无关的方式查找 name 对应的值。
+//
+// api.go 的 handleWebhook 用 http.Header（即 c.Request.Header）填充 headers
+// map，key 已经被 Go 标准库规范化为 CanonicalMIMEHeaderKey 形式（如
+// X-Hub-Signature-256）。但用户在 trigger config 里写的 signature_header
+// 可能是 "x-hub-signature-256" 这样的小写形式，会导致直接 lookup miss。
+// 这里先按规范化形式查找，再回退到原始 key，避免漏匹配。
+func lookupHeader(headers map[string]string, name string) string {
+	if name == "" {
+		return ""
+	}
+	if v, ok := headers[textproto.CanonicalMIMEHeaderKey(name)]; ok && v != "" {
+		return v
+	}
+	return headers[name]
+}
+
 // fireCron 由 cron scheduler 回调
-func (s *Service) fireCron(triggerID string, scheduledAt time.Time) {
-	triggers, err := s.db.ListTriggersByType(TriggerTypeCron)
+func (s *Service) fireCron(triggerID string, scheduledAt time.Time) {	found, err := s.db.GetTriggerByID(triggerID)
 	if err != nil {
-		s.log.Warn("fireCron: list triggers", zap.Error(err))
+		s.log.Warn("fireCron: get trigger", zap.String("trigger_id", triggerID), zap.Error(err))
 		return
 	}
-	var found *Trigger
-	for _, t := range triggers {
-		if t.ID == triggerID {
-			found = t
-			break
-		}
-	}
-	if found == nil {
+	if found == nil || found.Status != "active" {
 		s.log.Warn("fireCron: trigger gone", zap.String("trigger_id", triggerID))
 		s.cron.Remove(triggerID)
 		return

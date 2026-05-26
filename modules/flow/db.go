@@ -23,6 +23,10 @@ var (
 	ErrNotFound = errors.New("flow: not found")
 )
 
+// maxListLimit 限制 List* 查询单次返回的最大行数，防止恶意/失误调用
+// 拉爆数据库或内存。Service / API 层传入的 limit 会被 clamp 到这个上限。
+const maxListLimit = 200
+
 // ---------------- Flow ----------------
 
 // InsertFlow 写入一个 flow
@@ -116,6 +120,9 @@ func (d *DB) ListFlows(spaceID, status string, limit, offset int) ([]*Flow, erro
 	}
 	if limit <= 0 {
 		limit = 50
+	}
+	if limit > maxListLimit {
+		limit = maxListLimit
 	}
 	q = q.OrderDir("updated_at", false).Limit(uint64(limit)).Offset(uint64(offset))
 	var out []*Flow
@@ -212,6 +219,17 @@ func (d *DB) GetTriggerByWebhookPath(path string) (*Trigger, error) {
 	return t, err
 }
 
+// GetTriggerByID 按主键查询触发器
+func (d *DB) GetTriggerByID(id string) (*Trigger, error) {
+	t := &Trigger{}
+	err := d.session.Select("*").From("flow_triggers").
+		Where("id = ?", id).LoadOne(t)
+	if err == dbr.ErrNotFound {
+		return nil, nil
+	}
+	return t, err
+}
+
 // ---------------- Executions ----------------
 
 // InsertExecution 写入一个执行实例
@@ -271,6 +289,9 @@ func (d *DB) GetExecution(id string) (*Execution, error) {
 func (d *DB) ListExecutionsByFlow(flowID string, limit, offset int) ([]*Execution, error) {
 	if limit <= 0 {
 		limit = 50
+	}
+	if limit > maxListLimit {
+		limit = maxListLimit
 	}
 	var out []*Execution
 	_, err := d.session.Select("*").From("flow_executions").

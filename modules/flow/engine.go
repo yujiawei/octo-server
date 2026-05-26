@@ -196,6 +196,12 @@ func (e *Engine) run(ctx context.Context, exec *Execution, def *Definition, ec *
 		ndef := dag.Nodes[nodeID]
 		result, err := e.runNode(ctx, exec, ndef, ec)
 		if err != nil {
+			// 若 context 已被取消（CancelExecution 已写入 cancelled 状态），
+			// 不要走 finishFailed 把状态覆写为 failed —— 短路返回，
+			// 保留 CancelExecution 设置的 cancelled。
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			return e.finishFailed(exec, ec, fmt.Sprintf("node %s: %v", nodeID, err))
 		}
 		// 激活下游：edges 中 from == nodeID 的，根据 branch / condition 决定
