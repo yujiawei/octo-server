@@ -85,10 +85,15 @@ func Resolve(path string, ctx *ExecutionContext) (any, bool) {
 	var cur any
 	switch parts[0] {
 	case "trigger":
+		headers := map[string]any{}
+		for k, v := range ctx.Trigger.Headers {
+			headers[k] = v
+		}
 		cur = map[string]any{
 			"type":    ctx.Trigger.Type,
 			"payload": ctx.Trigger.Payload,
 			"input":   ctx.Trigger.Input,
+			"headers": headers,
 		}
 	case "nodes":
 		// {{nodes.id.output.field}}

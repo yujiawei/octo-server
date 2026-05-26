@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
@@ -61,6 +62,8 @@ func (f *FlowAPI) Stop() error {
 func (f *FlowAPI) Route(r *wkhttp.WKHttp) {
 	// Webhook 入口不要求登录态（外部 push）
 	r.POST("/v1/flow/webhook/:path", f.handleWebhook)
+	// 按 flow id 寻址的 webhook（前端展示 / 外部直接 POST）
+	r.POST("/v1/flows/:id/webhook", f.handleWebhookByFlow)
 
 	auth := r.Group("/v1", f.ctx.AuthMiddleware(r))
 	{
@@ -73,6 +76,8 @@ func (f *FlowAPI) Route(r *wkhttp.WKHttp) {
 		auth.POST("/flows/:id/deactivate", f.deactivateFlow)
 		auth.POST("/flows/:id/execute", f.executeFlow)
 		auth.GET("/flows/:id/executions", f.listExecutions)
+		// 查询 flow 的 webhook URL（前端展示用）
+		auth.GET("/flows/:id/webhook", f.getWebhookInfo)
 		auth.GET("/executions/:id", f.getExecution)
 		auth.POST("/executions/:id/cancel", f.cancelExecution)
 	}
@@ -260,6 +265,54 @@ func (f *FlowAPI) handleWebhook(c *wkhttp.Context) {
 		return
 	}
 	c.Response(map[string]any{"execution_id": exec.ID, "status": exec.Status})
+}
+
+// handleWebhookByFlow 处理 POST /v1/flows/:id/webhook
+func (f *FlowAPI) handleWebhookByFlow(c *wkhttp.Context) {
+	id := c.Param("id")
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.ResponseError(fmt.Errorf("read body: %w", err))
+		return
+	}
+	headers := map[string]string{}
+	for k, v := range c.Request.Header {
+		if len(v) > 0 {
+			headers[k] = v[0]
+		}
+	}
+	exec, err := f.service.HandleWebhookByFlowID(c.Request.Context(), id, body, headers)
+	if err != nil {
+		c.ResponseError(err)
+		return
+	}
+	c.Response(map[string]any{"execution_id": exec.ID, "status": exec.Status})
+}
+
+// getWebhookInfo 处理 GET /v1/flows/:id/webhook，返回 webhook URL（前端展示用）
+func (f *FlowAPI) getWebhookInfo(c *wkhttp.Context) {
+	id := c.Param("id")
+	flow, err := f.service.GetFlow(id)
+	if err != nil {
+		c.ResponseError(err)
+		return
+	}
+	if flow == nil {
+		c.ResponseError(ErrNotFound)
+		return
+	}
+	hasWebhook, err := f.service.HasWebhookTrigger(id)
+	if err != nil {
+		c.ResponseError(err)
+		return
+	}
+	base := f.ctx.GetConfig().External.BaseURL
+	url := fmt.Sprintf("%s/v1/flows/%s/webhook", strings.TrimRight(base, "/"), id)
+	c.Response(map[string]any{
+		"flow_id":             id,
+		"url":                 url,
+		"has_webhook_trigger": hasWebhook,
+	})
 }
 
 // ---------- helpers ----------

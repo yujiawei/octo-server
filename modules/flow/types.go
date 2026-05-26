@@ -195,9 +195,10 @@ type ExecutionContext struct {
 
 // TriggerData 触发器输入数据
 type TriggerData struct {
-	Type    string         `json:"type"`
-	Payload map[string]any `json:"payload,omitempty"`
-	Input   map[string]any `json:"input,omitempty"`
+	Type    string            `json:"type"`
+	Payload map[string]any    `json:"payload,omitempty"`
+	Input   map[string]any    `json:"input,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
 }
 
 // NodeContext 节点执行结果
