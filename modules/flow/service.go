@@ -275,7 +275,86 @@ func (s *Service) HandleWebhook(ctx context.Context, path string, body []byte, h
 	return s.engine.StartExecution(ctx, f, t.ID, TriggerData{
 		Type:    TriggerTypeWebhook,
 		Payload: payload,
+		Headers: headers,
 	})
+}
+
+// HandleWebhookByFlowID 处理按 flow id 寻址的 webhook：
+//   - flow 必须存在且处于 active 状态
+//   - flow.definition 中必须包含 webhook 类型的 trigger
+//   - request body 解析为 JSON 后写入 TriggerData.Payload，原始 headers 写入 TriggerData.Headers
+//
+// Phase 2 暂不做签名校验（Phase 3 再加）。
+func (s *Service) HandleWebhookByFlowID(ctx context.Context, flowID string, body []byte, headers map[string]string) (*Execution, error) {
+	f, err := s.db.GetFlow(flowID)
+	if err != nil {
+		return nil, err
+	}
+	if f == nil {
+		return nil, ErrNotFound
+	}
+	if f.Status != FlowStatusActive {
+		return nil, fmt.Errorf("flow %s is not active", flowID)
+	}
+	def, err := f.DecodeDefinition()
+	if err != nil {
+		return nil, fmt.Errorf("decode definition: %w", err)
+	}
+	var webhookTrigger *TriggerDef
+	for i := range def.Triggers {
+		if def.Triggers[i].Type == TriggerTypeWebhook {
+			webhookTrigger = &def.Triggers[i]
+			break
+		}
+	}
+	if webhookTrigger == nil {
+		return nil, fmt.Errorf("flow %s has no webhook trigger", flowID)
+	}
+	// 找到该 flow 在 DB 中已注册的 webhook trigger（通过 activate 写入），
+	// 用它的 ID 作为 execution.trigger_id；找不到也不致命，留空即可。
+	triggerID := ""
+	rows, err := s.db.ListTriggersByFlow(flowID)
+	if err == nil {
+		for _, r := range rows {
+			if r.Type == TriggerTypeWebhook {
+				triggerID = r.ID
+				break
+			}
+		}
+	}
+	var payload map[string]any
+	if len(body) > 0 {
+		// 非 JSON body 也能触发：放在 _raw 中
+		if err := json.Unmarshal(body, &payload); err != nil || payload == nil {
+			payload = map[string]any{"_raw": string(body)}
+		}
+	}
+	return s.engine.StartExecution(ctx, f, triggerID, TriggerData{
+		Type:    TriggerTypeWebhook,
+		Payload: payload,
+		Headers: headers,
+	})
+}
+
+// HasWebhookTrigger 报告 flow.definition 中是否包含 webhook 类型的 trigger
+func (s *Service) HasWebhookTrigger(flowID string) (bool, error) {
+	f, err := s.db.GetFlow(flowID)
+	if err != nil {
+		return false, err
+	}
+	if f == nil {
+		return false, ErrNotFound
+	}
+	def, err := f.DecodeDefinition()
+	if err != nil {
+		return false, fmt.Errorf("decode definition: %w", err)
+	}
+	for _, td := range def.Triggers {
+		if td.Type == TriggerTypeWebhook {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // ListExecutions 列出
