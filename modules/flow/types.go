@@ -2,6 +2,7 @@ package flow
 
 import (
 	"encoding/json"
+	"sync"
 	"time"
 )
 
@@ -191,7 +192,17 @@ type ExecutionContext struct {
 	Trigger     TriggerData            `json:"trigger"`
 	Nodes       map[string]NodeContext `json:"nodes"`
 	Vars        map[string]any         `json:"vars"`
+
+	// mu 保护 Nodes / Vars 的并发读写。引擎在同层并行执行节点时使用。
+	// 字段未导出，json 序列化忽略。
+	mu sync.Mutex
 }
+
+// Lock 给同包代码用于同步 Nodes/Vars 的访问。
+func (c *ExecutionContext) Lock()   { c.mu.Lock() }
+
+// Unlock 释放 Lock 持有的互斥锁。
+func (c *ExecutionContext) Unlock() { c.mu.Unlock() }
 
 // TriggerData 触发器输入数据
 type TriggerData struct {

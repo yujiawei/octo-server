@@ -85,6 +85,66 @@ func (d *DAG) EntryNodes() []string {
 	return entries
 }
 
+// Levels 把 DAG 按层划分。同一层中的节点没有相互依赖，可以并行执行。
+//
+// 返回值是按执行顺序排列的若干层，每层是该层节点 ID 的有序列表
+// （字典序，保证稳定）。__start__ / __end__ 虚拟节点不参与分层。
+//
+// 示例：A→B、A→C、B→D、C→D 会得到 [[A], [B, C], [D]]。
+//
+// 一个节点的层级 = max(前驱层级) + 1（前驱不含 __start__）。空 DAG 返回 nil。
+func (d *DAG) Levels() [][]string {
+	indeg := make(map[string]int, len(d.Nodes))
+	for id := range d.Nodes {
+		indeg[id] = 0
+	}
+	for _, e := range d.Edges {
+		if e.To == "__end__" || e.To == "" {
+			continue
+		}
+		if e.From == "__start__" || e.From == "" {
+			continue
+		}
+		if _, ok := d.Nodes[e.To]; ok {
+			indeg[e.To]++
+		}
+	}
+
+	var current []string
+	for id, deg := range indeg {
+		if deg == 0 {
+			current = append(current, id)
+		}
+	}
+	sort.Strings(current)
+
+	var levels [][]string
+	for len(current) > 0 {
+		level := make([]string, len(current))
+		copy(level, current)
+		levels = append(levels, level)
+
+		var next []string
+		for _, n := range current {
+			for _, e := range d.Outgoing[n] {
+				if e.To == "__end__" || e.To == "" {
+					continue
+				}
+				if _, ok := d.Nodes[e.To]; !ok {
+					continue
+				}
+				indeg[e.To]--
+				if indeg[e.To] == 0 {
+					next = append(next, e.To)
+				}
+			}
+		}
+		sort.Strings(next)
+		current = next
+	}
+	return levels
+}
+
 func topoSort(d *DAG) ([]string, error) {
 	// Kahn's algorithm; 排除 __start__/__end__ 虚拟节点
 	indeg := map[string]int{}
