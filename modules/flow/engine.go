@@ -11,6 +11,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-server/modules/flow/nodes"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 )
 
 // Engine 是 Flow 执行引擎。
@@ -161,9 +162,11 @@ func (e *Engine) CancelExecution(executionID string) error {
 	return e.db.UpdateExecutionStatus(executionID, ExecutionStatusCancelled, "cancelled", &now)
 }
 
-// run 是核心循环。简化模型：按拓扑序逐节点执行；condition 节点根据
-// matched branch 过滤后续出边；其他节点的出边只在 edge.condition 为
-// 空或求值为 true 时被激活。
+// run 是核心循环。模型：把 DAG 按层划分，逐层推进；同一层内的所有
+// 已激活节点用 errgroup 并行执行；该层全部完成后再统一计算下游激活，
+// condition 节点的 branch 选择也在此时一起处理。
+//
+// 串行 flow（每层只有一个节点）行为与之前的拓扑串行执行等价。
 func (e *Engine) run(ctx context.Context, exec *Execution, def *Definition, ec *ExecutionContext) error {
 	dag, err := BuildDAG(def)
 	if err != nil {
@@ -182,31 +185,64 @@ func (e *Engine) run(ctx context.Context, exec *Execution, def *Definition, ec *
 		activated[id] = true
 	}
 
-	for _, nodeID := range dag.TopoSort {
+	for _, level := range dag.Levels() {
 		if ctx.Err() != nil {
-			// 被 cancel
 			now := time.Now()
 			_ = e.db.UpdateExecutionStatus(exec.ID, ExecutionStatusCancelled, "cancelled", &now)
 			return ctx.Err()
 		}
-		if !activated[nodeID] {
-			// 上游未激活，跳过
-			continue
+
+		// 收集该层每个节点的执行结果，用于 level 完成后统一算下游激活。
+		// 索引与 level 切片对齐；未激活的位置保持 ran=false。
+		type nodeOutcome struct {
+			ran    bool
+			result *nodes.Result
 		}
-		ndef := dag.Nodes[nodeID]
-		result, err := e.runNode(ctx, exec, ndef, ec)
-		if err != nil {
-			return e.finishFailed(exec, ec, fmt.Sprintf("node %s: %v", nodeID, err))
-		}
-		// 激活下游：edges 中 from == nodeID 的，根据 branch / condition 决定
-		for _, edge := range dag.Outgoing[nodeID] {
-			if edge.To == "__end__" || edge.To == "" {
+		outcomes := make([]nodeOutcome, len(level))
+
+		g, gctx := errgroup.WithContext(ctx)
+		for i, nodeID := range level {
+			i, nodeID := i, nodeID
+			if !activated[nodeID] {
 				continue
 			}
-			if !edgeMatches(edge, result, ec) {
+			ndef := dag.Nodes[nodeID]
+			g.Go(func() error {
+				result, err := e.runNode(gctx, exec, ndef, ec)
+				if err != nil {
+					return fmt.Errorf("node %s: %w", nodeID, err)
+				}
+				outcomes[i] = nodeOutcome{ran: true, result: result}
+				return nil
+			})
+		}
+		if err := g.Wait(); err != nil {
+			// errgroup 在第一个错误后取消 gctx，已派发的兄弟节点会观察到
+			// ctx cancel 并尽快返回；这里把整体标记 failed。
+			if cerr := ctx.Err(); cerr != nil {
+				now := time.Now()
+				_ = e.db.UpdateExecutionStatus(exec.ID, ExecutionStatusCancelled, "cancelled", &now)
+				return cerr
+			}
+			return e.finishFailed(exec, ec, err.Error())
+		}
+
+		// 该层全部跑完后再统一计算下游激活：condition 节点的下游
+		// branch 选择也在此处与普通节点一起处理。
+		for i, nodeID := range level {
+			oc := outcomes[i]
+			if !oc.ran {
 				continue
 			}
-			activated[edge.To] = true
+			for _, edge := range dag.Outgoing[nodeID] {
+				if edge.To == "__end__" || edge.To == "" {
+					continue
+				}
+				if !edgeMatches(edge, oc.result, ec) {
+					continue
+				}
+				activated[edge.To] = true
+			}
 		}
 	}
 
@@ -219,11 +255,14 @@ func (e *Engine) runNode(ctx context.Context, exec *Execution, ndef NodeDef, ec 
 		return nil, fmt.Errorf("unknown node type: %s", ndef.Type)
 	}
 
-	// 渲染 config 中的 {{...}}
+	// 渲染 config 中的 {{...}}。同层并行时 ec.Nodes 可能被其他 goroutine
+	// 写入，因此渲染过程必须持锁。
+	ec.Lock()
 	rendered := map[string]any{}
 	for k, v := range ndef.Config {
 		rendered[k] = RenderAny(v, ec)
 	}
+	ec.Unlock()
 
 	// 写入 node_execution（running）
 	start := time.Now()
@@ -240,15 +279,19 @@ func (e *Engine) runNode(ctx context.Context, exec *Execution, ndef NodeDef, ec 
 	if err := e.db.InsertNodeExecution(nrow); err != nil {
 		e.log.Warn("insert node execution", zap.Error(err))
 	}
+	ec.Lock()
 	ec.Nodes[ndef.ID] = NodeContext{
 		Status:    NodeStatusRunning,
 		Input:     rendered,
 		StartedAt: &start,
 	}
+	ec.Unlock()
 
 	result, runErr := runner.Run(ctx, rendered)
 	end := time.Now()
 	nrow.FinishedAt = &end
+
+	ec.Lock()
 	nc := ec.Nodes[ndef.ID]
 	nc.FinishedAt = &end
 	if runErr != nil {
@@ -257,6 +300,7 @@ func (e *Engine) runNode(ctx context.Context, exec *Execution, ndef NodeDef, ec 
 		nc.Status = NodeStatusFailed
 		nc.Error = runErr.Error()
 		ec.Nodes[ndef.ID] = nc
+		ec.Unlock()
 		_ = e.db.UpdateNodeExecution(nrow)
 		return nil, runErr
 	}
@@ -268,11 +312,12 @@ func (e *Engine) runNode(ctx context.Context, exec *Execution, ndef NodeDef, ec 
 	}
 	nc.Status = NodeStatusSuccess
 	ec.Nodes[ndef.ID] = nc
-	_ = e.db.UpdateNodeExecution(nrow)
-
-	// 实时回写 context 到 execution
+	// 实时回写 context 到 execution。同层并行下，所有写入 exec 的位置都
+	// 必须持 ec.mu 才能避免与同伴 goroutine 的写发生竞态。
 	exec.Context = mustJSON(ec)
+	_ = e.db.UpdateNodeExecution(nrow)
 	_ = e.db.UpdateExecution(exec)
+	ec.Unlock()
 
 	return result, nil
 }
