@@ -62,11 +62,13 @@ func (r *Registry) Get(t string) (Runner, bool) {
 // ErrUnknownType 表示未注册的节点类型
 var ErrUnknownType = errors.New("unknown node type")
 
-// DefaultRegistry 返回内置节点 registry（script / http / condition）
+// DefaultRegistry 返回内置节点 registry（script / http / condition / shell / github_status）
 func DefaultRegistry() *Registry {
 	r := NewRegistry()
 	r.Register(NewScriptNode())
 	r.Register(NewHTTPNode(nil))
 	r.Register(NewConditionNode())
+	r.Register(NewShellNode())
+	r.Register(NewGitHubStatusNode(nil))
 	return r
 }

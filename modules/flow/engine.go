@@ -299,9 +299,19 @@ func (e *Engine) runNode(ctx context.Context, exec *Execution, ndef NodeDef, ec 
 		nrow.Error = runErr.Error()
 		nc.Status = NodeStatusFailed
 		nc.Error = runErr.Error()
+		// 即使节点 Run 报错，如果 runner 仍然返回了 result.Output（例如
+		// shell 节点 exit_code != 0 但 stdout/stderr 仍要保留），把它写入
+		// node_execution / context，方便排错和下游 / UI 展示。
+		if result != nil && result.Output != nil {
+			ob, _ := json.Marshal(result.Output)
+			nrow.Output = string(ob)
+			nc.Output = result.Output
+		}
 		ec.Nodes[ndef.ID] = nc
+		exec.Context = mustJSON(ec)
 		ec.Unlock()
 		_ = e.db.UpdateNodeExecution(nrow)
+		_ = e.db.UpdateExecution(exec)
 		return nil, runErr
 	}
 	nrow.Status = NodeStatusSuccess

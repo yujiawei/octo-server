@@ -35,9 +35,11 @@ const (
 	TriggerTypeManual  = "manual"
 
 	// Node types
-	NodeTypeScript    = "script"
-	NodeTypeHTTP      = "http"
-	NodeTypeCondition = "condition"
+	NodeTypeScript       = "script"
+	NodeTypeHTTP         = "http"
+	NodeTypeCondition    = "condition"
+	NodeTypeShell        = "shell"
+	NodeTypeGitHubStatus = "github_status"
 
 	// Concurrency strategy
 	ConcurrencyCancelPrevious = "cancel_previous"
