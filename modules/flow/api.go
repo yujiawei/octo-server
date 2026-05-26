@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strconv"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -161,6 +162,10 @@ func (f *FlowAPI) updateFlow(c *wkhttp.Context) {
 func (f *FlowAPI) deleteFlow(c *wkhttp.Context) {
 	id := c.Param("id")
 	if err := f.service.DeleteFlow(id); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			c.ResponseErrorWithStatus(err, http.StatusNotFound)
+			return
+		}
 		c.ResponseError(err)
 		return
 	}

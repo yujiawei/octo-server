@@ -181,14 +181,14 @@ func (s *Service) ListFlows(spaceID, status string, limit, offset int) ([]*Flow,
 	return s.db.ListFlows(spaceID, status, limit, offset)
 }
 
-// DeleteFlow 删除。会先反注册触发器
+// DeleteFlow 删除。会先反注册触发器。未找到时返回 ErrNotFound（由 handler 转 HTTP 404）。
 func (s *Service) DeleteFlow(id string) error {
 	f, err := s.db.GetFlow(id)
 	if err != nil {
 		return err
 	}
 	if f == nil {
-		return nil
+		return ErrNotFound
 	}
 	_ = s.deactivateTriggers(f)
 	return s.db.DeleteFlow(id)
