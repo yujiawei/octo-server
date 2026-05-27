@@ -15,6 +15,10 @@ import (
 // It validates the code, separates Params from Details, preserves the legacy
 // HTTP/body status=400 compatibility path, and delegates translation/envelope
 // rendering to the injected wkhttp.ErrorRenderer.
+//
+// ResponseErrorL writes the response but does not abort the gin chain. Handlers
+// must return immediately after calling it, or call c.Abort() when used inside
+// middleware.
 func ResponseErrorL(c *wkhttp.Context, code codes.Code, params i18n.Params, details i18n.Details) {
 	if c == nil {
 		return

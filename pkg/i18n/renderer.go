@@ -92,6 +92,8 @@ func filteredDetails(spec wkhttp.ErrorSpec) Details {
 	if !ok {
 		return Details{}
 	}
+	// Keep this safety net even when ResponseErrorL pre-filters details:
+	// octo-lib middleware and future direct RenderError callers bypass httperr.
 	return Details(spec.Details).FilterBy(code)
 }
 

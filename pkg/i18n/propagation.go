@@ -35,7 +35,6 @@ func (t *PropagationRoundTripper) RoundTrip(req *http.Request) (*http.Response, 
 		return nil, errors.New("i18n: nil outbound HTTP request")
 	}
 	cloned := req.Clone(req.Context())
-	cloned.Header = req.Header.Clone()
 	InjectHTTPHeaders(cloned)
 	return t.base().RoundTrip(cloned)
 }
