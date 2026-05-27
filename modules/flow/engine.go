@@ -225,9 +225,42 @@ func (e *Engine) runNode(ctx context.Context, exec *Execution, ndef NodeDef, ec 
 		rendered[k] = RenderAny(v, ec)
 	}
 
+	// userInput 是用户视角的、干净的节点输入（即模板渲染后的 config）。
+	// 必须在引擎注入任何内部键（例如 __exec_context__）之前确定下来，
+	// 它会被写进 node_execution.input 和 ExecutionContext.Nodes[id].Input，
+	// 对外可见。
+	userInput := make(map[string]any, len(rendered))
+	for k, v := range rendered {
+		userInput[k] = v
+	}
+
+	// 对 script 节点注入一份可序列化的执行上下文快照，
+	// script.Run 会读出并把它暴露成 JS 全局变量 `context`。
+	// 走一次 JSON round-trip，把 TriggerData / NodeContext 等结构体
+	// 转成 plain map[string]any，使 JS 端可以用 json tag 名（小写）
+	// 访问字段，例如 `context.trigger.payload.action`。
+	//
+	// 注意：注入到 rendered（即将传给 runner 的 cfg），不要注入到
+	// userInput——否则 __exec_context__ 会污染 node_execution.input。
+	if ndef.Type == NodeTypeScript {
+		snap := map[string]any{
+			"execution_id": ec.ExecutionID,
+			"flow_id":      ec.FlowID,
+			"trigger":      ec.Trigger,
+			"nodes":        ec.Nodes,
+			"vars":         ec.Vars,
+		}
+		if b, err := json.Marshal(snap); err == nil {
+			var plain map[string]any
+			if json.Unmarshal(b, &plain) == nil {
+				rendered[nodes.ExecContextKey] = plain
+			}
+		}
+	}
+
 	// 写入 node_execution（running）
 	start := time.Now()
-	inputJSON, _ := json.Marshal(rendered)
+	inputJSON, _ := json.Marshal(userInput)
 	nrow := &NodeExecution{
 		ID:          uuid.NewString(),
 		ExecutionID: exec.ID,
@@ -242,7 +275,7 @@ func (e *Engine) runNode(ctx context.Context, exec *Execution, ndef NodeDef, ec 
 	}
 	ec.Nodes[ndef.ID] = NodeContext{
 		Status:    NodeStatusRunning,
-		Input:     rendered,
+		Input:     userInput,
 		StartedAt: &start,
 	}
 
