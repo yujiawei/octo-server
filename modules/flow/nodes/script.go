@@ -15,14 +15,18 @@ import (
 // 约定：
 //   - script 在一个临时 runtime 内执行
 //   - 全局变量 `input` 暴露 config.input（已渲染）
+//   - 全局变量 `context` 暴露当次执行的快照（execution_id / flow_id /
+//     trigger / nodes / vars），由引擎注入；脚本可通过
+//     `context.trigger.payload.*` 访问触发数据
 //   - 全局函数 `console.log` 把消息塞入 logs 数组（不直接 stdout）
 //   - 脚本最终值（最后一行表达式 / 显式 return 通过 IIFE）变成 output
 //
 // 节点 config:
-//   runtime: "javascript"            # 当前只支持 javascript
-//   code:    string                  # JS 代码
-//   input:   map[string]any          # 注入到 input 全局变量
-//   timeout: string                  # 默认 "5s"
+//
+//	runtime: "javascript"            # 当前只支持 javascript
+//	code:    string                  # JS 代码
+//	input:   map[string]any          # 注入到 input 全局变量
+//	timeout: string                  # 默认 "5s"
 type ScriptNode struct{}
 
 // NewScriptNode 构造一个 script runner
@@ -44,6 +48,15 @@ func (s *ScriptNode) Run(ctx context.Context, cfg map[string]any) (*Result, erro
 	if code == "" {
 		return nil, errors.New("script node: code is required")
 	}
+
+	// 引擎为 script 节点注入了一份 ExecutionContext 快照（plain
+	// map[string]any），在这里把它取出，绑成 JS 全局 `context`，并从
+	// cfg 中删掉，避免它泄漏进 input.*。
+	execCtx, hasExecCtx := cfg[ExecContextKey]
+	if hasExecCtx {
+		delete(cfg, ExecContextKey)
+	}
+
 	input, _ := cfg["input"].(map[string]any)
 	if input == nil {
 		input = map[string]any{}
@@ -59,6 +72,11 @@ func (s *ScriptNode) Run(ctx context.Context, cfg map[string]any) (*Result, erro
 	vm := goja.New()
 	if err := vm.Set("input", input); err != nil {
 		return nil, fmt.Errorf("script node: set input: %w", err)
+	}
+	if hasExecCtx {
+		if err := vm.Set("context", execCtx); err != nil {
+			return nil, fmt.Errorf("script node: set context: %w", err)
+		}
 	}
 	var logs []string
 	console := vm.NewObject()

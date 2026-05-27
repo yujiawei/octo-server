@@ -62,6 +62,14 @@ func (r *Registry) Get(t string) (Runner, bool) {
 // ErrUnknownType 表示未注册的节点类型
 var ErrUnknownType = errors.New("unknown node type")
 
+// ExecContextKey 是引擎注入到 rendered config 中的执行上下文快照键名。
+// script 节点会从 rendered config 中提取这个键，把它绑成 JS 全局
+// `context`，并从 rendered config 中删除该键，避免污染 input。
+//
+// 该键以双下划线包围，且不会出现在任何用户级 schema 中，因此对外的
+// `input.*` 视图保持不变。
+const ExecContextKey = "__exec_context__"
+
 // DefaultRegistry 返回内置节点 registry（script / http / condition / shell / github_status）
 func DefaultRegistry() *Registry {
 	r := NewRegistry()
