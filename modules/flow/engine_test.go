@@ -123,6 +123,87 @@ func TestEngine_ConditionBranches(t *testing.T) {
 	}
 }
 
+// TestEngine_ScriptNodeSeesExecutionContext 是 GH-23 的回归测试：
+// 引擎必须把 ExecutionContext 快照注入 script 节点的 goja VM，
+// 暴露成全局 `context`。这覆盖 Verdict Callback / Closed Cleanup
+// 等 flow 真实使用 `context.trigger.payload.*` 的场景。
+func TestEngine_ScriptNodeSeesExecutionContext(t *testing.T) {
+	db, mock := newMockDB(t)
+	mock.MatchExpectationsInOrder(false)
+	for i := 0; i < 30; i++ {
+		mock.ExpectExec(".*").WillReturnResult(sqlmock.NewResult(0, 1))
+	}
+
+	eng := NewEngine(db, nodes.DefaultRegistry(), nil)
+	def := &Definition{
+		Variables: map[string]any{"region": "eu-west"},
+		Nodes: []NodeDef{
+			{ID: "first", Type: "script", Config: map[string]any{
+				"code": `return { greeting: "hi " + context.trigger.payload.who };`,
+			}},
+			{ID: "second", Type: "script", Config: map[string]any{
+				"code": `return {
+					action: context.trigger.payload.action,
+					prev: context.nodes.first.output.greeting,
+					region: context.vars.region,
+					flow_id: context.flow_id,
+				};`,
+			}},
+		},
+		Edges: []EdgeDef{{From: "first", To: "second"}},
+	}
+	defJSON, _ := json.Marshal(def)
+	flow := &Flow{ID: "fctx", Definition: string(defJSON), Status: FlowStatusActive}
+
+	exec, err := eng.StartExecution(context.Background(), flow, "", TriggerData{
+		Type: "github",
+		Payload: map[string]any{
+			"action": "opened",
+			"who":    "world",
+		},
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	var final *ExecutionContext
+	for time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+		ec, _ := exec.DecodeContext()
+		if ec != nil && ec.Nodes["second"].Status == NodeStatusSuccess {
+			final = ec
+			break
+		}
+		if ec != nil && ec.Nodes["second"].Status == NodeStatusFailed {
+			t.Fatalf("second failed: %s", ec.Nodes["second"].Error)
+		}
+	}
+	if final == nil {
+		t.Fatalf("script-with-context flow did not finish: status=%s err=%s", exec.Status, exec.Error)
+	}
+	out := final.Nodes["second"].Output
+	if out["action"] != "opened" {
+		t.Fatalf("context.trigger.payload.action: got %v, want opened (out=%#v)", out["action"], out)
+	}
+	if out["prev"] != "hi world" {
+		t.Fatalf("context.nodes.first.output.greeting: got %v", out["prev"])
+	}
+	if out["region"] != "eu-west" {
+		t.Fatalf("context.vars.region: got %v", out["region"])
+	}
+	if out["flow_id"] != "fctx" {
+		t.Fatalf("context.flow_id: got %v", out["flow_id"])
+	}
+
+	// 反面约束：__exec_context__ 不能泄漏进 node_execution.input
+	// （input 必须保持干净，对外可见）。
+	rawInput := final.Nodes["second"].Input
+	if _, leaked := rawInput[nodes.ExecContextKey]; leaked {
+		t.Fatalf("__exec_context__ leaked into node input: %#v", rawInput)
+	}
+}
+
 func TestEngine_HTTPNodeIntegrates(t *testing.T) {
 	db, mock := newMockDB(t)
 	mock.MatchExpectationsInOrder(false)
