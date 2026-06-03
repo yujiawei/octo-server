@@ -152,9 +152,16 @@ func (rb *Robot) setMentionPref(c *wkhttp.Context) {
 		c.ResponseError(errors.New("更新失败"))
 		return
 	}
-	// 写库成功后即时通知对应 bot 失效缓存（best-effort，失败不阻塞主流程；
+	// 写库成功后即时通知对应 bot 失效缓存（best-effort，异步不阻塞主流程；
 	// adapter 仍有 TTL 兜底）。octo-server#242 / YUJ-2884。
-	rb.sendMentionPrefNotification(robotID, groupNo, loginUID, req.NoMention)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				rb.Error("sendMentionPrefNotification panic", zap.Any("recover", r))
+			}
+		}()
+		rb.sendMentionPrefNotification(robotID, groupNo, req.NoMention)
+	}()
 	c.ResponseOK()
 }
 
@@ -178,8 +185,15 @@ func (rb *Robot) deleteMentionPref(c *wkhttp.Context) {
 		return
 	}
 	// 删除回退账号级默认即 no_mention=0；同样推事件让 adapter 即时失效缓存
-	// （best-effort，失败不阻塞）。octo-server#242 / YUJ-2884。
-	rb.sendMentionPrefNotification(robotID, groupNo, loginUID, 0)
+	// （best-effort，异步不阻塞）。octo-server#242 / YUJ-2884。
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				rb.Error("sendMentionPrefNotification panic", zap.Any("recover", r))
+			}
+		}()
+		rb.sendMentionPrefNotification(robotID, groupNo, 0)
+	}()
 	c.ResponseOK()
 }
 
@@ -195,7 +209,11 @@ func (rb *Robot) deleteMentionPref(c *wkhttp.Context) {
 //   - event 载荷带 group_no + no_mention，adapter 据此精准失效缓存。
 //
 // best-effort：投递失败仅记日志，不影响写接口返回 200（adapter 有 TTL 兜底）。
-func (rb *Robot) sendMentionPrefNotification(robotID, groupNo, updatedBy string, noMention int) {
+//
+// FromUID 用 robotID 而非 owner —— bot 必是群成员，WuKongIM 不会因发送方非
+// 群成员而拒发；owner 可能已退群，用 owner 会让事件静默失败退化成 TTL
+// （对齐 bot_api/botfather 样板）。
+func (rb *Robot) sendMentionPrefNotification(robotID, groupNo string, noMention int) {
 	payload := buildMentionPrefPayload(robotID, groupNo, noMention)
 
 	err := rb.ctx.SendMessage(&config.MsgSendReq{
@@ -204,7 +222,7 @@ func (rb *Robot) sendMentionPrefNotification(robotID, groupNo, updatedBy string,
 		},
 		ChannelID:   groupNo,
 		ChannelType: common.ChannelTypeGroup.Uint8(),
-		FromUID:     updatedBy,
+		FromUID:     robotID,
 		Payload:     []byte(util.ToJson(payload)),
 	})
 	if err != nil {
