@@ -216,6 +216,7 @@ func (ba *BotAPI) Route(r *wkhttp.WKHttp) {
 		botAPI.GET("/groups", ba.getGroups)
 		botAPI.GET("/groups/:group_no", ba.getGroupInfo)
 		botAPI.GET("/groups/:group_no/members", ba.getGroupMembers)
+		botAPI.GET("/groups/:group_no/mention_pref", ba.getMentionPref) // 群级免@偏好读（octo-server#237）
 		botAPI.GET("/groups/:group_no/md", ba.getGroupMd)
 		botAPI.PUT("/groups/:group_no/md", ba.updateGroupMd)
 		botAPI.GET("/space/members", ba.botSpaceMembers)

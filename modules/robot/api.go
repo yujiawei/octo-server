@@ -267,6 +267,11 @@ func (rb *Robot) Route(r *wkhttp.WKHttp) {
 		auth.PUT("/robot/:robot_id/auto_approve", rb.setAutoApprove) // 设置是否自动通过好友申请
 		auth.GET("/robot/space_bots", rb.spaceBots)                  // Bot 广场 — Space 内所有 Bot
 		auth.GET("/robot/my_bots", rb.myBots)                        // 我的 Bot — 已添加好友的 Bot
+		// bot 群级免@偏好（octo-server#237）：owner 写/读/列群
+		auth.GET("/robot/:robot_id/groups", rb.listGroups)                                  // 列出 bot 所在群 + no_mention
+		auth.PUT("/robot/:robot_id/groups/:group_no/mention_pref", rb.setMentionPref)       // UPSERT 群级免@偏好
+		auth.DELETE("/robot/:robot_id/groups/:group_no/mention_pref", rb.deleteMentionPref) // 删除回退默认（幂等）
+		auth.GET("/robot/:robot_id/groups/:group_no/mention_pref", rb.getMentionPref)       // 读群级免@偏好
 	}
 
 	robotAuth := r.Group("/v1/robots/:robot_id/:app_key", rb.authRobot()) // :robot_id即user的username
