@@ -44,7 +44,9 @@
 ## 主密钥落点（加密实现说明）
 
 - 算法：**AES-256-GCM**，密文 = 版本前缀 `enc:v1:` + `nonce(12B) || ciphertext || tag(16B)`，
-  落 `varbinary`。复用 octo-server 现有对称加密做法，不自造轮子。
+  落 `varbinary(8240)`。复用 octo-server 现有对称加密做法，不自造轮子。明文上限
+  8192B，加密后约 8192 + 前缀 7 + nonce 12 + tag 16 = 8227B，列宽 8240 留余量，
+  确保最大尺寸 key 不被严格 MySQL 拒插、也不会在非严格模式下静默截断成脏行。
 - 主密钥：环境变量 **`OCTO_USER_API_KEY_SECRET`（32 字节）**，与 `modules/botfather`
   的 user-api-key 加密**同一把主密钥落点**。本模块用独立域分离串
   `octo-user-secret-alias-cipher-v1` 经 `HMAC-SHA256(masterKey, domain)` 派生子密钥，
@@ -168,21 +170,27 @@ Header：`Authorization: Bearer bf_<bot_token>`
 
 > `value` 是明文，仅此一处返回，直达调用方，不进任何日志/审计。
 
-**歧义** 响应 `422`（返候选列表消歧，**不返明文**）：
+**歧义** 响应 `422`（候选列表走统一 i18n 错误信封的 `error.details.candidates`，**不返明文**）：
 
 ```json
 {
   "status": 422,
-  "error": { "code": "err.server.usersecret.ambiguous" },
-  "candidates": [
-    { "secret_id": "...", "display_name": "我的密钥", "kind": "external", "masked": "****1111", "created_at": "...", "updated_at": "..." },
-    { "secret_id": "...", "display_name": "我的米要", "kind": "external", "masked": "****2222", "created_at": "...", "updated_at": "..." }
-  ]
+  "error": {
+    "code": "err.server.usersecret.ambiguous",
+    "message": "名称匹配到多个密钥，请进一步区分。",
+    "http_status": 422,
+    "details": {
+      "candidates": [
+        { "secret_id": "...", "display_name": "我的密钥", "kind": "external", "masked": "****1111", "created_at": "...", "updated_at": "..." },
+        { "secret_id": "...", "display_name": "我的米要", "kind": "external", "masked": "****2222", "created_at": "...", "updated_at": "..." }
+      ]
+    }
+  }
 }
 ```
 
-上层（channel 插件）据 `candidates` 让用户/agent 选定后，用具体 `secret_id` 重新
-`resolve` 拿明文。
+上层（channel 插件）据 `error.details.candidates` 让用户/agent 选定后，用具体
+`secret_id` 重新 `resolve` 拿明文。
 
 **未命中** 响应 `404` `err.server.usersecret.not_found`。
 **解引用失败** 响应 `500` `err.server.usersecret.resolve_failed`。

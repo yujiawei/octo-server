@@ -9,6 +9,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
 	"go.uber.org/zap"
 )
 
@@ -203,10 +204,14 @@ func (a *API) resolve(c *wkhttp.Context) {
 	caller, callerErr := a.authResolveCaller(c)
 	if callerErr != nil {
 		a.Error("usersecret resolve 鉴权查询失败", zap.Error(callerErr))
+		// 鉴权查询本身报错(DB 异常)也留痕:安全模块的鉴权链路任何失败都要审计。
+		a.writeResolveAudit(c, caller, "", resolveOutcome{result: resultDecryptFail})
 		respondErr(c, errcode.ErrUserSecretResolveFailed)
 		return
 	}
 	if caller == nil || caller.OwnerUID == "" {
+		// 鉴权失败(无/非法 bot token)必须留痕 —— 安全模块的越权探测线索。
+		a.writeResolveAudit(c, caller, "", resolveOutcome{result: resultUnauthorized})
 		respondErr(c, errcode.ErrUserSecretUnauthorized)
 		return
 	}
@@ -215,6 +220,8 @@ func (a *API) resolve(c *wkhttp.Context) {
 		Query string `json:"query"` // secret_id 或 display_name
 	}
 	if err := c.BindJSON(&req); err != nil || strings.TrimSpace(req.Query) == "" {
+		// 入参非法也留痕(已鉴权的 caller 发了坏请求)。
+		a.writeResolveAudit(c, caller, req.Query, resolveOutcome{result: resultNotFound})
 		respondErr(c, errcode.ErrUserSecretRequestInvalid)
 		return
 	}
@@ -230,10 +237,9 @@ func (a *API) resolve(c *wkhttp.Context) {
 			"value":     outcome.plaintext,
 		})
 	case errors.Is(err, errAmbiguous):
-		// 歧义:返候选列表(脱敏)让上层消歧,不返明文。
-		c.JSON(http.StatusUnprocessableEntity, map[string]interface{}{
-			"status":     http.StatusUnprocessableEntity,
-			"error":      map[string]string{"code": errcode.ErrUserSecretAmbiguous.ID},
+		// 歧义:走统一 i18n 错误信封,候选列表(脱敏)经 details.candidates 返回,
+		// 让上层消歧;不返明文。保留 error.http_status(422)与本地化 message。
+		respondErrWithDetails(c, errcode.ErrUserSecretAmbiguous, i18n.Details{
 			"candidates": outcome.candidates,
 		})
 	case errors.Is(err, errNotFound):
@@ -265,7 +271,8 @@ func extractBearer(c *wkhttp.Context) string {
 }
 
 // writeResolveAudit best-effort 写 resolve 审计。失败仅记日志,不阻塞返回。
-// 不记录明文/密文/query 全文(query 截断)。
+// 不记录明文/密文/query 全文(query 截断)。caller 为 nil(鉴权失败)时仍留痕,
+// owner/caller_id 留空,result 由调用方标明(如 unauthorized)。
 func (a *API) writeResolveAudit(c *wkhttp.Context, caller *botIdentity, query string, outcome resolveOutcome) {
 	q := query
 	if len(q) > maxAuditQuery {
@@ -276,16 +283,19 @@ func (a *API) writeResolveAudit(c *wkhttp.Context, caller *botIdentity, query st
 		result = resultNotFound
 	}
 	candidates := len(outcome.candidates)
-	if err := a.store.insertResolveAudit(&resolveAuditModel{
-		OwnerUID:   caller.OwnerUID,
+	audit := &resolveAuditModel{
 		CallerKind: "user_bot",
-		CallerID:   caller.RobotID,
 		Query:      q,
 		SecretID:   outcome.secretID,
 		Result:     result,
 		Candidates: candidates,
 		IP:         c.ClientIP(),
-	}); err != nil {
+	}
+	if caller != nil {
+		audit.OwnerUID = caller.OwnerUID
+		audit.CallerID = caller.RobotID
+	}
+	if err := a.store.insertResolveAudit(audit); err != nil {
 		a.Error("usersecret resolve 审计写入失败", zap.Error(err))
 	}
 }

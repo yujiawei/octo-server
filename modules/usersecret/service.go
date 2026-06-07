@@ -5,7 +5,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"go.uber.org/zap"
 )
 
 // 业务层错误,handler 据此映射错误码/HTTP 状态。
@@ -260,6 +262,12 @@ func (s *service) finishHit(m *aliasModel) (resolveOutcome, error) {
 	plaintext, err := s.enc.decrypt(m.CipherText)
 	if err != nil {
 		return resolveOutcome{secretID: m.SecretID, result: resultDecryptFail}, err
+	}
+	// best-effort 回写「最后使用时间」:失败仅记日志,不影响 resolve 返回明文。
+	// touchLastUsed 内部已避免污染 updated_at。
+	if terr := s.store.touchLastUsed(m.SecretID); terr != nil {
+		log.Warn("usersecret 回写 last_used_at 失败",
+			zap.String("secret_id", m.SecretID), zap.Error(terr))
 	}
 	return resolveOutcome{
 		plaintext: plaintext,

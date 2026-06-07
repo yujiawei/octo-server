@@ -22,7 +22,7 @@ create table `user_secret_alias`
     display_name      VARCHAR(128)   not null,                                       -- 用户原始别名(语音友好,可重命名)
     display_name_norm VARCHAR(128)   not null,                                       -- normalize 后的判重键
     kind              VARCHAR(16)    not null default 'external',                    -- 分类:llm / external
-    cipher_text       varbinary(4096) not null,                                      -- AES-256-GCM 密文(含 enc:v1: 前缀)
+    cipher_text       varbinary(8240) not null,                                      -- AES-256-GCM 密文(含 enc:v1: 前缀)。列宽覆盖明文上限 8192B + 开销(前缀7+nonce12+tag16=35B)≈8227B,留余量到 8240 防截断脏行
     masked            VARCHAR(8)     not null default '',                            -- 明文尾 4 位掩码(低敏,供 list 展示,免解密)
     created_at        timestamp      not null default CURRENT_TIMESTAMP,
     updated_at        timestamp      not null default CURRENT_TIMESTAMP on update CURRENT_TIMESTAMP,

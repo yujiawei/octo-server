@@ -162,7 +162,7 @@ func TestAPI_Resolve_ByBotToken(t *testing.T) {
 }
 
 func TestAPI_Resolve_RejectsBadToken(t *testing.T) {
-	route, _ := newAPITestServer(t)
+	route, ctx := newAPITestServer(t)
 	// 无 token
 	w := httptest.NewRecorder()
 	route.ServeHTTP(w, botReq(t, "/v1/bot/secrets/resolve", "", map[string]string{"query": "x"}))
@@ -172,6 +172,48 @@ func TestAPI_Resolve_RejectsBadToken(t *testing.T) {
 	w = httptest.NewRecorder()
 	route.ServeHTTP(w, botReq(t, "/v1/bot/secrets/resolve", "bf_unknown_xyz", map[string]string{"query": "x"}))
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
+
+	// 鉴权失败也必须留审计(安全模块的越权探测线索)。两次坏 token → 两条 unauthorized。
+	var n int
+	_, err := ctx.DB().Select("count(*)").From("user_secret_resolve_audit").
+		Where("result=?", resultUnauthorized).Load(&n)
+	require.NoError(t, err)
+	assert.Equal(t, 2, n, "鉴权失败的 resolve 必须留痕")
+}
+
+// TestAPI_Resolve_MaxSizeKey_RoundTripThroughDB 边界测试:最大尺寸明文经
+// AES-GCM 加密(+前缀/nonce/tag 开销)落 DB 后仍能完整 round-trip,验证
+// cipher_text 列宽足够,不会被严格 MySQL 拒插或非严格模式静默截断成脏行。
+func TestAPI_Resolve_MaxSizeKey_RoundTripThroughDB(t *testing.T) {
+	route, ctx := newAPITestServer(t)
+	owner := "u_max_" + util.GenerUUID()[:6]
+	token := seedSession(t, ctx, owner)
+
+	maxKey := strings.Repeat("k", maxPlaintext) // 8192 字节明文上限
+
+	w := httptest.NewRecorder()
+	route.ServeHTTP(w, userReq(t, http.MethodPost, "/v1/manager/secrets", token, map[string]string{
+		"display_name": "max size key", "kind": "external", "key": maxKey,
+	}))
+	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
+	var created secretView
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &created))
+
+	botToken := "bf_" + util.GenerUUID()[:16]
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO robot (robot_id, creator_uid, bot_token, status) VALUES (?, ?, ?, 1)",
+		"botMax_"+util.GenerUUID()[:6], owner, botToken,
+	).Exec()
+	require.NoError(t, err)
+
+	w = httptest.NewRecorder()
+	route.ServeHTTP(w, botReq(t, "/v1/bot/secrets/resolve", botToken, map[string]string{"query": created.SecretID}))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var resp struct {
+		Value string `json:"value"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, maxKey, resp.Value, "最大尺寸 key 经 DB round-trip 后必须完整无截断")
 }
 
 func TestAPI_Resolve_OwnerIsolation(t *testing.T) {
@@ -226,11 +268,26 @@ func TestAPI_Resolve_Ambiguous(t *testing.T) {
 	route.ServeHTTP(w, botReq(t, "/v1/bot/secrets/resolve", botToken, map[string]string{"query": "我的miyao"}))
 	require.Equal(t, http.StatusUnprocessableEntity, w.Code, w.Body.String())
 	assert.NotContains(t, w.Body.String(), "v-我的密钥", "歧义响应不得含明文")
+
+	// 歧义走统一 i18n 错误信封:候选列表在 error.details.candidates,
+	// 且带本地化 message 与 error.http_status(422)。
 	var resp struct {
-		Candidates []secretView `json:"candidates"`
+		Status int `json:"status"`
+		Error  struct {
+			Code       string `json:"code"`
+			Message    string `json:"message"`
+			HTTPStatus int    `json:"http_status"`
+			Details    struct {
+				Candidates []secretView `json:"candidates"`
+			} `json:"details"`
+		} `json:"error"`
 	}
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
-	assert.Len(t, resp.Candidates, 2)
+	assert.Equal(t, http.StatusUnprocessableEntity, resp.Status)
+	assert.Equal(t, "err.server.usersecret.ambiguous", resp.Error.Code)
+	assert.NotEmpty(t, resp.Error.Message, "歧义错误必须带本地化 message")
+	assert.Equal(t, http.StatusUnprocessableEntity, resp.Error.HTTPStatus)
+	assert.Len(t, resp.Error.Details.Candidates, 2)
 }
 
 func TestAPI_Resolve_WritesAudit(t *testing.T) {

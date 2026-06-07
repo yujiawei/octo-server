@@ -59,11 +59,13 @@ var (
 	// ---- ambiguous (422) ----------------------------------------------------
 
 	// ErrUserSecretAmbiguous resolve 匹配到多个候选,需上层消歧。响应体携带候选
-	// 列表(脱敏,不含明文),由 handler 以 details/data 形式返回。
+	// 列表(脱敏,不含明文),由 handler 以 details 形式走统一 i18n 错误信封返回
+	// (error.details.candidates),保留 error.http_status 与本地化 message。
 	ErrUserSecretAmbiguous = register(codes.Code{
 		ID:             "err.server.usersecret.ambiguous",
 		HTTPStatus:     http.StatusUnprocessableEntity,
 		DefaultMessage: "The name matches multiple secrets. Please disambiguate.",
+		SafeDetailKeys: []string{"candidates"},
 	})
 
 	// ---- internal (500) -----------------------------------------------------

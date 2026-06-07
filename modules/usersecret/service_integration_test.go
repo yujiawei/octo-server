@@ -2,6 +2,7 @@ package usersecret
 
 import (
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-lib/testutil"
 	"github.com/stretchr/testify/assert"
@@ -122,6 +123,30 @@ func TestService_Delete_Integration(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, svc.delete(owner, v.SecretID))
 	assert.ErrorIs(t, svc.delete(owner, v.SecretID), errNotFound)
+}
+
+// TestService_Resolve_TouchesLastUsed_Integration 验证 resolve 成功后回写
+// last_used_at,且不污染 updated_at(「最后使用」≠「最后修改」)。
+func TestService_Resolve_TouchesLastUsed_Integration(t *testing.T) {
+	svc, st := newTestSvc(t)
+	owner := "u-lastused"
+	v, err := svc.create(owner, "touch me", KindExternal, "val-touch")
+	require.NoError(t, err)
+
+	before, err := st.queryBySecretID(owner, v.SecretID)
+	require.NoError(t, err)
+	require.Nil(t, before.LastUsedAt, "新建时 last_used_at 应为空")
+	updatedBefore := before.UpdatedAt
+
+	out, err := svc.resolve(owner, v.SecretID)
+	require.NoError(t, err)
+	require.Equal(t, "val-touch", out.plaintext)
+
+	after, err := st.queryBySecretID(owner, v.SecretID)
+	require.NoError(t, err)
+	require.NotNil(t, after.LastUsedAt, "resolve 成功后 last_used_at 必须回写")
+	assert.Equal(t, time.Time(updatedBefore).Unix(), time.Time(after.UpdatedAt).Unix(),
+		"回写 last_used_at 不应改动 updated_at")
 }
 
 func TestService_ResolveAmbiguous_Integration(t *testing.T) {
