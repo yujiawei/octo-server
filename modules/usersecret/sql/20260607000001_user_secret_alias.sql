@@ -35,18 +35,19 @@ create table `user_secret_alias`
 -- 别名 resolve 审计日志(P0)。
 --
 -- 记录每次 resolve:谁(caller_kind + caller_id)、何时、解了哪个 owner 的
--- 哪个 secret_id、命中结果(ok / not_found / ambiguous / decrypt_fail / unauthorized)。
+-- 哪个 secret_id、命中结果(ok / not_found / ambiguous / request_invalid /
+-- unauthorized / decrypt_fail / internal_error)。
 -- 与 oidc_audit_log 风格一致:无 FK,best-effort 写入,审计失败不阻塞 resolve。
 -- secret_id 命中歧义 / 未命中时为空,result 列标明原因。
 create table `user_secret_resolve_audit`
 (
     id          bigint         not null primary key AUTO_INCREMENT,
     owner_uid   VARCHAR(40)    not null default '',                                  -- 被解析 key 的归属用户
-    caller_kind VARCHAR(16)    not null default '',                                  -- 调用方类型:user_bot / app_bot
-    caller_id   VARCHAR(64)    not null default '',                                  -- 调用方 ID(robot_id / app uid)
-    query       VARCHAR(128)   not null default '',                                  -- 入参别名(已截断,不含明文 key)
+    caller_kind VARCHAR(16)    not null default '',                                  -- 调用方类型:当前仅 user_bot(bf_ token)
+    caller_id   VARCHAR(64)    not null default '',                                  -- 调用方 ID(robot_id)
+    query       VARCHAR(128)   not null default '',                                  -- 入参别名(按 rune 边界截断到 128 字符,不含明文 key)
     secret_id   VARCHAR(40)    not null default '',                                  -- 命中的 secret_id(唯一命中才有值)
-    result      VARCHAR(24)    not null default '',                                  -- ok/not_found/ambiguous/decrypt_fail/unauthorized
+    result      VARCHAR(24)    not null default '',                                  -- ok/not_found/ambiguous/request_invalid/unauthorized/decrypt_fail/internal_error
     candidates  int            not null default 0,                                   -- 匹配候选数(歧义时 >1)
     ip          VARCHAR(45)    not null default '',
     created_at  timestamp      not null default CURRENT_TIMESTAMP,

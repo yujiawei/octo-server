@@ -165,6 +165,24 @@ func TestService_ResolveAmbiguous_Integration(t *testing.T) {
 	assert.Empty(t, out.plaintext, "歧义不返明文")
 }
 
+// TestService_Resolve_ResultClassification_Integration 回归 P1.5:resolve 的非命中
+// 分支结果分类必须可区分(空入参 → request_invalid,真实零命中 → not_found),不能都
+// 混成 not_found,否则审计无法把「坏请求」「真未命中」「基础设施故障」分开。
+func TestService_Resolve_ResultClassification_Integration(t *testing.T) {
+	svc, _ := newTestSvc(t)
+	owner := "u-classify"
+
+	// 空 query → request_invalid(而非 not_found)。
+	out, err := svc.resolve(owner, "   ")
+	assert.ErrorIs(t, err, errInvalidInput)
+	assert.Equal(t, resultRequestInvalid, out.result)
+
+	// 真实零命中 → not_found。
+	out, err = svc.resolve(owner, "nonexistent-name")
+	assert.ErrorIs(t, err, errNotFound)
+	assert.Equal(t, resultNotFound, out.result)
+}
+
 func TestStore_QueryBotByToken_Integration(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))

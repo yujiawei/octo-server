@@ -40,9 +40,11 @@ type resolveAuditModel struct {
 
 // resolve 审计结果枚举。
 const (
-	resultOK           = "ok"
-	resultNotFound     = "not_found"
-	resultAmbiguous    = "ambiguous"
-	resultDecryptFail  = "decrypt_fail"
-	resultUnauthorized = "unauthorized"
+	resultOK             = "ok"
+	resultNotFound       = "not_found"
+	resultAmbiguous      = "ambiguous"
+	resultDecryptFail    = "decrypt_fail"
+	resultUnauthorized   = "unauthorized"
+	resultRequestInvalid = "request_invalid" // 已鉴权 caller 发了坏请求(空/坏 body)
+	resultInternalError  = "internal_error"  // DB/基础设施异常,区别于真实 not_found(P1.5)
 )

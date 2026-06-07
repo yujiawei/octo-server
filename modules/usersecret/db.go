@@ -41,17 +41,6 @@ func (s *store) queryBySecretID(ownerUID, secretID string) (*aliasModel, error) 
 	return m, nil
 }
 
-// queryByOwnerNorm 按 owner + 归一化名查询(唯一键)。未命中 (nil,nil)。
-func (s *store) queryByOwnerNorm(ownerUID, norm string) (*aliasModel, error) {
-	var m *aliasModel
-	if _, err := s.session.Select("*").From("user_secret_alias").
-		Where("owner_uid=? AND display_name_norm=?", ownerUID, norm).
-		Load(&m); err != nil && !errors.Is(err, dbr.ErrNotFound) {
-		return nil, fmt.Errorf("usersecret: query by owner norm: %w", err)
-	}
-	return m, nil
-}
-
 // listByOwner 列出某 owner 的全部别名(按创建时间倒序)。
 func (s *store) listByOwner(ownerUID string) ([]*aliasModel, error) {
 	var list []*aliasModel

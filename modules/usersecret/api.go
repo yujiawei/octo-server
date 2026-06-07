@@ -10,11 +10,14 @@ import (
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
 	"go.uber.org/zap"
 )
 
-// maxAuditQuery resolve 审计 query 列写入上限,防灌爆 + 不落明文 key。
-const maxAuditQuery = 128
+// maxAuditQueryRunes resolve 审计 query 列写入上限(按字符,非字节),防灌爆 + 不落明文 key。
+// 列是 VARCHAR(128)(utf8mb4 下按字符计长),故 128 runes 必然能塞下;按 rune 边界
+// 截断避免切断多字节 UTF-8 码点导致插入失败 / 存入非法 UTF-8(P1.4)。
+const maxAuditQueryRunes = 128
 
 // API 是 usersecret 模块的 HTTP 入口 + 依赖容器。
 type API struct {
@@ -51,7 +54,10 @@ func New(ctx *config.Context) *API {
 //   - /v1/manager/secrets/*  用户态 CRUD(AuthMiddleware,owner = 当前登录用户)。
 //   - /v1/bot/secrets/resolve  channel 插件 use-time 解析(bf_ bot token 鉴权)。
 func (a *API) Route(r *wkhttp.WKHttp) {
-	mgr := r.Group("/v1/manager/secrets", a.ctx.AuthMiddleware(r))
+	// 认证 CRUD 组在 AuthMiddleware 之后挂 SharedUIDRateLimiter:per-login-user 桶
+	// (ratelimit:uid:{uid}),给创建/轮换加密 key 这类敏感写路径做按用户的频控,
+	// 与 incomingwebhook / app_bot 等认证管理路由口径一致。
+	mgr := r.Group("/v1/manager/secrets", a.ctx.AuthMiddleware(r), appwkhttp.SharedUIDRateLimiter(r, a.ctx))
 	{
 		mgr.POST("", a.create)           // 新建
 		mgr.GET("", a.list)              // 列表(脱敏)
@@ -205,7 +211,7 @@ func (a *API) resolve(c *wkhttp.Context) {
 	if callerErr != nil {
 		a.Error("usersecret resolve 鉴权查询失败", zap.Error(callerErr))
 		// 鉴权查询本身报错(DB 异常)也留痕:安全模块的鉴权链路任何失败都要审计。
-		a.writeResolveAudit(c, caller, "", resolveOutcome{result: resultDecryptFail})
+		a.writeResolveAudit(c, caller, "", resolveOutcome{result: resultInternalError})
 		respondErr(c, errcode.ErrUserSecretResolveFailed)
 		return
 	}
@@ -220,8 +226,9 @@ func (a *API) resolve(c *wkhttp.Context) {
 		Query string `json:"query"` // secret_id 或 display_name
 	}
 	if err := c.BindJSON(&req); err != nil || strings.TrimSpace(req.Query) == "" {
-		// 入参非法也留痕(已鉴权的 caller 发了坏请求)。
-		a.writeResolveAudit(c, caller, req.Query, resolveOutcome{result: resultNotFound})
+		// 入参非法也留痕(已鉴权的 caller 发了坏请求)。标 request_invalid,
+		// 别和真实 not_found 混。
+		a.writeResolveAudit(c, caller, req.Query, resolveOutcome{result: resultRequestInvalid})
 		respondErr(c, errcode.ErrUserSecretRequestInvalid)
 		return
 	}
@@ -275,8 +282,10 @@ func extractBearer(c *wkhttp.Context) string {
 // owner/caller_id 留空,result 由调用方标明(如 unauthorized)。
 func (a *API) writeResolveAudit(c *wkhttp.Context, caller *botIdentity, query string, outcome resolveOutcome) {
 	q := query
-	if len(q) > maxAuditQuery {
-		q = q[:maxAuditQuery]
+	// 按 rune 边界截断:VARCHAR(128) 按字符计长,CJK 在 UTF-8 占 3-4 字节,
+	// 直接按字节切会切断码点 → 插入失败或存入非法 UTF-8(P1.4)。
+	if r := []rune(q); len(r) > maxAuditQueryRunes {
+		q = string(r[:maxAuditQueryRunes])
 	}
 	result := outcome.result
 	if result == "" {

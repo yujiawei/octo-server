@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
@@ -288,6 +289,58 @@ func TestAPI_Resolve_Ambiguous(t *testing.T) {
 	assert.NotEmpty(t, resp.Error.Message, "歧义错误必须带本地化 message")
 	assert.Equal(t, http.StatusUnprocessableEntity, resp.Error.HTTPStatus)
 	assert.Len(t, resp.Error.Details.Candidates, 2)
+}
+
+// TestAPI_Resolve_AuditQueryTruncatedOnRuneBoundary 回归 P1.4:超长 CJK query
+// 必须按 rune 边界截断后落审计,不能按字节切断多字节码点(否则 VARCHAR(128) 插入
+// 失败或存入非法 UTF-8)。审计行应可读、长度 ≤128 字符、且是合法 UTF-8。
+func TestAPI_Resolve_AuditQueryTruncatedOnRuneBoundary(t *testing.T) {
+	route, ctx := newAPITestServer(t)
+	owner := "u_trunc_" + util.GenerUUID()[:6]
+	botToken := "bf_" + util.GenerUUID()[:16]
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO robot (robot_id, creator_uid, bot_token, status) VALUES (?, ?, ?, 1)",
+		"botTrunc_"+util.GenerUUID()[:6], owner, botToken,
+	).Exec()
+	require.NoError(t, err)
+
+	// 200 个中文字符(UTF-8 下 600 字节),远超 128。无匹配 → not_found,但审计仍落。
+	longQuery := strings.Repeat("密", 200)
+	w := httptest.NewRecorder()
+	route.ServeHTTP(w, botReq(t, "/v1/bot/secrets/resolve", botToken, map[string]string{"query": longQuery}))
+	require.Equal(t, http.StatusNotFound, w.Code, w.Body.String())
+
+	var row struct {
+		Query string
+	}
+	found, err := ctx.DB().Select("query").From("user_secret_resolve_audit").
+		Where("owner_uid=?", owner).Load(&row)
+	require.NoError(t, err)
+	require.Equal(t, 1, found)
+	assert.True(t, utf8.ValidString(row.Query), "审计 query 必须是合法 UTF-8(不能切断码点)")
+	assert.Equal(t, 128, len([]rune(row.Query)), "审计 query 必须按 rune 边界截断到 128 字符")
+	assert.Equal(t, strings.Repeat("密", 128), row.Query)
+}
+
+// TestAPI_Resolve_CreateReturnsTimestamps 回归 Jerry-Xin/lml2468:create 201 响应
+// 必须带真实 created_at/updated_at,而非 DB 默认值在内存模型上留下的零值
+// ("0001-01-01T00:00:00Z")。
+func TestAPI_Resolve_CreateReturnsTimestamps(t *testing.T) {
+	route, ctx := newAPITestServer(t)
+	uid := "u_ts_" + util.GenerUUID()[:6]
+	token := seedSession(t, ctx, uid)
+
+	w := httptest.NewRecorder()
+	route.ServeHTTP(w, userReq(t, http.MethodPost, "/v1/manager/secrets", token, map[string]string{
+		"display_name": "ts key", "kind": "external", "key": "sk-ts-0001",
+	}))
+	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
+	var created secretView
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &created))
+	assert.NotEmpty(t, created.CreatedAt)
+	assert.NotEmpty(t, created.UpdatedAt)
+	assert.NotContains(t, created.CreatedAt, "0001-01-01", "create 响应不得返回零值时间戳")
+	assert.NotContains(t, created.UpdatedAt, "0001-01-01", "create 响应不得返回零值时间戳")
 }
 
 func TestAPI_Resolve_WritesAudit(t *testing.T) {

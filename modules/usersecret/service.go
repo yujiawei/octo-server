@@ -99,7 +99,16 @@ func (s *service) create(ownerUID, displayName, kind, plaintext string) (secretV
 		}
 		return secretView{}, err
 	}
-	return toView(m), nil
+	// 回读一次:created_at/updated_at 是 DB DEFAULT CURRENT_TIMESTAMP,内存 m 上
+	// 仍是零值,直接 toView 会返回 "0001-01-01T00:00:00Z"。与 updateKey/rename 同口径。
+	saved, err := s.store.queryBySecretID(ownerUID, m.SecretID)
+	if err != nil {
+		return secretView{}, err
+	}
+	if saved == nil {
+		return secretView{}, errNotFound
+	}
+	return toView(saved), nil
 }
 
 // updateKey 换 key:只更新密文 + 掩码,secret_id/display_name 不变。
@@ -214,12 +223,13 @@ type resolveOutcome struct {
 func (s *service) resolve(ownerUID, query string) (resolveOutcome, error) {
 	query = strings.TrimSpace(query)
 	if ownerUID == "" || query == "" {
-		return resolveOutcome{result: resultNotFound}, errInvalidInput
+		return resolveOutcome{result: resultRequestInvalid}, errInvalidInput
 	}
 
 	// 1) secret_id 直查
 	if direct, err := s.store.queryBySecretID(ownerUID, query); err != nil {
-		return resolveOutcome{}, err
+		// DB 异常:审计标 internal_error,别和真实 not_found 混(P1.5)。
+		return resolveOutcome{result: resultInternalError}, err
 	} else if direct != nil {
 		return s.finishHit(direct)
 	}
@@ -227,7 +237,7 @@ func (s *service) resolve(ownerUID, query string) (resolveOutcome, error) {
 	// 2) 名称匹配
 	rows, err := s.store.listByOwner(ownerUID)
 	if err != nil {
-		return resolveOutcome{}, err
+		return resolveOutcome{result: resultInternalError}, err
 	}
 	var exact, fuzzy []*aliasModel
 	for _, m := range rows {

@@ -74,6 +74,7 @@
 | 404 | `err.server.usersecret.not_found` | CRUD 目标 `secret_id` 不存在（非本 owner 即视为不存在）；**resolve 解引用零命中** |
 | 409 | `err.server.usersecret.duplicate_name` | create/rename 时归一化别名撞已有别名（**换名**提示） |
 | 422 | `err.server.usersecret.ambiguous` | **resolve 歧义**：匹配到多个候选，返候选列表让上层消歧（见下） |
+| 429 | （平台限流，非本模块 errcode） | CRUD 路由挂了 `SharedUIDRateLimiter`（per-login-user 桶）；瞬时突发被限流时返回，下游应退避重试 |
 | 500 | `err.server.usersecret.resolve_failed` | 解引用失败（密文解密/认证失败等内部异常）；主密钥未就绪 |
 
 ---
@@ -198,9 +199,22 @@ Header：`Authorization: Bearer bf_<bot_token>`
 ### resolve 审计（P0）
 
 每次 resolve 落一条审计（`user_secret_resolve_audit`）：谁（caller_kind=`user_bot` +
-`caller_id`=robot_id）、何时、解了哪个 owner 的哪个 `secret_id`、命中结果
-（`ok` / `not_found` / `ambiguous` / `decrypt_fail` / `unauthorized`）。审计为
-best-effort（失败仅记日志，不阻塞返回），且**不记录明文/密文**（`query` 截断存储）。
+`caller_id`=robot_id）、何时、解了哪个 owner 的哪个 `secret_id`、命中结果。
+`result` 枚举区分如下结果，便于把「坏请求 / 真未命中 / 基础设施故障 / 鉴权失败」分开排查：
+
+| `result` | 含义 |
+|---|---|
+| `ok` | 唯一命中、解密成功 |
+| `not_found` | 真实零命中（owner 名下无此别名/secret_id） |
+| `ambiguous` | 匹配到多个候选，返候选列表消歧 |
+| `request_invalid` | 已鉴权 caller 发了坏请求（空/无法解析的 body、空 query） |
+| `unauthorized` | bot 凭证缺失/非法（鉴权失败也留痕，越权探测线索） |
+| `decrypt_fail` | 命中但密文解密失败 |
+| `internal_error` | DB/基础设施异常（鉴权查询或名称扫描报错），区别于真实 `not_found` |
+
+审计为 best-effort（失败仅记日志，不阻塞返回），且**不记录明文/密文**。`query` 列
+按 **rune 边界**截断到 128 字符存储（`VARCHAR(128)` 按字符计长；不按字节切，避免切断
+多字节 UTF-8 码点）。`caller_kind` 当前仅产生 `user_bot`（本单只认 `bf_` user bot）。
 
 ---
 
