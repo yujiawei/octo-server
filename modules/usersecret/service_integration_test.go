@@ -183,6 +183,52 @@ func TestService_Resolve_ResultClassification_Integration(t *testing.T) {
 	assert.Equal(t, resultNotFound, out.result)
 }
 
+// TestService_Rename_Idempotent_Integration 回归 R3.1:用「与当前完全相同」的
+// display_name 改名,在默认 MySQL DSN(未设 clientFoundRows)下 UPDATE 报 0 changed
+// rows,但行存在 —— 必须幂等成功返回当前视图,而非误返 not_found。否则前端提交
+// 「未改的 display_name + 新 key」会在 rename 步 404,走不到 key 轮换。
+func TestService_Rename_Idempotent_Integration(t *testing.T) {
+	svc, _ := newTestSvc(t)
+	owner := "u-ren-idem"
+	v, err := svc.create(owner, "stable name", KindExternal, "val-1")
+	require.NoError(t, err)
+
+	// 同名改名:无字段变化,RowsAffected()==0,但必须幂等成功。
+	v2, err := svc.rename(owner, v.SecretID, "stable name")
+	require.NoError(t, err, "同名幂等改名不得返回 not_found")
+	assert.Equal(t, v.SecretID, v2.SecretID)
+	assert.Equal(t, "stable name", v2.DisplayName)
+
+	// 归一化等价(大小写/空格)同样应幂等成功,不撞唯一键、不误判 not_found。
+	v3, err := svc.rename(owner, v.SecretID, "  Stable   Name  ")
+	require.NoError(t, err)
+	assert.Equal(t, v.SecretID, v3.SecretID)
+
+	// 真正不存在的 secret_id 仍是 not_found。
+	_, err = svc.rename(owner, "no-such-id", "whatever")
+	assert.ErrorIs(t, err, errNotFound)
+}
+
+// TestService_RenameThenRotate_Idempotent_Integration 模拟前端「整表提交」:
+// 未改 display_name + 新 key。rename 步幂等成功(不 404),key 轮换随后生效。
+func TestService_RenameThenRotate_Idempotent_Integration(t *testing.T) {
+	svc, _ := newTestSvc(t)
+	owner := "u-ren-rotate"
+	v, err := svc.create(owner, "combo name", KindExternal, "old-val-1111")
+	require.NoError(t, err)
+
+	// rename(同名,幂等)→ updateKey(换 key),复刻 api.update 的两步编排。
+	_, err = svc.rename(owner, v.SecretID, "combo name")
+	require.NoError(t, err, "同名 rename 不得 404,否则到不了 key 轮换")
+	v2, err := svc.updateKey(owner, v.SecretID, "new-val-2222")
+	require.NoError(t, err)
+	assert.Equal(t, "****2222", v2.Masked)
+
+	out, err := svc.resolve(owner, v.SecretID)
+	require.NoError(t, err)
+	assert.Equal(t, "new-val-2222", out.plaintext, "key 轮换必须生效")
+}
+
 func TestStore_QueryBotByToken_Integration(t *testing.T) {
 	_, ctx := testutil.NewTestServer()
 	require.NoError(t, testutil.CleanAllTables(ctx))

@@ -127,6 +127,51 @@ func TestAPI_CRUD_RequiresAuth(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
+// TestAPI_Update_UnchangedNamePlusNewKey 回归 R3.1:前端整表提交「未改的
+// display_name + 新 key」时,api.update 先 rename(同名,幂等)再 updateKey。
+// 默认 MySQL DSN 下同名 UPDATE 报 0 changed rows,旧逻辑会在 rename 步误返 404,
+// 根本走不到 key 轮换。修复后应 200,且新 key 经 resolve 生效。
+func TestAPI_Update_UnchangedNamePlusNewKey(t *testing.T) {
+	route, ctx := newAPITestServer(t)
+	owner := "u_combo_" + util.GenerUUID()[:6]
+	token := seedSession(t, ctx, owner)
+
+	w := httptest.NewRecorder()
+	route.ServeHTTP(w, userReq(t, http.MethodPost, "/v1/manager/secrets", token, map[string]string{
+		"display_name": "combo key", "kind": "external", "key": "old-key-1111",
+	}))
+	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
+	var created secretView
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &created))
+
+	// 整表提交:display_name 未变 + 新 key。
+	w = httptest.NewRecorder()
+	route.ServeHTTP(w, userReq(t, http.MethodPut, "/v1/manager/secrets/"+created.SecretID, token, map[string]string{
+		"display_name": "combo key", "key": "new-key-2222",
+	}))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var updated secretView
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &updated))
+	assert.Equal(t, "****2222", updated.Masked, "key 轮换必须生效")
+
+	// resolve 应解出新 key。
+	botToken := "bf_" + util.GenerUUID()[:16]
+	_, err := ctx.DB().InsertBySql(
+		"INSERT INTO robot (robot_id, creator_uid, bot_token, status) VALUES (?, ?, ?, 1)",
+		"botCombo_"+util.GenerUUID()[:6], owner, botToken,
+	).Exec()
+	require.NoError(t, err)
+
+	w = httptest.NewRecorder()
+	route.ServeHTTP(w, botReq(t, "/v1/bot/secrets/resolve", botToken, map[string]string{"query": created.SecretID}))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var resp struct {
+		Value string `json:"value"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, "new-key-2222", resp.Value)
+}
+
 func TestAPI_Resolve_ByBotToken(t *testing.T) {
 	route, ctx := newAPITestServer(t)
 	owner := "u_" + util.GenerUUID()[:8]

@@ -74,7 +74,7 @@
 | 404 | `err.server.usersecret.not_found` | CRUD 目标 `secret_id` 不存在（非本 owner 即视为不存在）；**resolve 解引用零命中** |
 | 409 | `err.server.usersecret.duplicate_name` | create/rename 时归一化别名撞已有别名（**换名**提示） |
 | 422 | `err.server.usersecret.ambiguous` | **resolve 歧义**：匹配到多个候选，返候选列表让上层消歧（见下） |
-| 429 | （平台限流，非本模块 errcode） | CRUD 路由挂了 `SharedUIDRateLimiter`（per-login-user 桶）；瞬时突发被限流时返回，下游应退避重试 |
+| 429 | （平台限流，非本模块 errcode） | CRUD 路由挂 `SharedUIDRateLimiter`（per-login-user 桶）；resolve 挂 per-IP `StrictIPRateLimitMiddleware`（tag=`usersecret_resolve`，默认 50rps/burst200）。瞬时突发被限流时返回，下游应退避重试 |
 | 500 | `err.server.usersecret.resolve_failed` | 解引用失败（密文解密/认证失败等内部异常）；主密钥未就绪 |
 
 ---
@@ -133,6 +133,9 @@
 - `key` 与 `display_name` 至少给一个，否则 `400`。
 - 响应 `200`：更新后的脱敏视图（结构同 create 响应）。
 - 错误：`400`、`404`（`secret_id` 不存在）、`409`（rename 撞名）。
+- **幂等**：传入「与当前完全相同」的 `display_name`（含归一化等价的大小写/空格变体）
+  不报错，原样返回当前视图——前端整表提交「未改名 + 新 key」时，rename 步幂等放行，
+  key 轮换照常生效（不会误返 `404`）。
 
 ### 4. 删除 — `DELETE /v1/manager/secrets/{secret_id}`
 
@@ -195,6 +198,12 @@ Header：`Authorization: Bearer bf_<bot_token>`
 
 **未命中** 响应 `404` `err.server.usersecret.not_found`。
 **解引用失败** 响应 `500` `err.server.usersecret.resolve_failed`。
+
+> **限流**：`resolve` 端点挂 per-IP 严格限流（`StrictIPRateLimitMiddleware`，
+> tag=`usersecret_resolve`，默认 50 rps / burst 200，可经 `DM_USERSECRET_RESOLVE_IP_RPS`
+> / `DM_USERSECRET_RESOLVE_IP_BURST` 覆盖）。它会返明文且每次调用（含坏 token）都写
+> 一条审计行，故必须挡 token 探测 + 审计写放大。触顶返回 `429`，下游应退避重试。
+> Redis 故障时 fail-open（放行 + 告警）。
 
 ### resolve 审计（P0）
 

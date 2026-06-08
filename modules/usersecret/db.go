@@ -11,6 +11,26 @@ import (
 	"github.com/gocraft/dbr/v2"
 )
 
+// secretStore 是 usersecret 数据访问的行为契约。service / API 都依赖它而非具体
+// *store,让测试能注入「让某次查询报错」的 fault store,验证 resolve 的错误分类
+// (DB/auth-query 故障 → internal_error,而非误记 not_found/decrypt_fail)真正被
+// 守住(R3.2:回归测试必须能抓回原 classification bug,不能 mock-blind)。
+// 接口方法未导出,故只能在本包内实现,不构成对外 API 面。
+type secretStore interface {
+	insertAlias(m *aliasModel) error
+	queryBySecretID(ownerUID, secretID string) (*aliasModel, error)
+	listByOwner(ownerUID string) ([]*aliasModel, error)
+	updateSecret(ownerUID, secretID string, cipher []byte, masked string) (int64, error)
+	renameAlias(ownerUID, secretID, displayName, norm string) (int64, error)
+	deleteAlias(ownerUID, secretID string) (int64, error)
+	touchLastUsed(secretID string) error
+	insertResolveAudit(m *resolveAuditModel) error
+	queryBotByToken(botToken string) (*botIdentity, error)
+}
+
+// 编译期断言:*store 必须实现 secretStore。
+var _ secretStore = (*store)(nil)
+
 // store 别名表数据访问层。
 type store struct {
 	session *dbr.Session

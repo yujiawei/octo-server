@@ -25,11 +25,11 @@ const (
 
 // service 别名 CRUD + resolve 的业务编排。
 type service struct {
-	store *store
+	store secretStore
 	enc   *encryptor
 }
 
-func newService(st *store, enc *encryptor) *service {
+func newService(st secretStore, enc *encryptor) *service {
 	return &service{store: st, enc: enc}
 }
 
@@ -149,16 +149,17 @@ func (s *service) rename(ownerUID, secretID, displayName string) (secretView, er
 	if norm == "" {
 		return secretView{}, errInvalidInput
 	}
-	n, err := s.store.renameAlias(ownerUID, secretID, displayName, norm)
-	if err != nil {
+	if _, err := s.store.renameAlias(ownerUID, secretID, displayName, norm); err != nil {
 		if isDuplicateErr(err) {
 			return secretView{}, errDuplicateName
 		}
 		return secretView{}, err
 	}
-	if n == 0 {
-		return secretView{}, errNotFound
-	}
+	// n==0 不能直接当 not-found:默认 MySQL DSN 未设 clientFoundRows,改名成
+	// 「与当前同名」(归一化后无变化)的幂等 UPDATE 报 0 changed rows,但行是
+	// 存在的。若把它当 not-found,前端提交「未改的 display_name + 新 key」会在
+	// rename 步误返 404,根本走不到 key 轮换(R3.1)。故 n==0 时先回查存在性:
+	// 存在 → 幂等改名,返回当前视图;真不存在 → errNotFound。
 	m, err := s.store.queryBySecretID(ownerUID, secretID)
 	if err != nil {
 		return secretView{}, err

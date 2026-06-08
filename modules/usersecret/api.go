@@ -1,16 +1,20 @@
 package usersecret
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
 	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
 	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
 	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
 	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
+	rd "github.com/go-redis/redis"
 	"go.uber.org/zap"
 )
 
@@ -19,12 +23,45 @@ import (
 // 截断避免切断多字节 UTF-8 码点导致插入失败 / 存入非法 UTF-8(P1.4)。
 const maxAuditQueryRunes = 128
 
+// resolve 端点 per-IP 限流默认值。resolve 经 bf_ bot token 鉴权且锚定 owner,
+// 不挂用户态 SharedUIDRateLimiter(读不到登录 uid),改用 per-IP 严格限流挡
+// token 探测 + 审计表写放大(R3:每次调用都写审计行,含坏 token)。阈值给得
+// 偏宽:正常 use-time resolve 量很低,但同 egress IP 下可能聚合多 bot,故
+// 50 rps / burst 200 留余量,异常放大才触顶。可经环境变量覆盖。
+const (
+	envResolveIPRPS    = "DM_USERSECRET_RESOLVE_IP_RPS"
+	envResolveIPBurst  = "DM_USERSECRET_RESOLVE_IP_BURST"
+	defResolveIPRPS    = 50.0
+	defResolveIPBurst  = 200
+	resolveRateLimitNS = "usersecret_resolve" // Redis keyspace tag
+)
+
+// rateRedisOnce 让限流 redis client 在进程内单例化,避免每次 New() 都开新连接池
+// (参考 incomingwebhook / pkg/wkhttp.SharedUIDRateLimiter 的同款约定)。
+var (
+	rateRedisOnce   sync.Once
+	rateRedisClient *rd.Client
+)
+
+func sharedRateRedis(cfg *config.Config) *rd.Client {
+	rateRedisOnce.Do(func() {
+		// 经 octoredis.MustBuildOptions 构造,确保 RedisTLS 启用(托管 TLS Redis)时
+		// TLSConfig 不被遗漏,否则限流 client 连不上、fail-open 静默关掉防护。
+		// PoolSize 显式设 10:令牌桶 Lua 是短事务,与其它限流 client 全局约定一致。
+		rateRedisClient = rd.NewClient(octoredis.MustBuildOptions(cfg, func(o *rd.Options) {
+			o.MaxRetries = 1
+			o.PoolSize = 10
+		}))
+	})
+	return rateRedisClient
+}
+
 // API 是 usersecret 模块的 HTTP 入口 + 依赖容器。
 type API struct {
 	ctx *config.Context
 	log.Log
 
-	store   *store
+	store   secretStore
 	svc     *service
 	enc     *encryptor
 	enabled bool // 主密钥就绪才挂载写接口 / resolve
@@ -65,8 +102,15 @@ func (a *API) Route(r *wkhttp.WKHttp) {
 		mgr.DELETE("/:secret_id", a.delete)
 	}
 
-	// resolve:bot token 鉴权,不挂用户 AuthMiddleware。
-	r.POST("/v1/bot/secrets/resolve", a.resolve)
+	// resolve:bot token 鉴权,不挂用户 AuthMiddleware。但它会返明文且每次调用
+	// (含坏 token)都写一条审计行,故必须挂 per-IP 严格限流挡 token 探测 + 审计
+	// 写放大(R3 blocker)。复用 StrictIPRateLimitMiddleware(与 login/sms/搜索等
+	// 敏感端点同款),独立 tag 隔离 keyspace;Redis 故障时 fail-open(放行 + 告警)。
+	rps := wkhttp.ParseRPSFromEnv(envResolveIPRPS, defResolveIPRPS)
+	burst := wkhttp.ParseBurstFromEnv(envResolveIPBurst, defResolveIPBurst)
+	resolveLimit := r.StrictIPRateLimitMiddleware(
+		context.Background(), sharedRateRedis(a.ctx.GetConfig()), resolveRateLimitNS, rps, burst)
+	r.POST("/v1/bot/secrets/resolve", resolveLimit, a.resolve)
 }
 
 // guardReady 写接口 / resolve 入口统一检查主密钥就绪。未就绪返回 5xx 并 return true。
@@ -127,7 +171,7 @@ func (a *API) list(c *wkhttp.Context) {
 // update 同时承载「换 key」与「重命名」:
 //   - body 含 key      → 换 key(只更新密文,secret_id/display_name 不变)。
 //   - body 含 display_name → 重命名(secret_id/密文不变)。
-//   - 两者都给 → 先换 key 再重命名;都不给 → 400。
+//   - 两者都给 → 先重命名再换 key(见下方实现注释);都不给 → 400。
 func (a *API) update(c *wkhttp.Context) {
 	if a.guardReady(c) {
 		return
