@@ -165,6 +165,38 @@ func TestService_ResolveAmbiguous_Integration(t *testing.T) {
 	assert.Empty(t, out.plaintext, "歧义不返明文")
 }
 
+// TestService_Resolve_UniqueFuzzy_NeverAutoPlaintext_Integration 回归 P1:唯一模糊
+// 命中(score==1,双向 pinyin 子串)绝不能自动解密返明文,必须降级为单个候选走
+// ambiguous 确认路径。
+//
+// 复刻 issue 场景:owner 同时有别名 `openai` 与 `Claude密钥`,query `pen` 无 exact
+// 命中,旧逻辑会因「唯一模糊命中 openai」直接 finishHit 返回 openai 明文——即静默
+// 返回用户没指定的那把自有密钥。修复后必须返候选确认而非明文。
+func TestService_Resolve_UniqueFuzzy_NeverAutoPlaintext_Integration(t *testing.T) {
+	svc, _ := newTestSvc(t)
+	owner := "u-fuzzy-pen"
+
+	v1, err := svc.create(owner, "openai", KindLLM, "sk-openai-secret")
+	require.NoError(t, err)
+	_, err = svc.create(owner, "Claude密钥", KindLLM, "sk-claude-secret")
+	require.NoError(t, err)
+
+	// `pen` 是 `openai` 的子串(pinyinKey 同),旧逻辑下是唯一模糊命中。
+	out, err := svc.resolve(owner, "pen")
+	assert.ErrorIs(t, err, errAmbiguous, "唯一模糊命中必须走候选确认,不能 not_found 也不能自动解密")
+	assert.Equal(t, resultAmbiguous, out.result)
+	assert.Empty(t, out.plaintext, "唯一模糊命中绝不返明文")
+	assert.NotEqual(t, "sk-openai-secret", out.plaintext, "绝不静默返回未指定的密钥明文")
+	require.Len(t, out.candidates, 1, "唯一模糊命中应作为单个脱敏候选返回")
+	assert.Equal(t, v1.SecretID, out.candidates[0].SecretID)
+	assert.NotEmpty(t, out.candidates[0].Masked, "候选返回脱敏视图")
+
+	// 用候选给出的 secret_id 显式 resolve → 才返明文(保留可用性)。
+	confirmed, err := svc.resolve(owner, v1.SecretID)
+	require.NoError(t, err)
+	assert.Equal(t, "sk-openai-secret", confirmed.plaintext)
+}
+
 // TestService_Resolve_ResultClassification_Integration 回归 P1.5:resolve 的非命中
 // 分支结果分类必须可区分(空入参 → request_invalid,真实零命中 → not_found),不能都
 // 混成 not_found,否则审计无法把「坏请求」「真未命中」「基础设施故障」分开。

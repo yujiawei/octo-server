@@ -44,7 +44,7 @@ func (f *fakeStore) listByOwner(ownerUID string) ([]*aliasModel, error) {
 func (f *fakeStore) updateSecret(string, string, []byte, string) (int64, error) { return 0, nil }
 func (f *fakeStore) renameAlias(string, string, string, string) (int64, error)  { return 0, nil }
 func (f *fakeStore) deleteAlias(string, string) (int64, error)                  { return 0, nil }
-func (f *fakeStore) touchLastUsed(string) error                                 { return nil }
+func (f *fakeStore) touchLastUsed(string, string) error                         { return nil }
 
 func (f *fakeStore) insertResolveAudit(m *resolveAuditModel) error {
 	f.audits = append(f.audits, m)

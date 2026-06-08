@@ -23,7 +23,7 @@ type secretStore interface {
 	updateSecret(ownerUID, secretID string, cipher []byte, masked string) (int64, error)
 	renameAlias(ownerUID, secretID, displayName, norm string) (int64, error)
 	deleteAlias(ownerUID, secretID string) (int64, error)
-	touchLastUsed(secretID string) error
+	touchLastUsed(ownerUID, secretID string) error
 	insertResolveAudit(m *resolveAuditModel) error
 	queryBotByToken(botToken string) (*botIdentity, error)
 }
@@ -119,13 +119,14 @@ func (s *store) deleteAlias(ownerUID, secretID string) (int64, error) {
 // touchLastUsed best-effort 回写 last_used_at(resolve 成功后调用)。
 // 显式把 updated_at 设回自身,避开列上的 `on update CURRENT_TIMESTAMP`:
 // 「最后使用」是读侧元数据,不应污染「最后修改」时间。
-func (s *store) touchLastUsed(secretID string) error {
+// owner_uid 一并限定:与其它 accessor 一致,defense-in-depth 防越权回写。
+func (s *store) touchLastUsed(ownerUID, secretID string) error {
 	_, err := s.session.Update("user_secret_alias").
 		SetMap(map[string]interface{}{
 			"last_used_at": time.Now(),
 			"updated_at":   dbr.Expr("updated_at"),
 		}).
-		Where("secret_id=?", secretID).Exec()
+		Where("owner_uid=? AND secret_id=?", ownerUID, secretID).Exec()
 	return err
 }
 

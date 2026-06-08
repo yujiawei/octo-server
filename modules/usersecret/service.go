@@ -216,11 +216,18 @@ type resolveOutcome struct {
 // 解析优先级:
 //  1. query 命中本 owner 的某 secret_id → 唯一命中,直接返明文。
 //  2. 否则按 display_name 精确 + 拼音/模糊匹配:
-//     - 精确命中存在 → 仅在精确集合里判唯一;精确唯一返明文,精确多条→歧义。
-//     - 无精确命中 → 用模糊命中集合:唯一返明文,多条→返候选列表消歧。
+//     - 精确命中(score==2)存在 → 仅在精确集合里判唯一;精确唯一返明文,精确多条→歧义。
+//     - 无精确命中 → 用模糊命中(score==1)集合走候选确认:无论 1 条还是多条,
+//       都返脱敏候选列表(422 ambiguous)让上层显式确认,绝不自动解密返明文。
 //  3. 零命中 → not_found。
 //
-// 任何「非唯一」结果都不返明文,只返候选脱敏视图让上层消歧。
+// 为何「唯一模糊命中」也不自动返明文(P1):matchScore 的模糊档用双向 pinyin
+// 子串命中,无最小长度约束,短/部分 query(如 `pen` 命中 `openai`)会唯一命中
+// 一把用户并未指定的自有密钥,finishHit 直接解密就成了「静默错选」——channel
+// 插件会拿错 key 去外部认证。只有 exact(归一化完全相等)才足够确定到能自动解密;
+// 模糊命中一律降级为候选,保留语音 UX 又消除静默错选。
+//
+// 任何「非精确唯一」结果都不返明文,只返候选脱敏视图让上层消歧。
 func (s *service) resolve(ownerUID, query string) (resolveOutcome, error) {
 	query = strings.TrimSpace(query)
 	if ownerUID == "" || query == "" {
@@ -232,7 +239,7 @@ func (s *service) resolve(ownerUID, query string) (resolveOutcome, error) {
 		// DB 异常:审计标 internal_error,别和真实 not_found 混(P1.5)。
 		return resolveOutcome{result: resultInternalError}, err
 	} else if direct != nil {
-		return s.finishHit(direct)
+		return s.finishHit(ownerUID, direct)
 	}
 
 	// 2) 名称匹配
@@ -249,34 +256,43 @@ func (s *service) resolve(ownerUID, query string) (resolveOutcome, error) {
 			fuzzy = append(fuzzy, m)
 		}
 	}
-	hits := exact
-	if len(hits) == 0 {
-		hits = fuzzy
+
+	// 仅精确(score==2)唯一命中才自动解密返明文。
+	switch {
+	case len(exact) == 1:
+		return s.finishHit(ownerUID, exact[0])
+	case len(exact) > 1:
+		return ambiguousOutcome(exact)
 	}
 
-	switch {
-	case len(hits) == 0:
-		return resolveOutcome{result: resultNotFound}, errNotFound
-	case len(hits) == 1:
-		return s.finishHit(hits[0])
-	default:
-		cands := make([]secretView, 0, len(hits))
-		for _, m := range hits {
-			cands = append(cands, toView(m))
-		}
-		return resolveOutcome{candidates: cands, result: resultAmbiguous}, errAmbiguous
+	// 无精确命中:模糊命中一律走候选确认(含唯一模糊命中),不自动解密。
+	if len(fuzzy) > 0 {
+		return ambiguousOutcome(fuzzy)
 	}
+
+	return resolveOutcome{result: resultNotFound}, errNotFound
+}
+
+// ambiguousOutcome 把一组命中渲染成脱敏候选信封(422 ambiguous),不含明文。
+func ambiguousOutcome(hits []*aliasModel) (resolveOutcome, error) {
+	cands := make([]secretView, 0, len(hits))
+	for _, m := range hits {
+		cands = append(cands, toView(m))
+	}
+	return resolveOutcome{candidates: cands, result: resultAmbiguous}, errAmbiguous
 }
 
 // finishHit 对唯一命中解密,成功则 best-effort 回写 last_used_at。
-func (s *service) finishHit(m *aliasModel) (resolveOutcome, error) {
+// ownerUID 透传给 touchLastUsed,使回写也带 owner 限定(defense-in-depth,
+// 与其它 accessor 的 owner 限定一致)。
+func (s *service) finishHit(ownerUID string, m *aliasModel) (resolveOutcome, error) {
 	plaintext, err := s.enc.decrypt(m.CipherText)
 	if err != nil {
 		return resolveOutcome{secretID: m.SecretID, result: resultDecryptFail}, err
 	}
 	// best-effort 回写「最后使用时间」:失败仅记日志,不影响 resolve 返回明文。
 	// touchLastUsed 内部已避免污染 updated_at。
-	if terr := s.store.touchLastUsed(m.SecretID); terr != nil {
+	if terr := s.store.touchLastUsed(ownerUID, m.SecretID); terr != nil {
 		log.Warn("usersecret 回写 last_used_at 失败",
 			zap.String("secret_id", m.SecretID), zap.Error(terr))
 	}
