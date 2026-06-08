@@ -73,7 +73,7 @@
 | 401 | `err.server.usersecret.unauthorized` | CRUD 未登录；resolve bot 凭证无效 / 认不出合法 owner |
 | 404 | `err.server.usersecret.not_found` | CRUD 目标 `secret_id` 不存在（非本 owner 即视为不存在）；**resolve 解引用零命中** |
 | 409 | `err.server.usersecret.duplicate_name` | create/rename 时归一化别名撞已有别名（**换名**提示） |
-| 422 | `err.server.usersecret.ambiguous` | **resolve 歧义**：匹配到多个候选，返候选列表让上层消歧（见下） |
+| 422 | `err.server.usersecret.ambiguous` | **resolve 需确认**：任何 pinyin/模糊命中（**含恰好 1 个候选**），返脱敏候选列表让上层显式确认（见下）。仅 exact 唯一命中才直接返明文 |
 | 429 | （平台限流，非本模块 errcode） | CRUD 路由挂 `SharedUIDRateLimiter`（per-login-user 桶）；resolve 挂 per-IP `StrictIPRateLimitMiddleware`（tag=`usersecret_resolve`，默认 50rps/burst200）。瞬时突发被限流时返回，下游应退避重试 |
 | 500 | `err.server.usersecret.resolve_failed` | 解引用失败（密文解密/认证失败等内部异常）；主密钥未就绪 |
 
@@ -152,21 +152,31 @@ Header：`Authorization: Bearer bf_<bot_token>`
 请求：
 
 ```json
-{ "query": "克劳德密钥" }
+{ "query": "我的米要" }
 ```
 
-- `query` 可为 `secret_id`（精确直查）或 `display_name`（精确 + 拼音/模糊匹配）。
+- `query` 可为 `secret_id`（精确直查）或 `display_name`（精确匹配 + 拼音/模糊匹配）。
+  上例「我的米要」是「我的密钥」的同写法同音变体，会走 pinyin 模糊命中（返 `422` 候选确认，
+  非直接返明文，见下）。
 
 **解析规则**：
 
-1. `query` 命中本 owner 某 `secret_id` → 唯一命中，返明文。
+1. `query` 命中本 owner 某 `secret_id` → **exact 唯一命中**，返明文。
 2. 否则按名称匹配：
-   - 归一化（去空格/小写/简繁）**精确命中** 优先；精确唯一 → 返明文，精确多条 → 歧义。
-   - 无精确命中时用**拼音/模糊命中**（语音场景：「克劳德密钥」「我的米要」等可命中
-     同写法/同音变体）；唯一 → 返明文，多条 → 歧义。
+   - **exact 命中**（归一化 display_name 完全相等：去空格 + 折叠大小写 + 简繁归一）：
+     唯一 → **返 200 明文**；多条 → `422` 候选确认。
+   - 无 exact 命中时用**拼音/模糊命中**（语音场景：同写法/同音变体，如「我的米要」命中
+     「我的密钥」）：**无论命中 1 条还是多条，一律返 `422` 候选确认，不自动返明文。**
 3. 零命中 → `404`。
 
-**唯一命中** 响应 `200`：
+> **设计说明（security，P1）**：fuzzy/pinyin 命中**即使恰好只有 1 个候选**也不自动返明文。
+> 模糊档用双向 pinyin 子串命中、无最小长度约束，短/部分 query（如 `pen` 命中 `openai`）会
+> 「唯一命中」一把用户**并未指定**的密钥，自动解密就成了**静默错选**——channel 插件会拿错 key
+> 去外部认证。故只有 **exact 唯一命中**（secret_id 直查 或 归一化 display_name 完全相等）足够
+> 确定到能自动解密；任何 fuzzy 命中一律降级为 `422` 候选，由上层显式确认后用具体 `secret_id`
+> 再 resolve。这样既保留语音 UX，又堵死静默错选明文。
+
+**exact 唯一命中** 响应 `200`：
 
 ```json
 { "secret_id": "a1b2c3d4-...", "value": "sk-xxxxxxxx" }
@@ -174,7 +184,8 @@ Header：`Authorization: Bearer bf_<bot_token>`
 
 > `value` 是明文，仅此一处返回，直达调用方，不进任何日志/审计。
 
-**歧义** 响应 `422`（候选列表走统一 i18n 错误信封的 `error.details.candidates`，**不返明文**）：
+**候选确认** 响应 `422`（候选列表走统一 i18n 错误信封的 `error.details.candidates`，**不返明文**）。
+触发条件：exact 命中多条，**或任何 pinyin/模糊命中（含恰好 1 个候选）**：
 
 ```json
 {
@@ -194,7 +205,8 @@ Header：`Authorization: Bearer bf_<bot_token>`
 ```
 
 上层（channel 插件）据 `error.details.candidates` 让用户/agent 选定后，用具体
-`secret_id` 重新 `resolve` 拿明文。
+`secret_id` 重新 `resolve` 拿明文。**注意：只有一个候选时也必须走这一步确认**——
+fuzzy 唯一命中不代表用户指定了它，须显式确认。
 
 **未命中** 响应 `404` `err.server.usersecret.not_found`。
 **解引用失败** 响应 `500` `err.server.usersecret.resolve_failed`。
@@ -213,9 +225,9 @@ Header：`Authorization: Bearer bf_<bot_token>`
 
 | `result` | 含义 |
 |---|---|
-| `ok` | 唯一命中、解密成功 |
+| `ok` | exact 唯一命中、解密成功 |
 | `not_found` | 真实零命中（owner 名下无此别名/secret_id） |
-| `ambiguous` | 匹配到多个候选，返候选列表消歧 |
+| `ambiguous` | exact 命中多条，**或任何 fuzzy/pinyin 命中（含恰好 1 个候选）**，返候选列表待确认 |
 | `request_invalid` | 已鉴权 caller 发了坏请求（空/无法解析的 body、空 query） |
 | `unauthorized` | bot 凭证缺失/非法（鉴权失败也留痕，越权探测线索） |
 | `decrypt_fail` | 命中但密文解密失败 |
@@ -241,6 +253,21 @@ Header：`Authorization: Bearer bf_<bot_token>`
 - write-secret 工具：调 CRUD `POST/PUT`（以用户身份），把用户给的 key 存进来。
 - use-time resolve：用 bot 自己的 `bf_` token 调 `POST /v1/bot/secrets/resolve`，
   入参用户口述的别名 `query`。
-- 处理三态：`200` 唯一命中拿 `value` 写目标位置；`422` 歧义按 `candidates` 消歧后
-  用 `secret_id` 再 resolve；`404` 提示「没有这个 key」。
+- 处理三态：
+  - `200` = **exact 唯一命中**（secret_id 直查 或 归一化 display_name 完全相等）→ 拿 `value` 写目标位置。**这是唯一拿明文的路径**。
+  - `422` = **候选确认**（exact 多条，**或任何 fuzzy/pinyin 命中——哪怕 `candidates` 只有 1 个**）→ 按 `error.details.candidates` 让用户/agent 显式选定，再用具体 `secret_id` 重新 resolve。**不要把 `candidates` 长度为 1 当作命中直接用，必须确认。**
+  - `404` = 零命中 → 提示「没有这个 key」。
 - 明文 `value` 落到指定位置后即用即弃，**不要回写进 Octo 任何消息/上下文**。
+
+> ⚠️ 契约变更（对齐 PR#301 代码）：旧文档曾写「唯一 fuzzy/pinyin 命中返 200 明文」。
+> **该承诺已作废。** 现在只有 exact 唯一命中返 200；任何 fuzzy/pinyin 命中（含唯一）一律返
+> 422 候选确认。详见上文「解析规则」的 security 设计说明。
+
+#### 已知限制：英文品牌别名的语音音译跨形态匹配
+
+- pinyin 模糊匹配把英文留 ASCII、汉字转拼音。因此**英文别名（如存的 `claude`）与其中文音译
+  说法（如「克劳德」）算出的 pinyin 键不同，无法跨形态互相命中**。
+- 实践约束：**英文品牌别名需用其英文拼写、或已存别名的同写法变体来查询**（如存「Claude 密钥」，
+  用「claude 密钥」「claude密钥」可命中；用纯中文音译「克劳德密钥」**不保证**命中）。
+- 英文 ↔ 中文音译（`claude` ↔ 克劳德）的跨形态匹配**当前不支持，属已知限制**，留待后续迭代
+  （需要单独的品牌名→音译映射，见 follow-up）。当前 resolve 行为不会因此改动。
