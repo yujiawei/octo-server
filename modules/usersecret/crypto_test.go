@@ -33,7 +33,13 @@ func TestEncryptDecrypt_RoundTrip(t *testing.T) {
 		ct, err := enc.encrypt(pt)
 		require.NoError(t, err)
 		assert.True(t, strings.HasPrefix(string(ct), cipherVersionPrefix), "密文需带版本前缀")
-		assert.NotContains(t, string(ct), pt, "密文不得含明文")
+		// 「密文不含明文」只对足够长的明文断言才有意义:单/双字节明文(如 "a")会与
+		// 随机 nonce/密文字节以 ~1/256 概率偶然「撞」出同一字节,使 NotContains 变成
+		// flaky(约 10% 误失败)。≥4 字节的连续子串偶然碰撞概率 ≤256^-4,可忽略,
+		// 才是真正能体现「密文不回显明文」的检查。
+		if len([]byte(pt)) >= 4 {
+			assert.NotContains(t, string(ct), pt, "密文不得含明文")
+		}
 
 		got, err := enc.decrypt(ct)
 		require.NoError(t, err)
