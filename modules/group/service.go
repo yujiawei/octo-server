@@ -66,6 +66,10 @@ type IService interface {
 	GetMember(groupNo, uid string) (*MemberResp, error)
 	// 获取黑名单成员uid集合
 	GetBlacklistMemberUIDs(groupNo string) ([]string, error)
+	// GetSubscribableMemberUIDs 返回可订阅成员 uid 集合（status=normal AND is_deleted=0，
+	// 即排除被拉黑成员），供子区/父群的 IM Subscribers 数据源使用。与 GetMembers
+	// （“所有非删除成员”）语义不同，不可互换。
+	GetSubscribableMemberUIDs(groupNo string) ([]string, error)
 	// 查询管理员成员uid列表（包括创建者）
 	GetMemberUIDsOfManager(groupNo string) ([]string, error)
 	// 是否是创建者或管理者
@@ -512,6 +516,17 @@ func (s *Service) GetMember(groupNo, uid string) (*MemberResp, error) {
 
 func (s *Service) GetBlacklistMemberUIDs(groupNo string) ([]string, error) {
 	uids, err := s.db.queryBlacklistMemberUIDsWithGroupNo(groupNo)
+	if err != nil {
+		return nil, err
+	}
+	return uids, nil
+}
+
+// GetSubscribableMemberUIDs 返回可订阅成员 uid（status=normal AND is_deleted=0）。
+// 子区/父群 IM Subscribers 数据源专用：排除被拉黑成员，避免 WuKongIM 重载订阅时
+// 把黑名单用户加回订阅列表（YUJ-4185 P0-2）。
+func (s *Service) GetSubscribableMemberUIDs(groupNo string) ([]string, error) {
+	uids, err := s.db.querySubscribableMemberUIDsWithGroupNo(groupNo)
 	if err != nil {
 		return nil, err
 	}

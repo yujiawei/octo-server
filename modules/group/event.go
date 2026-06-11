@@ -49,9 +49,10 @@ func (g *Group) handleGroupDisbandEvent(data []byte, commit config.EventCommit) 
 		})),
 	})
 	if err != nil {
+		// YUJ-4185 P1-1：解散提示是装饰性通知，best-effort 即可。绝不能因它失败就
+		// return —— 否则后续频道删除 / 子区订阅清理被跳过，群处于“半解散”状态：
+		// 成员仍订阅父群 / 子区频道，继续收消息（越权读）。只记日志，继续清理。
 		g.Error("发送解散群消息错误", zap.Error(err))
-		commit(err)
-		return
 	}
 	// 删除channel
 	err = g.ctx.IMDelChannel(&config.ChannelDeleteReq{
@@ -62,6 +63,39 @@ func (g *Group) handleGroupDisbandEvent(data []byte, commit config.EventCommit) 
 		g.Error("删除IM频道失败", zap.Error(err))
 		commit(err)
 		return
+	}
+	// YUJ-4185 P1-1：群解散必须连同所有子区(CommunityTopic)频道一起销毁，否则子区的
+	// IM 频道仍存活、成员订阅未摘 → 解散后成员仍能通过子区频道收/拉历史消息（越权读）。
+	// 直接 IMDelChannel 每个非删除子区频道（频道删除即断所有订阅），再清成员对子区的
+	// 置顶 / 会话扩展。best-effort：单个子区清理失败只记日志，不阻塞父群解散。
+	threadShortIDs, threadErr := queryThreadShortIDsForCleanup(g.ctx, req.GroupNo)
+	if threadErr != nil {
+		g.Error("查询群子区失败（解散清理）", zap.Error(threadErr), zap.String("groupNo", req.GroupNo))
+	}
+	for _, shortID := range threadShortIDs {
+		threadChannelID := req.GroupNo + "____" + shortID
+		if delErr := g.ctx.IMDelChannel(&config.ChannelDeleteReq{
+			ChannelID:   threadChannelID,
+			ChannelType: common.ChannelTypeCommunityTopic.Uint8(),
+		}); delErr != nil {
+			g.Error("删除子区IM频道失败（解散清理）", zap.Error(delErr), zap.String("channelID", threadChannelID))
+		}
+		user.RemovePinnedForChannel(threadChannelID, common.ChannelTypeCommunityTopic.Uint8())
+		conversation_ext.RemoveConvExtForChannel(threadChannelID, common.ChannelTypeCommunityTopic.Uint8())
+	}
+	// 删除该群所有子区的成员 / 个人设置行，避免解散后残留脏数据（频道已销毁，
+	// 这些行不再有意义）。best-effort：失败只记日志。
+	if len(threadShortIDs) > 0 {
+		if _, delErr := g.ctx.DB().DeleteFrom("thread_member").
+			Where("thread_id IN (SELECT id FROM thread WHERE group_no=?)", req.GroupNo).
+			Exec(); delErr != nil {
+			g.Error("删除子区成员记录失败（解散清理）", zap.Error(delErr), zap.String("groupNo", req.GroupNo))
+		}
+		if _, delErr := g.ctx.DB().DeleteFrom("thread_setting").
+			Where("group_no=?", req.GroupNo).
+			Exec(); delErr != nil {
+			g.Error("删除子区个人设置失败（解散清理）", zap.Error(delErr), zap.String("groupNo", req.GroupNo))
+		}
 	}
 	// 清理所有用户对该群的置顶
 	user.RemovePinnedForChannel(req.GroupNo, common.ChannelTypeGroup.Uint8())
@@ -621,6 +655,13 @@ func (g *Group) handleOrgOrDeptEmployeeUpdate(data []byte, commit config.EventCo
 	}
 
 	if len(deleteMembers) > 0 {
+		// YUJ-4185 P1-2：组织/部门结构更新删人也要摘子区订阅，与已修的
+		// handleOrgEmployeeExit / 踢人 / 退群 对称。按 groupNo 取 SpaceID 供 helper
+		// 清理 Space 维度的 pinned / 会话扩展。
+		spaceIDByGroupNo := make(map[string]string, len(groups))
+		for _, grp := range groups {
+			spaceIDByGroupNo[grp.GroupNo] = grp.SpaceID
+		}
 		for _, m := range deleteMembers {
 			members := make([]string, 0)
 			for index := range m.Members {
@@ -635,6 +676,11 @@ func (g *Group) handleOrgOrDeptEmployeeUpdate(data []byte, commit config.EventCo
 				g.Error("调用IM的订阅接口失败！", zap.Error(err))
 				commit(err)
 				return
+			}
+			// Issue #27 同型：组织/部门删人必须摘除该 uid 在群内所有非删除子区的
+			// IM 订阅（复用统一 helper，best-effort）。
+			for _, uid := range members {
+				g.removeUserFromGroupThreads(m.GroupNo, uid, spaceIDByGroupNo[m.GroupNo])
 			}
 			// 发送群成员更新命令
 			err = g.ctx.SendCMD(config.MsgCMDReq{

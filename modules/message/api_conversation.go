@@ -641,26 +641,40 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 
 	syncUserConversationResps := make([]*SyncUserConversationResp, 0, len(conversations))
 	userKey := loginUID
+	// YUJ-4185 P0-3：把 groupVailds（ExistMembers 返回的“当前仍是成员”的群集合）
+	// 转成 set，既给 GROUP 分支 O(1) 校验，也给子区分支补“父群成员”校验用。
+	// groupNos 构造时已把每个子区的 parent groupNo 一并加入（见上文 addGroupNo），
+	// 所以 ExistMembers 的结果天然覆盖父群。
+	groupVaildSet := make(map[string]struct{}, len(groupVailds))
+	for _, gv := range groupVailds {
+		groupVaildSet[gv] = struct{}{}
+	}
 	if len(conversations) > 0 {
 		for _, conversation := range conversations {
 
 			if conversation.ChannelType == common.ChannelTypeGroup.Uint8() {
-				vaild := false
-				for _, groupVaild := range groupVailds {
-					if groupVaild == conversation.ChannelID {
-						vaild = true
-						break
-					}
-				}
-				if !vaild { // 无效群则跳过
+				if _, vaild := groupVaildSet[conversation.ChannelID]; !vaild { // 无效群则跳过
 					continue
 				}
 			}
 
-			if conversation.ChannelType == common.ChannelTypeCommunityTopic.Uint8() && threadFilterEnabled {
-				if shortID, ok := threadChannelShortIDMap[conversation.ChannelID]; ok {
-					if _, active := activeThreadShortIDs[shortID]; !active {
-						continue
+			if conversation.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
+				// YUJ-4185 P0-3：子区可见性必须校验调用者仍是父群成员（fail-closed）。
+				// 之前只按 activeThreadShortIDs 过滤“子区是否存活”，不校验成员身份，
+				// 被移除者的会话列表仍能看到子区并据此拉历史（越权读 P0）。
+				// parent groupNo 在 groupNos 里，ExistMembers 已覆盖；解析失败也 skip。
+				parentNo, _, perr := thread.ParseChannelID(conversation.ChannelID)
+				if perr != nil {
+					continue
+				}
+				if _, member := groupVaildSet[parentNo]; !member {
+					continue
+				}
+				if threadFilterEnabled {
+					if shortID, ok := threadChannelShortIDMap[conversation.ChannelID]; ok {
+						if _, active := activeThreadShortIDs[shortID]; !active {
+							continue
+						}
 					}
 				}
 			}

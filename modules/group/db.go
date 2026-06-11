@@ -422,6 +422,24 @@ func (d *DB) queryBlacklistMemberUIDsWithGroupNo(groupNo string) ([]string, erro
 	return uids, err
 }
 
+// querySubscribableMemberUIDsWithGroupNo 返回某群「可订阅」成员 uid 集合：
+// is_deleted=0 AND status=GroupMemberStatusNormal，即排除被拉黑（status=blacklist）的成员。
+// 子区(channel_type=CommunityTopic) 实时下发的权威订阅源就读这份列表（thread/1module.go
+// Subscribers 回调），WuKongIM 缓存它做 WebSocket push。被拉黑成员若仍出现在这里，即使
+// 上层主动 IMRemoveSubscriber，下一次 WuKongIM 重载 Subscribers 仍会把他加回去 → 拉黑
+// 不自愈（YUJ-4185 P0-2 根因）。
+//
+// 与 queryMembersWithGroupNo（GetMembers，多处复用、语义是“所有非删除成员”）分开，
+// 不改动既有调用方语义；只有需要“能收实时推送的成员”的订阅数据源走这里。
+func (d *DB) querySubscribableMemberUIDsWithGroupNo(groupNo string) ([]string, error) {
+	var uids []string
+	_, err := d.session.Select("group_member.uid").
+		From("group_member").
+		Where("group_member.group_no=? and group_member.is_deleted=0 and status=?", groupNo, common.GroupMemberStatusNormal).
+		Load(&uids)
+	return uids, err
+}
+
 // 查询在线成员数量
 func (d *DB) queryMemberOnlineCount(groupNo string) (int64, error) {
 	var count int64
