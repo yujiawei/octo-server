@@ -466,6 +466,7 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	groupMap := map[string]*group.GroupResp{}                   // 群详情
 	conversationExtraMap := map[string]*conversationExtraResp{} // 最近会话扩展
 	groupVailds := make([]string, 0, len(conversations))        // 有效群
+	groupActives := make([]string, 0, len(conversations))       // 活跃群（排除黑名单）
 	activeThreadShortIDs := make(map[string]struct{})           // 有效子区
 
 	// ---------- 是否在群内 ----------
@@ -473,6 +474,15 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 		groupVailds, err = co.groupService.ExistMembers(groupNos, loginUID)
 		if err != nil {
 			co.Error("查询有效群失败！", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return
+		}
+		// CR 整改：子区(CommunityTopic)父群成员校验必须排除黑名单，否则被拉黑
+		// (status=Blacklist、is_deleted=0) 用户仍能在会话列表看到子区并据此拉历史
+		// （越权读）。GROUP 分支沿用 groupVailds 保持既有语义不变。
+		groupActives, err = co.groupService.ExistMembersActive(groupNos, loginUID)
+		if err != nil {
+			co.Error("查询活跃群失败！", zap.Error(err))
 			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
 			return
 		}
@@ -649,6 +659,11 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 	for _, gv := range groupVailds {
 		groupVaildSet[gv] = struct{}{}
 	}
+	// CR 整改：子区父群成员校验走 active-only 集合（排除黑名单）。
+	groupActiveSet := make(map[string]struct{}, len(groupActives))
+	for _, ga := range groupActives {
+		groupActiveSet[ga] = struct{}{}
+	}
 	if len(conversations) > 0 {
 		for _, conversation := range conversations {
 
@@ -662,12 +677,14 @@ func (co *Conversation) syncUserConversation(c *wkhttp.Context) {
 				// YUJ-4185 P0-3：子区可见性必须校验调用者仍是父群成员（fail-closed）。
 				// 之前只按 activeThreadShortIDs 过滤“子区是否存活”，不校验成员身份，
 				// 被移除者的会话列表仍能看到子区并据此拉历史（越权读 P0）。
-				// parent groupNo 在 groupNos 里，ExistMembers 已覆盖；解析失败也 skip。
+				// parent groupNo 在 groupNos 里，ExistMembersActive 已覆盖；解析失败也 skip。
+				// CR 整改：用 groupActiveSet（排除黑名单）而非 groupVaildSet，否则被拉黑
+				// 用户仍能透出子区。
 				parentNo, _, perr := thread.ParseChannelID(conversation.ChannelID)
 				if perr != nil {
 					continue
 				}
-				if _, member := groupVaildSet[parentNo]; !member {
+				if _, member := groupActiveSet[parentNo]; !member {
 					continue
 				}
 				if threadFilterEnabled {

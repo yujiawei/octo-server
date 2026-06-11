@@ -193,6 +193,20 @@ func (d *DB) existMembers(groupNos []string, uid string) ([]string, error) {
 	return results, err
 }
 
+// existMembersActive 是 existMembers 的白名单（fail closed）批量变体：在 is_deleted=0
+// 之外额外要求 status=GroupMemberStatusNormal，即把被拉黑（status=Blacklist）以及未来
+// 可能新增的非正常状态成员从结果里排除。
+// 与单群的 ExistMemberActive 语义一致，专供「子区(CommunityTopic)读/发门禁」这类绕过
+// IM datasource、直查本地分表的批量校验使用，避免被拉黑用户仍出现在“仍是成员”的集合里
+// 进而越权读子区历史/会话（YUJ-4185 CR 整改）。
+func (d *DB) existMembersActive(groupNos []string, uid string) ([]string, error) {
+	var results []string
+	_, err := d.session.Select("group_no").From("group_member").
+		Where("group_no in ? and uid=? and is_deleted=0 and status=?",
+			groupNos, uid, common.GroupMemberStatusNormal).Load(&results)
+	return results, err
+}
+
 // ExistMemberDelete 存在已删除的群成员数据
 func (d *DB) ExistMemberDelete(uid string, groupNo string) (bool, error) {
 	var count int64

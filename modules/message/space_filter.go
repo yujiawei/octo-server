@@ -144,7 +144,9 @@ func filterThreadConvsByParentMembership[T any](
 	}
 	memberParents := make(map[string]struct{})
 	if len(parentNos) > 0 {
-		memberNos, err := groupService.ExistMembers(parentNos, loginUID)
+		// CR 整改：用 ExistMembersActive（排除黑名单）而非 ExistMembers，否则被拉黑
+		// (status=Blacklist、is_deleted=0) 用户的子区会话仍会透出。
+		memberNos, err := groupService.ExistMembersActive(parentNos, loginUID)
 		if err != nil {
 			// fail-closed：无法确认成员身份时丢弃全部子区会话。
 			log.Warn("子区父群成员校验失败，按 fail-closed 丢弃子区会话", zap.Error(err))

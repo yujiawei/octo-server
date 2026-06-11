@@ -283,9 +283,9 @@ func (sb *Sidebar) Sync(c *wkhttp.Context) {
 	}
 	// YUJ-4185 P1-4：子区(CommunityTopic)条目必须按父群成员身份过滤（fail-closed）。
 	// FilterRawConversationsBySpace 只在 spaceID != "" 时跑，且历史上它只比 space
-	// 不校验成员；这里对所有路径（含无 X-Space-ID 的请求）显式补父群 ExistMember，
-	// 避免被移除者在 sidebar 仍看到子区入口（越权读）。DB-only thread ext 行另在
-	// 下方 2a.6 单独过滤。
+	// 不校验成员；这里对所有路径（含无 X-Space-ID 的请求）显式补父群 ExistMembersActive
+	// （排除黑名单），避免被移除/拉黑者在 sidebar 仍看到子区入口（越权读）。DB-only
+	// thread ext 行另在下方 2a.6 单独过滤。
 	conversations = filterThreadConvsByParentMembership(
 		conversations,
 		func(c *config.SyncUserConversationResp) string { return c.ChannelID },
@@ -875,14 +875,16 @@ func (sb *Sidebar) filterThreadExtsBySpace(rows []*convext.Model, spaceID, login
 
 // filterThreadExtsByParentMembership 剔除“调用者已不是父群成员”的 DB-only thread ext 行。
 // YUJ-4185 P1-4：子区无独立成员表，权威成员身份在父群；被踢/退群/拉黑后 thread ext 行
-// 仍可能残留，必须按父群 ExistMembers 校验，避免子区从 follow tab 越权透出。
+// 仍可能残留，必须按父群 ExistMembersActive 校验，避免子区从 follow tab 越权透出。
+// CR 整改：用 ExistMembersActive（status=Normal 白名单）而非 ExistMembers，否则被拉黑
+// (status=Blacklist、is_deleted=0) 用户仍能从 follow tab 看到子区。
 // fail-closed：父群成员查询失败时返回 error，调用方 follow tab 整体退避。
 func (sb *Sidebar) filterThreadExtsByParentMembership(rows []*convext.Model, loginUID string) ([]*convext.Model, error) {
 	parentNos := uniqueThreadParentGroupNos(rows)
 	if len(parentNos) == 0 {
 		return rows, nil
 	}
-	memberNos, err := sb.groupService.ExistMembers(parentNos, loginUID)
+	memberNos, err := sb.groupService.ExistMembersActive(parentNos, loginUID)
 	if err != nil {
 		return nil, fmt.Errorf("filter thread ext by parent membership: %w", err)
 	}

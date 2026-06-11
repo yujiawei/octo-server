@@ -10,15 +10,15 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// fakeMembershipGroupService 是 group.IService 的最小替身，只实现 ExistMembers，
-// 用来验证 YUJ-4185 P0-3 / P1-4 的子区父群成员过滤。
+// fakeMembershipGroupService 是 group.IService 的最小替身，只实现 ExistMembersActive，
+// 用来验证 YUJ-4185 P0-3 / P1-4 的子区父群成员过滤（active-only，排除黑名单）。
 type fakeMembershipGroupService struct {
 	group.IService
-	memberOf map[string]bool // groupNo -> 当前 uid 是否仍是成员
+	memberOf map[string]bool // groupNo -> 当前 uid 是否仍是活跃成员（非黑名单）
 	err      error
 }
 
-func (f *fakeMembershipGroupService) ExistMembers(groupNos []string, uid string) ([]string, error) {
+func (f *fakeMembershipGroupService) ExistMembersActive(groupNos []string, uid string) ([]string, error) {
 	if f.err != nil {
 		return nil, f.err
 	}

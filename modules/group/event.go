@@ -25,6 +25,14 @@ func (g *Group) handleGroupDisbandEvent(data []byte, commit config.EventCommit) 
 		commit(nil)
 		return
 	}
+	if req.GroupNo == "" {
+		// 空 groupNo 守卫：对齐 handleOrgEmployeeExit。空值会让下游清理退化为
+		// 全表/无目标的危险 SQL（如 thread_member 子查询、IMDelChannel 空频道），
+		// best-effort 提交后直接 return。
+		g.Error("解散群groupNo不能为空", zap.Error(errors.New("解散群groupNo不能为空")))
+		commit(nil)
+		return
+	}
 
 	content := "{0}已解散该群聊"
 	err = g.ctx.SendMessage(&config.MsgSendReq{
@@ -85,17 +93,20 @@ func (g *Group) handleGroupDisbandEvent(data []byte, commit config.EventCommit) 
 	}
 	// 删除该群所有子区的成员 / 个人设置行，避免解散后残留脏数据（频道已销毁，
 	// 这些行不再有意义）。best-effort：失败只记日志。
-	if len(threadShortIDs) > 0 {
-		if _, delErr := g.ctx.DB().DeleteFrom("thread_member").
-			Where("thread_id IN (SELECT id FROM thread WHERE group_no=?)", req.GroupNo).
-			Exec(); delErr != nil {
-			g.Error("删除子区成员记录失败（解散清理）", zap.Error(delErr), zap.String("groupNo", req.GroupNo))
-		}
-		if _, delErr := g.ctx.DB().DeleteFrom("thread_setting").
-			Where("group_no=?", req.GroupNo).
-			Exec(); delErr != nil {
-			g.Error("删除子区个人设置失败（解散清理）", zap.Error(delErr), zap.String("groupNo", req.GroupNo))
-		}
+	// 不 gate 在 len(threadShortIDs) > 0 上：对齐 removeUserFromGroupThreadsCleanup
+	// 的“不 gate 扫残留”约定 —— 用户可能只 mute 过子区而从未 JoinThread（Issue #331），
+	// 或子区已被删除（不在 queryThreadShortIDsForCleanup 的存活集合里）但 thread_member /
+	// thread_setting 仍有残留行。这两条 DELETE 按 group_no 直删，把残留一并清掉。
+	// req.GroupNo 非空已在函数开头守卫，子查询不会退化为全表。
+	if _, delErr := g.ctx.DB().DeleteFrom("thread_member").
+		Where("thread_id IN (SELECT id FROM thread WHERE group_no=?)", req.GroupNo).
+		Exec(); delErr != nil {
+		g.Error("删除子区成员记录失败（解散清理）", zap.Error(delErr), zap.String("groupNo", req.GroupNo))
+	}
+	if _, delErr := g.ctx.DB().DeleteFrom("thread_setting").
+		Where("group_no=?", req.GroupNo).
+		Exec(); delErr != nil {
+		g.Error("删除子区个人设置失败（解散清理）", zap.Error(delErr), zap.String("groupNo", req.GroupNo))
 	}
 	// 清理所有用户对该群的置顶
 	user.RemovePinnedForChannel(req.GroupNo, common.ChannelTypeGroup.Uint8())
