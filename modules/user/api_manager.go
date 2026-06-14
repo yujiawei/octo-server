@@ -10,6 +10,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-lib/common"
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/cache"
 	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
 	common2 "github.com/Mininglamp-OSS/octo-server/modules/common"
 	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
@@ -36,6 +37,7 @@ type Manager struct {
 	friendDB      *friendDB
 	onlineService IOnlineService
 	commonService common2.IService
+	roleService   *RoleService
 }
 
 // NewManager NewManager
@@ -50,6 +52,7 @@ func NewManager(ctx *config.Context) *Manager {
 		userSettingDB: NewSettingDB(ctx.DB()),
 		onlineService: NewOnlineService(ctx),
 		commonService: common2.NewService(ctx),
+		roleService:   NewRoleService(NewDB(ctx), ctx.Cache()),
 	}
 	m.createManagerAccount()
 	return m
@@ -328,21 +331,72 @@ func (m *Manager) deleteAdminUsers(c *wkhttp.Context) {
 		respondUserError(c, errcode.ErrUserStoreFailed)
 		return
 	}
-	oldToken, err := m.ctx.Cache().Get(fmt.Sprintf("%s%d%s", m.ctx.GetConfig().Cache.UIDTokenCachePrefix, config.Web, user.UID))
-	if err != nil {
-		m.Error("获取旧token错误", zap.Error(err))
+	// 先失效角色热缓存，再撤销 token。DB 里该 uid 已删（权威源 role 已为空），所以
+	// 只要这里清掉 user_role:{uid} 热缓存，即便下面的 token 撤销失败、某个 token 残
+	// 留，下一请求经 RoleResolver 也会从 DB 解析出"无系统角色"而被拒。顺序反过来
+	// （先撤 token，失败就 return）会跳过 Invalidate，让旧 role 缓存存活到 TTL，
+	// 与残留 token 叠加成提权窗口——正是本 PR 要消除的（PR #364 review）。
+	m.roleService.Invalidate(user.UID)
+	// 撤销该管理员在所有设备端（APP/Web/PC）的登录态，而不只是 Web。尽力删除每个端
+	// （不在首个错误就中断），最大化吊销面；任一失败仍向调用方报错以便排查。
+	if err := m.revokeAllDeviceTokens(user.UID); err != nil {
+		m.Error("清除管理员token数据错误", zap.Error(err), zap.String("uid", user.UID))
 		respondUserError(c, errcode.ErrUserTokenCacheFailed)
 		return
 	}
-	if oldToken != "" {
-		err = m.ctx.Cache().Delete(m.ctx.GetConfig().Cache.TokenCachePrefix + oldToken)
+	c.ResponseOK()
+}
+
+// deviceTokenRevokeFailure pairs a device flag with the error from trying to
+// revoke its session, so the caller can log per-device outcomes.
+type deviceTokenRevokeFailure struct {
+	flag config.DeviceFlag
+	err  error
+}
+
+// revokeDeviceTokensInCache is the cache-only, injectable core of
+// revokeAllDeviceTokens (factored out so it can be unit-tested with a fake
+// cache). It removes uid's token payload + UIDToken reverse mapping for every
+// device flag. best-effort: it does NOT abort on the first error — it attempts
+// every flag and returns one failure entry per error, so a Redis hiccup on one
+// device cannot strand the others.
+func revokeDeviceTokensInCache(c cache.Cache, uidTokenPrefix, tokenPrefix, uid string) []deviceTokenRevokeFailure {
+	var failures []deviceTokenRevokeFailure
+	for _, flag := range []config.DeviceFlag{config.APP, config.Web, config.PC} {
+		uidKey := fmt.Sprintf("%s%d%s", uidTokenPrefix, flag, uid)
+		token, err := c.Get(uidKey)
 		if err != nil {
-			m.Error("清除旧token数据错误", zap.Error(err))
-			respondUserError(c, errcode.ErrUserTokenCacheFailed)
-			return
+			failures = append(failures, deviceTokenRevokeFailure{flag, err})
+			continue
+		}
+		if token == "" {
+			continue
+		}
+		if err := c.Delete(tokenPrefix + token); err != nil {
+			failures = append(failures, deviceTokenRevokeFailure{flag, err})
+			continue
+		}
+		if err := c.Delete(uidKey); err != nil {
+			failures = append(failures, deviceTokenRevokeFailure{flag, err})
 		}
 	}
-	c.ResponseOK()
+	return failures
+}
+
+// revokeAllDeviceTokens 清除某 uid 在所有设备端（APP/Web/PC）的登录态：既删
+// token:{token} 让旧 token 立即失效，也删 UIDToken:{flag}{uid} 反查映射。
+// best-effort（见 revokeDeviceTokensInCache），逐端记日志，返回首个错误供调用方报错。
+func (m *Manager) revokeAllDeviceTokens(uid string) error {
+	cacheCfg := m.ctx.GetConfig().Cache
+	failures := revokeDeviceTokensInCache(m.ctx.Cache(), cacheCfg.UIDTokenCachePrefix, cacheCfg.TokenCachePrefix, uid)
+	var firstErr error
+	for _, f := range failures {
+		m.Error("撤销设备token失败", zap.Error(f.err), zap.String("uid", uid), zap.Uint8("device_flag", f.flag.Uint8()))
+		if firstErr == nil {
+			firstErr = f.err
+		}
+	}
+	return firstErr
 }
 
 // 查询管理员列表

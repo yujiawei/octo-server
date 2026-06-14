@@ -156,9 +156,23 @@ func toSpaceResp(m *managerSpaceModel) *managerSpaceResp {
 	}
 }
 
-// requireAdmin 统一的 admin/superAdmin 角色检查。未通过时已写入响应，调用方应立即返回。
+// requireAdmin 统一的 admin/superAdmin 角色检查，用于只读 / 低风险管理接口。
+// 未通过时已写入响应，调用方应立即返回。
 func (m *Manager) requireAdmin(c *wkhttp.Context) bool {
 	if err := c.CheckLoginRole(); err != nil {
+		httperr.ResponseErrorL(c, errcode.ErrSharedForbidden, nil, nil)
+		return false
+	}
+	return true
+}
+
+// requireSuperAdmin 仅放行 superAdmin，用于跨空间的高危/不可逆操作（强制解散、
+// 封禁/解禁、强制移除成员、修改成员角色含转让所有权）。这些操作此前只要求
+// admin，等于让"只读运营位"对任意空间拥有上帝模式；收敛到 superAdmin。
+// 返回 ErrSharedForbidden（与 requireAdmin 同一个通用 403），不暴露"需要更高
+// 角色"的具体原因，符合反枚举约定。未通过时已写入响应，调用方应立即返回。
+func (m *Manager) requireSuperAdmin(c *wkhttp.Context) bool {
+	if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
 		httperr.ResponseErrorL(c, errcode.ErrSharedForbidden, nil, nil)
 		return false
 	}
@@ -309,7 +323,7 @@ func (m *Manager) detail(c *wkhttp.Context) {
 
 // forceDisband 强制解散空间（同时移除全部成员）
 func (m *Manager) forceDisband(c *wkhttp.Context) {
-	if !m.requireAdmin(c) {
+	if !m.requireSuperAdmin(c) {
 		return
 	}
 	spaceId := c.Param("space_id")
@@ -401,7 +415,7 @@ func (m *Manager) members(c *wkhttp.Context) {
 // liftBan 封禁 / 解禁空间：status=1 恢复正常，status=2 置为封禁。
 // status=0（解散）请用 DELETE /space/:space_id。
 func (m *Manager) liftBan(c *wkhttp.Context) {
-	if !m.requireAdmin(c) {
+	if !m.requireSuperAdmin(c) {
 		return
 	}
 	spaceId := c.Param("space_id")
@@ -594,6 +608,10 @@ func (m *Manager) updateSpaceProfile(c *wkhttp.Context) {
 // addMembers 管理员强制添加成员（绕过 max_users 限制）。
 // 注意：此操作绕过了 executeJoinSpace 的业务副作用（SpaceMemberJoin 事件、预设群组），
 // 属于 low-level 管理操作；常规入口请走 /v1/space/join。
+//
+// 仍保持 requireAdmin（而非 requireSuperAdmin）是有意为之：强制"添加"是可逆的
+// （随后可移除），而强制解散/封禁/移除/改角色不可逆，故只把后者收紧到 superAdmin。
+// 若日后判定强制加人也需收紧，改成 requireSuperAdmin 即可。
 func (m *Manager) addMembers(c *wkhttp.Context) {
 	if !m.requireAdmin(c) {
 		return
@@ -650,7 +668,7 @@ func (m *Manager) addMembers(c *wkhttp.Context) {
 // 禁止移除 owner——实际检查在 managerDB.removeMembersForce 的事务内用
 // SELECT ... FOR UPDATE 原子完成，避免 handler 层 check 与 update 之间的 TOCTOU。
 func (m *Manager) removeMembers(c *wkhttp.Context) {
-	if !m.requireAdmin(c) {
+	if !m.requireSuperAdmin(c) {
 		return
 	}
 	spaceId := c.Param("space_id")
@@ -714,7 +732,7 @@ func normalizeUIDs(in []string) []string {
 
 // updateMemberRole 修改成员角色；role=2 时自动把当前 owner 降级为 admin。
 func (m *Manager) updateMemberRole(c *wkhttp.Context) {
-	if !m.requireAdmin(c) {
+	if !m.requireSuperAdmin(c) {
 		return
 	}
 	spaceId := c.Param("space_id")
