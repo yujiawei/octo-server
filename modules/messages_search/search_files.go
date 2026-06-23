@@ -72,7 +72,6 @@ func (h *Handler) searchFiles(c *wkhttp.Context) {
 	}
 
 	normID := normalizedChannelID(req.ChannelType, req.ChannelID, loginUID)
-	dsl := buildSearchFilesDSL(req, normID, spaceID)
 	isRelevance := req.Sort == "relevance"
 
 	initialAfter, ok := decodeCursorAsSearchAfter(h.cfg, req.Cursor, isRelevance)
@@ -87,6 +86,11 @@ func (h *Handler) searchFiles(c *wkhttp.Context) {
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), h.cfg.Timeout)
 	defer cancel()
+
+	dsl, analyzeErr := buildSearchFilesDSL(ctx, newOSIKSmartAnalyzer(client), h.cfg.StopwordStripEnabled, req, normID, spaceID)
+	if analyzeErr != nil {
+		h.Warn("messages_search: _analyze fallback (degraded keyword clause)", zap.Error(analyzeErr))
+	}
 
 	osQuery := func(searchAfter []any, size int) ([]*elastic.SearchHit, error) {
 		svc := client.Search().
@@ -129,19 +133,22 @@ func (h *Handler) searchFiles(c *wkhttp.Context) {
 	c.Response(envelope(items, hasMore, nextCursor))
 }
 
-func buildSearchFilesDSL(req SearchFilesReq, normChannelID, spaceID string) elastic.Query {
+func buildSearchFilesDSL(ctx context.Context, analyzer tokenAnalyzer, stopwordStripEnabled bool, req SearchFilesReq, normChannelID, spaceID string) (elastic.Query, error) {
 	b := elastic.NewBoolQuery()
 	applyChannelAndRevoked(b, normChannelID)
 	applySpaceIDScope(b, req.ChannelType, spaceID)
 	b.Filter(elastic.NewTermQuery("payload.type", payloadTypeFile))
 	addCommonFilters(b, req.Filters)
+	var analyzeErr error
 	if req.Keyword != "" {
-		b.Must(elastic.NewMultiMatchQuery(req.Keyword,
+		clause, err := buildKeywordClauseGated(ctx, analyzer, stopwordStripEnabled, req.Keyword,
 			"payload.file.name^2",
 			"payload.file.caption",
-		))
+		)
+		b.Must(clause)
+		analyzeErr = err
 	}
-	return b
+	return b, analyzeErr
 }
 
 func (h *Handler) buildFileHits(ctx context.Context, hits []*elastic.SearchHit, req SearchFilesReq, loginUID string) []FileHit {

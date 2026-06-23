@@ -67,7 +67,6 @@ func (h *Handler) searchMessages(c *wkhttp.Context) {
 	}
 
 	normID := normalizedChannelID(req.ChannelType, req.ChannelID, loginUID)
-	dsl := buildSearchMessagesDSL(req, normID, spaceID)
 	isRelevance := req.Sort == "relevance"
 
 	initialAfter, ok := decodeCursorAsSearchAfter(h.cfg, req.Cursor, isRelevance)
@@ -82,6 +81,11 @@ func (h *Handler) searchMessages(c *wkhttp.Context) {
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), h.cfg.Timeout)
 	defer cancel()
+
+	dsl, analyzeErr := buildSearchMessagesDSL(ctx, newOSIKSmartAnalyzer(client), h.cfg.StopwordStripEnabled, req, normID, spaceID)
+	if analyzeErr != nil {
+		h.Warn("messages_search: _analyze fallback (degraded keyword clause)", zap.Error(analyzeErr))
+	}
 
 	osQuery := func(searchAfter []any, size int) ([]*elastic.SearchHit, error) {
 		svc := client.Search().
@@ -128,22 +132,31 @@ func (h *Handler) searchMessages(c *wkhttp.Context) {
 	c.Response(envelope(items, hasMore, nextCursor))
 }
 
-// buildSearchMessagesDSL constructs the bool query for /_search.
-func buildSearchMessagesDSL(req SearchMessagesReq, normChannelID, spaceID string) elastic.Query {
+// buildSearchMessagesDSL constructs the bool query for /_search. Returns the
+// query plus a non-nil error iff the keyword path's `_analyze` call failed and
+// the keyword clause degraded to the fallback shape (raw keyword + MSM 75%);
+// the query is still safe to use, callers should warn-log the error.
+//
+// stopwordStripEnabled = false routes through the ops kill switch: skip the
+// `_analyze` call and emit the §4.4 degraded shape unconditionally.
+func buildSearchMessagesDSL(ctx context.Context, analyzer tokenAnalyzer, stopwordStripEnabled bool, req SearchMessagesReq, normChannelID, spaceID string) (elastic.Query, error) {
 	b := elastic.NewBoolQuery()
+	var analyzeErr error
 	if req.Keyword != "" {
-		b.Must(elastic.NewMultiMatchQuery(req.Keyword,
+		clause, err := buildKeywordClauseGated(ctx, analyzer, stopwordStripEnabled, req.Keyword,
 			"payload.text.content^3",
 			"payload.image.caption", "payload.image.name",
 			"payload.file.caption", "payload.file.name",
 			"payload.mergeForward.msgs.searchText",
-		))
+		)
+		b.Must(clause)
+		analyzeErr = err
 	}
 	applyChannelAndRevoked(b, normChannelID)
 	applySpaceIDScope(b, req.ChannelType, spaceID)
 	addCommonFilters(b, req.Filters)
 	b.MustNot(elastic.NewTermQuery("payload.type", payloadTypeCmd))
-	return b
+	return b, analyzeErr
 }
 
 // buildSearchMessagesHighlight returns the standard highlight config for

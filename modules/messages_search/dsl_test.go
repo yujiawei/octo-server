@@ -1,13 +1,24 @@
 package messages_search
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/olivere/elastic"
 )
+
+// fallbackTestAnalyzer triggers buildKeywordClause's fallback path (raw
+// keyword + cross_fields + MSM 75%), which is what shape tests for the
+// non-keyword DSL plumbing want — the original keyword stays intact in the
+// emitted query, so the historical substring assertions continue to apply.
+// Tests asserting branch-specific shape live in keyword_query_test.go.
+func fallbackTestAnalyzer() stubAnalyzer {
+	return stubAnalyzer{err: errors.New("test: analyze unavailable")}
+}
 
 // extractDSL serialises a query for asserting structural shape in tests.
 func extractDSL(t *testing.T, q interface {
@@ -38,7 +49,12 @@ func TestBuildSearchMessagesDSL_Shape(t *testing.T) {
 			SenderIDs: []string{"u1", "u2"},
 		},
 	}
-	q := buildSearchMessagesDSL(req, "groupNo", "")
+	// Fallback analyzer keeps the original keyword in the emitted query, so
+	// the historical substring assertions (the "hello" pin) still apply. The
+	// MSM 75% + cross_fields shape introduced by the OR-trap fix is asserted
+	// in keyword_query_test.go alongside the branch logic — duplicating it
+	// here would just couple this test to the fallback path.
+	q, _ := buildSearchMessagesDSL(context.Background(), fallbackTestAnalyzer(), true, req, "groupNo", "")
 	dsl := extractDSL(t, q.(interface {
 		Source() (any, error)
 	}))
@@ -64,7 +80,7 @@ func TestBuildSearchMessagesDSL_NoKeywordSkipsMultiMatch(t *testing.T) {
 		ChannelType: channelTypeGroup,
 		ChannelID:   "groupNo",
 	}
-	q := buildSearchMessagesDSL(req, "groupNo", "")
+	q, _ := buildSearchMessagesDSL(context.Background(), fallbackTestAnalyzer(), true, req, "groupNo", "")
 	js, _ := json.Marshal(extractDSL(t, q.(interface {
 		Source() (any, error)
 	})))
@@ -101,7 +117,7 @@ func TestBuildSearchMediaDSL_FiltersTypes(t *testing.T) {
 
 func TestBuildSearchFilesDSL_NoKeywordSkipsMultiMatch(t *testing.T) {
 	req := SearchFilesReq{ChannelType: channelTypeGroup, ChannelID: "g"}
-	q := buildSearchFilesDSL(req, "g", "")
+	q, _ := buildSearchFilesDSL(context.Background(), fallbackTestAnalyzer(), true, req, "g", "")
 	js, _ := json.Marshal(extractDSL(t, q.(interface {
 		Source() (any, error)
 	})))
@@ -116,7 +132,7 @@ func TestBuildSearchFilesDSL_NoKeywordSkipsMultiMatch(t *testing.T) {
 
 func TestBuildSearchFilesDSL_KeywordIncludesMultiMatch(t *testing.T) {
 	req := SearchFilesReq{ChannelType: channelTypeGroup, ChannelID: "g", Keyword: "report"}
-	q := buildSearchFilesDSL(req, "g", "")
+	q, _ := buildSearchFilesDSL(context.Background(), fallbackTestAnalyzer(), true, req, "g", "")
 	js, _ := json.Marshal(extractDSL(t, q.(interface {
 		Source() (any, error)
 	})))
@@ -131,7 +147,7 @@ func TestBuildSearchFilesDSL_KeywordIncludesMultiMatch(t *testing.T) {
 
 func TestBuildSearchAllDSL_TypeFilter(t *testing.T) {
 	req := SearchMessagesReq{ChannelType: channelTypeGroup, ChannelID: "g", Keyword: "k"}
-	q := buildSearchAllDSL(req, "g", "")
+	q, _ := buildSearchAllDSL(context.Background(), fallbackTestAnalyzer(), true, req, "g", "")
 	js, _ := json.Marshal(extractDSL(t, q.(interface {
 		Source() (any, error)
 	})))
@@ -150,7 +166,7 @@ func TestBuildSearchAllDSL_TypeFilter(t *testing.T) {
 
 func TestBuildSearchAllDSL_NoKeywordKeepsTypeFilter(t *testing.T) {
 	req := SearchMessagesReq{ChannelType: channelTypeGroup, ChannelID: "g"}
-	q := buildSearchAllDSL(req, "g", "")
+	q, _ := buildSearchAllDSL(context.Background(), fallbackTestAnalyzer(), true, req, "g", "")
 	js, _ := json.Marshal(extractDSL(t, q.(interface {
 		Source() (any, error)
 	})))

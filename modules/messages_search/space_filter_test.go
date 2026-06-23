@@ -1,6 +1,7 @@
 package messages_search
 
 import (
+	"context"
 	"encoding/json"
 	"net/http/httptest"
 	"strings"
@@ -38,7 +39,8 @@ func TestApplySpaceIDScope_P2PEmitsTermFilter(t *testing.T) {
 		ChannelID:   "peer",
 		Keyword:     "hi",
 	}
-	body := asJSONString(t, buildSearchMessagesDSL(req, "fake-cid", "spaceX").(interface {
+	q, _ := buildSearchMessagesDSL(context.Background(), fallbackTestAnalyzer(), true, req, "fake-cid", "spaceX")
+	body := asJSONString(t, q.(interface {
 		Source() (any, error)
 	}))
 	if !strings.Contains(body, `"spaceId":"spaceX"`) {
@@ -56,7 +58,8 @@ func TestApplySpaceIDScope_GroupBypassed(t *testing.T) {
 		ChannelID:   "G1",
 		Keyword:     "hi",
 	}
-	body := asJSONString(t, buildSearchMessagesDSL(req, "G1", "spaceX").(interface {
+	q, _ := buildSearchMessagesDSL(context.Background(), fallbackTestAnalyzer(), true, req, "G1", "spaceX")
+	body := asJSONString(t, q.(interface {
 		Source() (any, error)
 	}))
 	if strings.Contains(body, `spaceId`) {
@@ -70,7 +73,8 @@ func TestApplySpaceIDScope_ThreadBypassed(t *testing.T) {
 		ChannelID:   "G1____abcd",
 		Keyword:     "hi",
 	}
-	body := asJSONString(t, buildSearchMessagesDSL(req, "G1____abcd", "spaceX").(interface {
+	q, _ := buildSearchMessagesDSL(context.Background(), fallbackTestAnalyzer(), true, req, "G1____abcd", "spaceX")
+	body := asJSONString(t, q.(interface {
 		Source() (any, error)
 	}))
 	if strings.Contains(body, `spaceId`) {
@@ -88,7 +92,8 @@ func TestApplySpaceIDScope_P2PEmptySpaceIDIsNoOp(t *testing.T) {
 		ChannelID:   "peer",
 		Keyword:     "hi",
 	}
-	body := asJSONString(t, buildSearchMessagesDSL(req, "fake-cid", "").(interface {
+	q, _ := buildSearchMessagesDSL(context.Background(), fallbackTestAnalyzer(), true, req, "fake-cid", "")
+	body := asJSONString(t, q.(interface {
 		Source() (any, error)
 	}))
 	if strings.Contains(body, `spaceId`) {
@@ -100,6 +105,9 @@ func TestApplySpaceIDScope_P2PEmptySpaceIDIsNoOp(t *testing.T) {
 // route p2p through applySpaceIDScope. We pin all four explicitly because
 // future copies of the handler skeleton are easy to drift.
 func TestApplySpaceIDScope_AcrossEndpoints(t *testing.T) {
+	ctx := context.Background()
+	a := fallbackTestAnalyzer()
+
 	mediaReq := SearchMediaReq{ChannelType: channelTypePerson, ChannelID: "peer"}
 	if body := asJSONString(t, buildSearchMediaDSL(mediaReq, "fake", "S").(interface {
 		Source() (any, error)
@@ -107,13 +115,15 @@ func TestApplySpaceIDScope_AcrossEndpoints(t *testing.T) {
 		t.Errorf("search_media p2p DSL missing spaceId filter:\n%s", body)
 	}
 	filesReq := SearchFilesReq{ChannelType: channelTypePerson, ChannelID: "peer"}
-	if body := asJSONString(t, buildSearchFilesDSL(filesReq, "fake", "S").(interface {
+	filesQ, _ := buildSearchFilesDSL(ctx, a, true, filesReq, "fake", "S")
+	if body := asJSONString(t, filesQ.(interface {
 		Source() (any, error)
 	})); !strings.Contains(body, `"spaceId":"S"`) {
 		t.Errorf("search_files p2p DSL missing spaceId filter:\n%s", body)
 	}
 	allReq := SearchAllReq{ChannelType: channelTypePerson, ChannelID: "peer", Keyword: "k"}
-	if body := asJSONString(t, buildSearchAllDSL(allReq, "fake", "S").(interface {
+	allQ, _ := buildSearchAllDSL(ctx, a, true, allReq, "fake", "S")
+	if body := asJSONString(t, allQ.(interface {
 		Source() (any, error)
 	})); !strings.Contains(body, `"spaceId":"S"`) {
 		t.Errorf("search_all p2p DSL missing spaceId filter:\n%s", body)

@@ -51,6 +51,20 @@ type SearchConfig struct {
 	//     `spaceId` field. Logged at WARN on every p2p request so the
 	//     deviation cannot stay enabled silently.
 	RequireSpaceID bool
+	// StopwordStripEnabled gates the conditional stopword strip + `_analyze`
+	// pre-processing introduced by
+	// docs/messages-search/2026-06-23-multimatch-or-trap-fix.md.
+	//
+	//   - true (default): the search_messages / search_files / search_all
+	//     keyword paths call OS `_analyze?analyzer=ik_smart` and drop
+	//     stopwords (defaultStopwords) before constructing multi_match.
+	//   - false: ops-only kill switch. Skip `_analyze` entirely and fall
+	//     back to the §4.4 degraded shape — raw keyword + cross_fields +
+	//     MSM 75% — on every keyword request, including the previously
+	//     branchless pure-stopword path. Use when the strip behavior is
+	//     misclassifying queries in production and a one-line config flip
+	//     is preferable to a redeploy.
+	StopwordStripEnabled bool
 }
 
 // RateLimitCfg drives the per-loginUID 5 QPS / 20 burst limiter.
@@ -76,6 +90,10 @@ func loadConfig() SearchConfig {
 		CursorHMAC:        os.Getenv("OCTO_SEARCH_CURSOR_HMAC"),
 		UserAvatarBaseURL: strings.TrimRight(os.Getenv("OCTO_USER_AVATAR_BASE_URL"), "/"),
 		RequireSpaceID:    parseBool(os.Getenv("OCTO_SEARCH_REQUIRE_SPACE_ID"), true),
+		// Default ON; flipping OCTO_SEARCH_STOPWORD_STRIP_ENABLED=false is
+		// the ops kill switch documented in
+		// docs/messages-search/2026-06-23-multimatch-or-trap-fix.md §8.
+		StopwordStripEnabled: parseBool(os.Getenv("OCTO_SEARCH_STOPWORD_STRIP_ENABLED"), true),
 	}
 }
 

@@ -62,7 +62,6 @@ func (h *Handler) searchAll(c *wkhttp.Context) {
 	}
 
 	normID := normalizedChannelID(req.ChannelType, req.ChannelID, loginUID)
-	dsl := buildSearchAllDSL(req, normID, spaceID)
 	isRelevance := req.Sort == "relevance"
 
 	initialAfter, ok := decodeCursorAsSearchAfter(h.cfg, req.Cursor, isRelevance)
@@ -77,6 +76,11 @@ func (h *Handler) searchAll(c *wkhttp.Context) {
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), h.cfg.Timeout)
 	defer cancel()
+
+	dsl, analyzeErr := buildSearchAllDSL(ctx, newOSIKSmartAnalyzer(client), h.cfg.StopwordStripEnabled, req, normID, spaceID)
+	if analyzeErr != nil {
+		h.Warn("messages_search: _analyze fallback (degraded keyword clause)", zap.Error(analyzeErr))
+	}
 
 	osQuery := func(searchAfter []any, size int) ([]*elastic.SearchHit, error) {
 		svc := client.Search().
@@ -122,7 +126,7 @@ func (h *Handler) searchAll(c *wkhttp.Context) {
 	c.Response(envelope(items, hasMore, nextCursor))
 }
 
-func buildSearchAllDSL(req SearchAllReq, normChannelID, spaceID string) elastic.Query {
+func buildSearchAllDSL(ctx context.Context, analyzer tokenAnalyzer, stopwordStripEnabled bool, req SearchAllReq, normChannelID, spaceID string) (elastic.Query, error) {
 	b := elastic.NewBoolQuery()
 	applyChannelAndRevoked(b, normChannelID)
 	applySpaceIDScope(b, req.ChannelType, spaceID)
@@ -132,20 +136,32 @@ func buildSearchAllDSL(req SearchAllReq, normChannelID, spaceID string) elastic.
 		payloadTypeMergeForward,
 	))
 	addCommonFilters(b, req.Filters)
+	var analyzeErr error
 	if req.Keyword != "" {
-		b.Should(
-			elastic.NewMultiMatchQuery(req.Keyword,
-				"payload.text.content^3",
-				"payload.mergeForward.msgs.searchText",
-			),
-			elastic.NewMultiMatchQuery(req.Keyword,
-				"payload.file.name^2",
-				"payload.file.caption",
-			),
+		eff, useMSM := req.Keyword, true
+		if stopwordStripEnabled {
+			// Single `_analyze` roundtrip feeds both Should branches — same
+			// keyword, same analyzer, so a second call would be redundant and
+			// double the IK-cluster RT cost of every _search_all hit.
+			var err error
+			eff, useMSM, err = AnalyzeKeyword(ctx, analyzer, req.Keyword)
+			analyzeErr = err
+		}
+		// When stopwordStripEnabled=false: skip _analyze entirely and emit the
+		// §4.4 degraded shape (raw keyword + cross_fields + MSM 75%) on both
+		// branches — the eff/useMSM defaults above match that contract.
+		textClause := buildKeywordClauseFromAnalyzed(eff, useMSM,
+			"payload.text.content^3",
+			"payload.mergeForward.msgs.searchText",
 		)
+		fileClause := buildKeywordClauseFromAnalyzed(eff, useMSM,
+			"payload.file.name^2",
+			"payload.file.caption",
+		)
+		b.Should(textClause, fileClause)
 		b.MinimumShouldMatch("1")
 	}
-	return b
+	return b, analyzeErr
 }
 
 func buildSearchAllHighlight() *elastic.Highlight {
