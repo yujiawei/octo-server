@@ -30,7 +30,7 @@ CREATE TABLE `thread_user_state` (
   PRIMARY KEY (`id`),
   UNIQUE KEY `uk_uid_thread` (`uid`, `group_no`, `short_id`),   -- 仲裁按 uid+thread 定位
   KEY `idx_thread` (`group_no`, `short_id`)                     -- 删除/GC 按 thread 反查
-) ENGINE=InnoDB;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='子区按用户可见性状态表';
 
 -- +migrate Down
 DROP TABLE `thread_user_state`;

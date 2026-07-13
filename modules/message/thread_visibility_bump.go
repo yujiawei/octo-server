@@ -31,6 +31,34 @@ func (m *Message) resolveSpaceIDForGroup(groupNo string) string {
 	return info.SpaceID
 }
 
+// resolveBumpSpaceForUID 解析「某 uid 在某群下」follow_version 应落的 space（P1 修复）。
+//
+// 背景（YUJ-8101 P1-1）：sidebar 读侧按 **request space** 读 follow_version
+// （api_sidebar.go GetSpaceID(c) → followVersionDB.Get(loginUID, spaceID)）——
+// 对跨 space 外部成员（group_member.is_external=1, source_space_id）来说，request space
+// 就是他自己的 source space，不是群的 home space。若 bump 一律落群 home space，
+// 外部成员的 bump 落在 (uid, group-space) 而读在 (uid, source-space)，follow_version
+// 永不推进，per-user 归档翻转 + P1 强制拉回信号对他不生效。
+//
+// 修法镜像既有成例 conversation_ext.OnThreadCreated（在各自 ext-row space bump）：
+//   - 外部成员（is_external=1）→ 其 source_space_id（与读侧同分区）；
+//   - 内部成员（含成员行查不到 / 查询失败）→ 群 home space（与旧行为一致，保守回落）。
+func (m *Message) resolveBumpSpaceForUID(groupNo, uid string) string {
+	groupSpace := m.resolveSpaceIDForGroup(groupNo)
+	if groupNo == "" || uid == "" {
+		return groupSpace
+	}
+	isExternal, sourceSpaceID, _, _, _, err := m.groupService.GetMemberExternalFields(groupNo, uid)
+	if err != nil {
+		// 查询失败：保守回落群 home space（等价旧行为），不阻断 bump。
+		return groupSpace
+	}
+	if isExternal == 1 {
+		return sourceSpaceID // 外部成员读侧按 source space —— bump 必须落同一分区
+	}
+	return groupSpace
+}
+
 // bumpFollowVersionForThreadChannelsTx 对一批 thread channel_id（"{groupNo}____{shortID}"）
 // 解析出 space_id 后，在同一 tx 内 bump (uid, space_id) 的 follow_version（去重每个 space 只 bump 一次）。
 // 用于 reminder_done 侧（T5）。channel_id 解析失败的条目跳过（不阻断核心写）。
@@ -44,7 +72,9 @@ func (m *Message) bumpFollowVersionForThreadChannelsTx(tx *dbr.Tx, uid string, c
 		if err != nil {
 			continue
 		}
-		spaceID := m.resolveSpaceIDForGroup(groupNo)
+		// P1-1：按「该 uid 在该群」的读侧分区解析 bump space（外部成员→source space），
+		// 而非群 home space，否则跨 space 成员的 bump 与读落在不同 (uid, space) 分区。
+		spaceID := m.resolveBumpSpaceForUID(groupNo, uid)
 		if _, ok := bumped[spaceID]; ok {
 			continue
 		}
@@ -57,8 +87,8 @@ func (m *Message) bumpFollowVersionForThreadChannelsTx(tx *dbr.Tx, uid string, c
 }
 
 // bumpFollowVersionForReminders 是 reminder 触发侧 bump（plan T6）的同步内核：
-// 对每条 per-uid（uid≠''）且属于子区（channel_type=5）的新 reminder，bump 被@uid 的
-// follow_version。@所有人(uid='')不 bump。
+// 对每条 per-uid（uid≠”）且属于子区（channel_type=5）的新 reminder，bump 被@uid 的
+// follow_version。@所有人(uid=”)不 bump。
 //
 // 关键约束（plan T6/R2，顾问共识）：**绝不把本 bump 包进 handleReminders 的核心写 tx**。
 // 消息入库是高频核心链路，bump 是边缘 UI 链路。这里每个 (uid, space) 各自独立短 tx、
@@ -88,7 +118,8 @@ func (m *Message) bumpFollowVersionForReminders(reminders []*remindersModel) {
 		if err != nil {
 			continue
 		}
-		spaceID := m.resolveSpaceIDForGroup(groupNo)
+		// P1-1：按被@ uid 的读侧分区解析 bump space（外部成员→source space）。
+		spaceID := m.resolveBumpSpaceForUID(groupNo, r.UID)
 		k := key{uid: r.UID, space: spaceID}
 		if _, ok := seen[k]; ok {
 			continue
@@ -96,19 +127,23 @@ func (m *Message) bumpFollowVersionForReminders(reminders []*remindersModel) {
 		seen[k] = struct{}{}
 
 		// 各自独立短 tx，失败只 warn（fire-and-forget 语义，不阻断消息投递）。
-		tx, err := m.ctx.DB().Begin()
-		if err != nil {
-			m.Warn("T6 bump: begin tx failed (non-fatal)", zap.Error(err), zap.String("uid", r.UID))
-			continue
-		}
-		if _, err := convext.BumpFollowVersionTx(tx, r.UID, spaceID); err != nil {
-			tx.RollbackUnlessCommitted()
-			m.Warn("T6 bump: BumpFollowVersionTx failed (non-fatal)", zap.Error(err), zap.String("uid", r.UID))
-			continue
-		}
-		if err := tx.Commit(); err != nil {
-			tx.RollbackUnlessCommitted()
-			m.Warn("T6 bump: commit failed (non-fatal)", zap.Error(err), zap.String("uid", r.UID))
-		}
+		// 包一层闭包让 defer tx.RollbackUnlessCommitted() 每次迭代就地生效（P2-b）：
+		// 顶层 recover 只 log 不 rollback，Begin 与 Commit 之间若 driver panic 会泄漏 tx；
+		// per-iteration defer 兜底回滚，与 reminderDone 的 recover+rollback 成例对齐。
+		func(uid, spaceID string) {
+			tx, err := m.ctx.DB().Begin()
+			if err != nil {
+				m.Warn("T6 bump: begin tx failed (non-fatal)", zap.Error(err), zap.String("uid", uid))
+				return
+			}
+			defer tx.RollbackUnlessCommitted()
+			if _, err := convext.BumpFollowVersionTx(tx, uid, spaceID); err != nil {
+				m.Warn("T6 bump: BumpFollowVersionTx failed (non-fatal)", zap.Error(err), zap.String("uid", uid))
+				return
+			}
+			if err := tx.Commit(); err != nil {
+				m.Warn("T6 bump: commit failed (non-fatal)", zap.Error(err), zap.String("uid", uid))
+			}
+		}(r.UID, spaceID)
 	}
 }

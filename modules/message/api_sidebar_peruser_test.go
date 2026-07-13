@@ -99,7 +99,7 @@ func itemByID(items []*SidebarItem, targetID string) *SidebarItem {
 
 // TestComputeEffectiveStatus_PerUserIsolation — gate 1: 子区内 @Alice 未处理 →
 // Alice effective status=1；同群未被@的 Bob effective status=2（手工归档）。
-// uid='' 广播不触发 P1。
+// uid=” 广播不触发 P1。
 func TestComputeEffectiveStatus_PerUserIsolation(t *testing.T) {
 	setupPerUserEnv(t)
 	_, ctx := testutil.NewTestServer()
@@ -193,8 +193,8 @@ func TestComputeEffectiveStatus_MuteWithIntent(t *testing.T) {
 	const g = "gp3b"
 	now := time.Now().Add(-time.Hour)
 	seedThread(t, ctx, g, "t1", thread.ThreadStatusActive, &now)
-	seedReminder(t, ctx, "alice", g, "t1")            // P1
-	seedMute(t, ctx, "alice", g, "t1", 1)             // 静音
+	seedReminder(t, ctx, "alice", g, "t1")             // P1
+	seedMute(t, ctx, "alice", g, "t1", 1)              // 静音
 	seedUserArchiveIntent(t, ctx, "alice", g, "t1", 1) // 本人归档意图
 
 	sb := NewSidebar(ctx)
@@ -306,4 +306,97 @@ func TestComputeEffectiveStatus_UnreadSecondFilter(t *testing.T) {
 	assert.Equal(t, thread.ThreadStatusArchived, itemByID(items, threadChannelID(g, "hidden")).Status)
 	assert.Equal(t, 6, itemByID(items, threadChannelID(g, "pulled")).Unread, "P1 pulled item keeps unread")
 	assert.Equal(t, thread.ThreadStatusActive, itemByID(items, threadChannelID(g, "pulled")).Status)
+}
+
+// =============================================================================
+// P1-2: fail-open 真失败分支覆盖（YUJ-8148，message 端）
+//
+// computeEffectiveStatus 有三个 error 分支：QueryMuteForUID / QueryUserStates /
+// queryUnhandledMentionChannels。原测试只覆盖 loginUID=="" 早退与 0 行成功查询，从未
+// 强制这三个 query 真报错。这里 RENAME 掉每个 backing 表让查询报错，断言 item 保留
+// 已回填的**全局 status**（fail-open，绝不误藏）。message-side 测试是 //go:build
+// integration（CI 不带 -tags integration 不跑），thread-side 的 error 注入进 CI gate。
+// =============================================================================
+
+// renameTableAwayMsg 把某表重命名走开，返回还原函数（与 thread-side 同法）。
+func renameTableAwayMsg(t *testing.T, ctx *config.Context, table string) func() {
+	t.Helper()
+	bak := table + "_failopen_bak"
+	_, err := ctx.DB().Exec("RENAME TABLE " + table + " TO " + bak)
+	require.NoError(t, err)
+	return func() {
+		_, _ = ctx.DB().Exec("RENAME TABLE " + bak + " TO " + table)
+	}
+}
+
+// TestComputeEffectiveStatus_FailOpen_MuteQueryError 覆盖 mute 查询 error 分支：
+// thread_setting 缺失 → QueryMuteForUID 报错 → 保留已回填全局 status，不隐藏。
+func TestComputeEffectiveStatus_FailOpen_MuteQueryError(t *testing.T) {
+	setupPerUserEnv(t)
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+
+	const g = "gpfo1"
+	now := time.Now().Add(-time.Hour)
+	seedThread(t, ctx, g, "t1", thread.ThreadStatusArchived, &now)
+
+	restore := renameTableAwayMsg(t, ctx, "thread_setting")
+	defer restore()
+
+	sb := NewSidebar(ctx)
+	statusMap := map[string]int{threadChannelID(g, "t1"): thread.ThreadStatusArchived}
+	items := []*SidebarItem{threadItem(g, "t1", 7)}
+	sb.computeEffectiveStatus("alice", items, statusMap)
+
+	got := itemByID(items, threadChannelID(g, "t1"))
+	assert.Equal(t, thread.ThreadStatusArchived, got.Status,
+		"mute 查询报错时保留全局 status（fail-open，不隐藏）")
+}
+
+// TestComputeEffectiveStatus_FailOpen_UserStateQueryError 覆盖 user_state 查询 error 分支。
+func TestComputeEffectiveStatus_FailOpen_UserStateQueryError(t *testing.T) {
+	setupPerUserEnv(t)
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+
+	const g = "gpfo2"
+	now := time.Now().Add(-time.Hour)
+	seedThread(t, ctx, g, "t1", thread.ThreadStatusActive, &now)
+
+	restore := renameTableAwayMsg(t, ctx, "thread_user_state")
+	defer restore()
+
+	sb := NewSidebar(ctx)
+	statusMap := map[string]int{threadChannelID(g, "t1"): thread.ThreadStatusActive}
+	items := []*SidebarItem{threadItem(g, "t1", 3)}
+	sb.computeEffectiveStatus("alice", items, statusMap)
+
+	got := itemByID(items, threadChannelID(g, "t1"))
+	assert.Equal(t, thread.ThreadStatusActive, got.Status,
+		"user_state 查询报错时保留全局 status（fail-open，不隐藏）")
+	assert.Equal(t, 3, got.Unread, "fail-open 不动 Unread（保留现状可见）")
+}
+
+// TestComputeEffectiveStatus_FailOpen_P1QueryError 覆盖 P1 查询 error 分支：
+// reminders 缺失 → queryUnhandledMentionChannels 报错 → 保留全局 status，不隐藏。
+func TestComputeEffectiveStatus_FailOpen_P1QueryError(t *testing.T) {
+	setupPerUserEnv(t)
+	_, ctx := testutil.NewTestServer()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+
+	const g = "gpfo3"
+	now := time.Now().Add(-time.Hour)
+	seedThread(t, ctx, g, "t1", thread.ThreadStatusArchived, &now)
+
+	restore := renameTableAwayMsg(t, ctx, "reminders")
+	defer restore()
+
+	sb := NewSidebar(ctx)
+	statusMap := map[string]int{threadChannelID(g, "t1"): thread.ThreadStatusArchived}
+	items := []*SidebarItem{threadItem(g, "t1", 5)}
+	sb.computeEffectiveStatus("alice", items, statusMap)
+
+	got := itemByID(items, threadChannelID(g, "t1"))
+	assert.Equal(t, thread.ThreadStatusArchived, got.Status,
+		"P1 查询报错时保留全局 status（fail-open，不隐藏）")
 }

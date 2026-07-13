@@ -773,6 +773,29 @@ func (s *Service) UnarchiveThread(groupNo, shortID, operatorUID string) error {
 	return nil
 }
 
+// resolveBumpSpaceForUID 解析「某 uid 在某群下」follow_version 应落的 space（P1-1 修复）。
+// sidebar 读侧按 request space 读 follow_version；跨 space 外部成员
+// （group_member.is_external=1, source_space_id）的 request space 就是其 source space。
+// 故 bump 必须按 uid 解析：外部成员→source space，内部成员（含查不到/查询失败）→群 home space。
+// 镜像 conversation_ext.OnThreadCreated「各自 ext-row space bump」成例。
+func (s *Service) resolveBumpSpaceForUID(groupNo, operatorUID string) string {
+	groupSpace := ""
+	if groupInfo, gerr := s.groupService.GetGroupWithGroupNo(groupNo); gerr == nil && groupInfo != nil {
+		groupSpace = groupInfo.SpaceID
+	}
+	if groupNo == "" || operatorUID == "" {
+		return groupSpace
+	}
+	isExternal, sourceSpaceID, _, _, _, err := s.groupService.GetMemberExternalFields(groupNo, operatorUID)
+	if err != nil {
+		return groupSpace // 查询失败保守回落群 home space（等价旧行为）
+	}
+	if isExternal == 1 {
+		return sourceSpaceID // 外部成员读侧按 source space —— bump 必须落同一分区
+	}
+	return groupSpace
+}
+
 // setArchiveIntentPerUser 在一个 tx 内写 operatorUID 对该子区的归档意图并 bump follow_version（plan T7）。
 // intent: 1=归档 0=取消归档。
 //
@@ -780,10 +803,11 @@ func (s *Service) UnarchiveThread(groupNo, shortID, operatorUID string) error {
 // **再** UpsertArchiveIntentTx，避免与 UnfollowChannel/UpdateSort 反向交叉造成 InnoDB 死锁。
 // 事务惯例参照 service.go 的 s.db.session.Begin()（勿另造事务框架，遵 STOP-4）。
 func (s *Service) setArchiveIntentPerUser(groupNo, shortID, operatorUID string, intent int) error {
-	spaceID := ""
-	if groupInfo, gerr := s.groupService.GetGroupWithGroupNo(groupNo); gerr == nil && groupInfo != nil {
-		spaceID = groupInfo.SpaceID
-	}
+	// P1-1：bump space 必须与 sidebar 读侧同分区 —— 外部成员读侧按其 source space
+	// （api_sidebar GetSpaceID(c)），故此处按 operatorUID 解析（external→source space，
+	// internal→群 home space），否则外部成员 bump 落 (uid, group-space) 而读在
+	// (uid, source-space)，follow_version 永不推进、per-user 归档翻转不刷新。
+	spaceID := s.resolveBumpSpaceForUID(groupNo, operatorUID)
 	version, err := s.threadVersionGen()()
 	if err != nil {
 		return fmt.Errorf("gen version for archive intent: %w", err)
